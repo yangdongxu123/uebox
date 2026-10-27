@@ -45,6 +45,7 @@ import {
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
 
 import { runWithTargetConnectionId } from '../../core/projectTargetContext'
+import { readTeamSeat, runWithTeamSeat } from '../../core/team/teamSeatContext'
 import type { UnrealAgentTool } from '../../tools/defineTool'
 import { OFFLINE_UE_TOOLS } from '../../tools/toolNames'
 import {
@@ -96,6 +97,8 @@ interface Session {
   lastActiveAt: number
   /** 正在处理中的请求数。>0 时绝不回收 —— 长请求不是空闲 */
   inFlight: number
+  /** 会话结束时要收的尾（见 `McpSessionSetup.dispose`）。只调一次，调完清掉 */
+  dispose?: () => void | Promise<void>
 }
 
 export interface McpServerHostOptions {
@@ -129,6 +132,11 @@ export interface McpSessionSetup {
   tools: UnrealAgentTool<never>[]
   /** MCP `initialize` 结果里的 `instructions`，客户端拿它当系统提示的一部分 */
   instructions?: string
+  /**
+   * 会话结束（客户端 DELETE、断线、闲置回收）时调一次。
+   * 外部团队的队员连接靠它把没交回的活收成「停下」、放掉文件锁
+   */
+  dispose?: () => void | Promise<void>
 }
 
 export interface McpSessionRequest {
@@ -140,7 +148,15 @@ export interface McpSessionRequest {
   clientCapabilities?: ClientCapabilities
   /** 向客户端发起一次表单询问（MCP elicitation）。只在客户端声明支持时给 */
   elicit?: (params: ElicitRequestFormParams, signal?: AbortSignal) => Promise<ElicitResult>
+  /**
+   * 客户端要哪套工具（初始化请求的 `X-Unreal-Box-Profile` 头）。没有 = 完整的那一套。
+   * `producer` 是混合团队制作人的精简工具集（`core/team/hybridTeamTools.ts`）
+   */
+  profile?: string
 }
+
+/** 选工具集的请求头。只在初始化请求上读：会话的工具清单握手时就定了 */
+export const PROFILE_HEADER = 'x-unreal-box-profile'
 
 /**
  * 工具从哪来。
@@ -324,7 +340,7 @@ export class McpServerHost {
 
     let session: Session
     try {
-      session = await this.createSession(body.params.capabilities)
+      session = await this.createSession(body.params.capabilities, headerValue(req, PROFILE_HEADER))
     } catch (error) {
       jsonRpcError(res, 500, -32603, `会话装配失败：${(error as Error).message}`)
       return
@@ -335,7 +351,10 @@ export class McpServerHost {
   }
 
   /** 造一条新会话：一个 Server、一个 Transport，注册进表里 */
-  private async createSession(clientCapabilities: ClientCapabilities): Promise<Session> {
+  private async createSession(
+    clientCapabilities: ClientCapabilities,
+    profile?: string
+  ): Promise<Session> {
     // 先把壳造出来，再往里填 —— 下面几个回调都要引用这条会话本身，
     // 而它们最早也要等到 `handleRequest` 才会被调到（那时字段已经填完了）。
     const session = {} as Session
@@ -343,8 +362,9 @@ export class McpServerHost {
     // id 由我们先定，而不是等 transport 在握手时现生成：工具要在握手**之前**
     // 按这个 id 装配（浏览器窗口、提问都挂在会话 id 上）
     const sessionId = `mcp-${randomUUID()}`
-    const setup = await this.setupSession(session, sessionId, clientCapabilities)
+    const setup = await this.setupSession(session, sessionId, clientCapabilities, profile)
     session.tools = setup.tools
+    if (setup.dispose) session.dispose = setup.dispose
 
     session.transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => sessionId,
@@ -356,6 +376,7 @@ export class McpServerHost {
       onsessionclosed: (id) => {
         this.sessions.delete(id)
         releaseSessionBrowser(id)
+        disposeSession(session)
       }
     })
 
@@ -373,6 +394,7 @@ export class McpServerHost {
       if (id) this.sessions.delete(id)
       // 这条会话的工具按会话 id 开过内置浏览器的话，窗口跟着会话一起关，不然留到进程结束
       releaseSessionBrowser(sessionId)
+      disposeSession(session)
     }
 
     session.lastActiveAt = Date.now()
@@ -410,7 +432,8 @@ export class McpServerHost {
   private async setupSession(
     session: Session,
     sessionId: string,
-    clientCapabilities: ClientCapabilities
+    clientCapabilities: ClientCapabilities,
+    profile?: string
   ): Promise<McpSessionSetup> {
     if (Array.isArray(this.source)) return { tools: this.exposed }
 
@@ -418,6 +441,7 @@ export class McpServerHost {
       sessionId,
       readOnly: !this.options.includeMutating,
       clientCapabilities,
+      ...(profile ? { profile } : {}),
       // 只有客户端说了支持才给：不支持的客户端收到 elicitation 请求只会报错，
       // 而 ask_user 会挂在那儿等一个不会来的回答
       ...(clientCapabilities.elicitation
@@ -538,8 +562,11 @@ export class McpServerHost {
             if (text) onProgress(text)
           }
         : undefined
+      // 外部团队的通行证：能发 `_meta` 的客户端（CLI）放在这里，模型填参数的放在 `team_seat`。
+      // 见 core/team/externalTeamTools.ts
+      const seat = readTeamSeat(request.params._meta?.unrealBox)
       const execute = (): ReturnType<typeof tool.execute> =>
-        tool.execute(callId, args, signal, onUpdate)
+        runWithTeamSeat(seat, () => tool.execute(callId, args, signal, onUpdate))
       const result = target ? await runWithTargetConnectionId(target, execute) : await execute()
 
       const structured = toStructuredContent(tool.name, result.details)
@@ -667,6 +694,16 @@ function failure(message: string, code: string): CallToolOutcome {
 /**
  * 关掉某条 MCP 会话开过的内置浏览器。按需加载：浏览器服务要 electron，单测里不该被连带拉起
  */
+/** 会话的收尾只做一次：DELETE 和传输层关闭两条路都会走到这里 */
+function disposeSession(session: Session): void {
+  const dispose = session.dispose
+  if (!dispose) return
+  session.dispose = undefined
+  void Promise.resolve()
+    .then(dispose)
+    .catch((error: unknown) => console.warn('[AgentV3][MCP-Server] 会话收尾失败:', error))
+}
+
 function releaseSessionBrowser(sessionId: string): void {
   void import('../../../services/agentBrowser')
     .then(({ deleteSessionBrowser }) => deleteSessionBrowser(sessionId))
@@ -774,10 +811,10 @@ function jsonRpcError(res: ServerResponse, status: number, code: number, message
 function describeListenError(error: Error, port: number): string {
   const code = (error as NodeJS.ErrnoException).code
   if (code === 'EADDRINUSE') {
-    return `端口 ${port} 已被占用（可能已经开了一个盒子，或别的程序在用）。换一个端口再试。`
+    return `端口 ${port} 已被占用（可能已有虚幻盒子实例在运行，或被其他程序占用）。请更换端口后重试。`
   }
   if (code === 'EACCES') {
-    return `没有权限使用端口 ${port}。换一个大于 1024 的端口。`
+    return `没有权限使用端口 ${port}，请更换为大于 1024 的端口。`
   }
   return error.message
 }

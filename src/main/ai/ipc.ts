@@ -3,7 +3,7 @@ import { registerCreatorPlanIPC } from './creatorPlan/ipc'
 import { startCreatorPlanRefresh } from './creatorPlan/refresh'
 import { isPlanProvider } from '../../shared/creatorPlan'
 import { registerSpeechIPC } from '../ipc/speech'
-import { PROVIDER_CATALOG } from './catalog'
+import { findCatalogEntry, PROVIDER_CATALOG } from './catalog'
 import {
   deleteLiteralKey,
   hasApiKey,
@@ -15,11 +15,20 @@ import {
 } from './credentials'
 import { OAuthCancelledError, runOAuthLogin, yieldsPermanentKey } from './oauth'
 import { listRemoteModels, testProvider } from './probe'
+import { countRunsUsingProvider } from './providerUsage'
 import { invalidateSettingsCache, readSettings, settingsPath, updateSettings } from './store'
+import {
+  deleteDisabledProvider,
+  disableProvider,
+  enableProvider,
+  readDisabledProviders,
+  updateDisabledProvider
+} from './disabledProviders'
 import { isLocalModelConfigured } from './resolveModel'
 import type { AiProviderSettings, ProviderConfig } from './types'
 import {
   applyRolePatch,
+  disallowedRoles,
   sanitizeRolePatch,
   unsavedRoles,
   type ProbeFailure,
@@ -39,36 +48,48 @@ import {
  */
 
 async function toView(settings: AiProviderSettings): Promise<SettingsView> {
-  const providers = await Promise.all(
-    settings.providers.map(async (provider): Promise<ProviderView> => {
-      const { apiKey, ...rest } = provider
-      if (apiKey.kind === 'none') return { ...rest, apiKey: { kind: 'none' } }
-      const present = await hasApiKey(apiKey)
-      // env / shell 带着值回显：它们是「怎么取密钥」而不是密钥，界面要把它
-      // 填回那个单一输入框。literal 只回 hasKey。
-      if (apiKey.kind === 'env') {
-        return { ...rest, apiKey: { kind: 'env', name: apiKey.name, hasKey: present } }
-      }
-      if (apiKey.kind === 'shell') {
-        return { ...rest, apiKey: { kind: 'shell', command: apiKey.command, hasKey: present } }
-      }
-      if (apiKey.kind === 'oauth') {
-        return {
-          ...rest,
-          apiKey: { kind: 'oauth', provider: apiKey.provider, hasKey: present }
-        }
-      }
-      return { ...rest, apiKey: { kind: 'literal', hasKey: present } }
-    })
-  )
+  const [providers, disabledProviders] = await Promise.all([
+    Promise.all(settings.providers.map(providerView)),
+    readDisabledProviders().then((list) => Promise.all(list.map(providerView)))
+  ])
 
   return {
     providers,
+    disabledProviders,
     roles: settings.roles,
     path: settingsPath(),
     encryptionAvailable: isEncryptionAvailable(),
     configured: await isLocalModelConfigured()
   }
+}
+
+async function providerView(provider: ProviderConfig): Promise<ProviderView> {
+  const { apiKey, ...rest } = provider
+  if (apiKey.kind === 'none') return { ...rest, apiKey: { kind: 'none' } }
+  const present = await hasApiKey(apiKey)
+  // env / shell 带着值回显：它们是「怎么取密钥」而不是密钥，界面要把它
+  // 填回那个单一输入框。literal 只回 hasKey。
+  if (apiKey.kind === 'env') {
+    return { ...rest, apiKey: { kind: 'env', name: apiKey.name, hasKey: present } }
+  }
+  if (apiKey.kind === 'shell') {
+    return { ...rest, apiKey: { kind: 'shell', command: apiKey.command, hasKey: present } }
+  }
+  if (apiKey.kind === 'oauth') {
+    return {
+      ...rest,
+      apiKey: { kind: 'oauth', provider: apiKey.provider, hasKey: present }
+    }
+  }
+  return { ...rest, apiKey: { kind: 'literal', hasKey: present } }
+}
+
+/** 启用中的在 models.json，停用的在旁边那个文件；编辑、测试时两边都要找 */
+async function findProvider(providerId: string): Promise<ProviderConfig | undefined> {
+  return (
+    (await readSettings()).providers.find((item) => item.id === providerId) ??
+    (await readDisabledProviders()).find((item) => item.id === providerId)
+  )
 }
 
 /**
@@ -90,11 +111,11 @@ async function materialize(
   let apiKey: ProviderConfig['apiKey']
   if (!parsed) {
     // 留空：原来是 literal 就沿用（明文读不回界面，用户不是"看着它删掉的"），
-    // 其余情况按真的不要密钥处理。
+    // 同一个账号已经在别的来源登录过就共用那份登录，其余情况按真的不要密钥处理。
     apiKey =
       previous?.apiKey.kind === 'literal' || previous?.apiKey.kind === 'oauth'
         ? previous.apiKey
-        : { kind: 'none' }
+        : ((await sharedOAuthKey(draft)) ?? { kind: 'none' })
   } else if (parsed.kind === 'env') {
     apiKey = { kind: 'env', name: parsed.name }
   } else if (parsed.kind === 'shell') {
@@ -117,7 +138,28 @@ async function materialize(
       ? previousId
       : null
 
-  return { provider: { ...rest, apiKey }, staleKeyId }
+  // 从目录添加的，用途跟着目录走：界面上那一栏已经锁了，这里再拦一道过期界面和手改的请求
+  const kind = findCatalogEntry(draft.catalogId ?? '')?.kind ?? rest.kind
+  return { provider: { ...rest, kind, apiKey }, staleKeyId }
+}
+
+/**
+ * 同一个账号在别的来源已经登录过时，那份登录。
+ *
+ * 「Codex 生图」和「Codex」对话是同一个 ChatGPT 账号：已经登录过的用户添加生图来源时
+ * 不该再授权一遍。共用的是同一条令牌记录，续期写回的也是它，两边一直是同一份；
+ * 删来源不删登录令牌（见 delete-provider），所以删掉其中一个不会让另一个掉线。
+ */
+async function sharedOAuthKey(draft: ProviderDraft): Promise<ProviderConfig['apiKey'] | null> {
+  const entry = findCatalogEntry(draft.catalogId ?? '')
+  if (!entry?.supportsOAuth) return null
+  const account = entry.oauthProvider ?? entry.id
+  for (const provider of (await readSettings()).providers) {
+    const key = provider.apiKey
+    if (provider.id === draft.id || key.kind !== 'oauth' || key.provider !== account) continue
+    if (await hasApiKey(key)) return key
+  }
+  return null
 }
 
 /** 落盘之后删掉换下来的旧密文；别的来源还在用同一份（Box Plan 的几个来源共用一把 Key）就留着 */
@@ -127,8 +169,8 @@ async function dropStaleKey(keyId: string | null, providerId: string): Promise<v
 
 /** 除了 `exceptProviderId`，还有没有别的来源引用这份密文 */
 async function keyUsedElsewhere(keyId: string, exceptProviderId: string): Promise<boolean> {
-  const settings = await readSettings()
-  return settings.providers.some(
+  const providers = [...(await readSettings()).providers, ...(await readDisabledProviders())]
+  return providers.some(
     (provider) =>
       provider.id !== exceptProviderId &&
       (provider.apiKey.kind === 'literal' || provider.apiKey.kind === 'oauth') &&
@@ -194,13 +236,17 @@ export function registerAiProviderIPC(): void {
   ipcMain.handle('ai-provider:save-provider', async (_event, draft: ProviderDraft) => {
     if (isPlanProvider(String(draft?.id ?? ''))) return PLAN_READ_ONLY
     try {
-      const previous = (await readSettings()).providers.find((item) => item.id === draft.id)
+      const previous = await findProvider(draft.id)
       const { provider, staleKeyId } = await materialize(draft, previous)
+      // 停用中的改完还是停用着
+      const disabled = await updateDisabledProvider(provider)
       // 落盘这一步排进队里、在最新的配置上改：materialize 要等密钥库，这期间后台对账可能写过
-      const saved = await updateSettings((settings) => ({
-        ...settings,
-        providers: withProvider(settings.providers, provider)
-      }))
+      const saved = disabled
+        ? await readSettings()
+        : await updateSettings((settings) => ({
+            ...settings,
+            providers: withProvider(settings.providers, provider)
+          }))
       await dropStaleKey(staleKeyId, provider.id)
       return { ok: true, data: await toView(saved) }
     } catch (error) {
@@ -208,10 +254,18 @@ export function registerAiProviderIPC(): void {
     }
   })
 
+  /** 删之前问：有几个正在跑的对话用着它。确认框据此提醒「它们会在下一次调模型时出错」 */
+  ipcMain.handle('ai-provider:usage', (_event, providerId: string) =>
+    countRunsUsingProvider(String(providerId ?? ''))
+  )
+
   ipcMain.handle('ai-provider:delete-provider', async (_event, providerId: string) => {
     if (isPlanProvider(String(providerId ?? ''))) return PLAN_READ_ONLY
     try {
-      const target = (await readSettings()).providers.find((item) => item.id === providerId)
+      const target =
+        (await readSettings()).providers.find((item) => item.id === providerId) ??
+        (await deleteDisabledProvider(providerId)) ??
+        undefined
       // 指向它的角色绑定由 normalizeSettings 自动丢弃，这里不用手动清。
       const saved = await updateSettings((current) => ({
         ...current,
@@ -225,6 +279,21 @@ export function registerAiProviderIPC(): void {
     }
   })
 
+  /** 停用 / 启用一个来源，见 disabledProviders.ts */
+  ipcMain.handle(
+    'ai-provider:set-enabled',
+    async (_event, providerId: string, enabled: boolean) => {
+      const id = String(providerId ?? '')
+      if (isPlanProvider(id)) return PLAN_READ_ONLY
+      try {
+        await (enabled ? enableProvider(id) : disableProvider(id))
+        return { ok: true, data: await toView(await readSettings()) }
+      } catch (error) {
+        return fail(error)
+      }
+    }
+  )
+
   /**
    * 只收改了的那几个角色（null = 清空），在队里、在最新的配置上合并。
    * 收整张表的话，渲染层手里那份旧表会把后台刚写的（套餐清单对账）或上一次还没回来的改动盖掉
@@ -232,15 +301,23 @@ export function registerAiProviderIPC(): void {
   ipcMain.handle('ai-provider:set-roles', async (_event, raw: unknown) => {
     try {
       const patch = sanitizeRolePatch(raw)
-      const saved = await updateSettings((settings) => ({
-        ...settings,
-        roles: applyRolePatch(settings.roles, patch)
-      }))
+      let refused: string[] = []
+      const saved = await updateSettings((settings) => {
+        // 模型只开放给部分角色的（套餐可选模型，见 ModelConfig.allowedRoles），绑到别的角色网关会拒：不存
+        refused = disallowedRoles(settings, patch)
+        const allowed = Object.fromEntries(
+          Object.entries(patch).filter(([role]) => !refused.includes(role))
+        ) as typeof patch
+        return { ...settings, roles: applyRolePatch(settings.roles, allowed) }
+      })
+      if (refused.length > 0) {
+        return { ok: false, error: `保存失败（${refused.join('、')}）：所选模型不能用于该角色。` }
+      }
       const lost = unsavedRoles(saved.roles, patch)
       if (lost.length > 0) {
         return {
           ok: false,
-          error: `没存上（${lost.join('、')}）：选的来源或模型已经不在了，重新打开设置页再选一次。`
+          error: `保存失败（${lost.join('、')}）：所选来源或模型已不存在，请重新打开设置页并重新选择。`
         }
       }
       return { ok: true, data: await toView(saved) }
@@ -251,8 +328,7 @@ export function registerAiProviderIPC(): void {
 
   ipcMain.handle('ai-provider:test', async (_event, draft: ProviderDraft, modelId: string) => {
     try {
-      const settings = await readSettings()
-      const previous = settings.providers.find((item) => item.id === draft.id)
+      const previous = await findProvider(draft.id)
       return await testProvider((await materialize(draft, previous)).provider, modelId)
     } catch (error) {
       return failProbe(error)
@@ -261,8 +337,7 @@ export function registerAiProviderIPC(): void {
 
   ipcMain.handle('ai-provider:list-models', async (_event, draft: ProviderDraft) => {
     try {
-      const settings = await readSettings()
-      const previous = settings.providers.find((item) => item.id === draft.id)
+      const previous = await findProvider(draft.id)
       return await listRemoteModels((await materialize(draft, previous)).provider)
     } catch (error) {
       return failProbe(error)
@@ -308,7 +383,7 @@ export function registerAiProviderIPC(): void {
           return { ok: true, data: { key: tokens.accessToken } }
         }
 
-        const previous = (await readSettings()).providers.find((item) => item.id === draft.id)
+        const previous = await findProvider(draft.id)
         // 密钥 id 跟着 provider id 走，与 literal 那条路保持一致
         const tokenId = `provider:${draft.id}`
         const apiKey = await saveOAuthTokens(tokenId, oauthProvider, tokens)
@@ -316,10 +391,12 @@ export function registerAiProviderIPC(): void {
         const { apiKeyInput: _ignored, ...rest } = draft
         void _ignored
         const provider: ProviderConfig = { ...rest, apiKey }
-        const saved = await updateSettings((current) => ({
-          ...current,
-          providers: withProvider(current.providers, provider)
-        }))
+        const saved = (await updateDisabledProvider(provider))
+          ? await readSettings()
+          : await updateSettings((current) => ({
+              ...current,
+              providers: withProvider(current.providers, provider)
+            }))
         // 换成 oauth 之前如果存过明文密钥，落盘后把那份删掉，不留孤儿。
         // 明文默认也存在 provider:<id> 下 —— 和刚存的令牌是同一个 id，那就已经被覆盖了，不能删
         if (previous?.apiKey.kind === 'literal' && previous.apiKey.id !== tokenId) {

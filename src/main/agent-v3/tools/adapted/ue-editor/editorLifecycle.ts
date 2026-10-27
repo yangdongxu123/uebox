@@ -142,7 +142,7 @@ async function waitUntilLive(
     // 白等一轮不说，lastError 还会是个误导人的「客户端不存在」。
     //
     // `previousProjectPath` 本来就没有时是另一回事：那说明这一轮压根没绑定
-    // 目标工程（纯对话会话），`getTargetConnectionId()` 是 undefined，
+    // 目标工程（纯对话），`getTargetConnectionId()` 是 undefined，
     // callRequest 会自己挑 —— 而且只在恰好一个连接时才挑，多连接一律拒绝。
     if (rebound || !previousProjectPath) {
       try {
@@ -265,11 +265,13 @@ export function createRestartEditorTool() {
             restarted: true,
             reconnected: false,
             timed_out: true,
-            needs_manual_reconnect: true,
+            // 插件断线后自己每 5 秒重连，等就是了 —— 字段名别再暗示「要人去手动连」
+            wait_for_reconnect: true,
             error:
               `编辑器已经重启，但盒子还没重新连上它 —— 现在发任何引擎命令都会失败。\n` +
               (check.lastError ? `最后一次试探的失败原因：${check.lastError}\n` : '') +
-              `请用户在盒子界面里重新连接项目；重连之后就能继续了。\n` +
+              `用 ue_session_health 带 wait_seconds 再等一会儿 —— 插件断线后每 5 秒自己重连，` +
+              `界面上没有「连接」按钮，不要让用户去找。\n` +
               `**不要重复重启** —— 编辑器本身是好的，问题在连接上。`
           }
         }
@@ -414,7 +416,7 @@ dirty_after 只数这条命令新弄脏、引擎又没存成的包，有才需�
     }),
 
     // 预演不改任何东西，按 safe 问；真正的那次照 destructive 问，而且预演上点的
-    // 「本次会话都允许」放不过来（审批门按实际风险分开记）
+    // 「本对话内都允许」放不过来（审批门按实际风险分开记）
     riskFor: (args) =>
       (args as { dry_run?: unknown } | null)?.dry_run === true ? 'safe' : 'destructive',
 

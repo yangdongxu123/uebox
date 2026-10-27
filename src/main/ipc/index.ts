@@ -6,7 +6,6 @@ import { registerBaiduyunIPC } from './baiduyun'
 import { registerWebdavIPC } from './webdav'
 import { registerShellIPC } from './shell'
 import { registerPathIPC } from './path'
-import { registerAssistantIPC } from './assistant'
 import { registerUnrealPathIPC } from './unrealPath'
 import { registerUnrealProcessIPC } from './unrealProcess'
 import { registerAgentV3IPC } from './agentV3'
@@ -31,6 +30,7 @@ import { registerAiImageIPC } from './aiImage'
 import { registerAppSettingsIPC, type SetAppIconTheme } from './appSettings'
 import { registerPersonalizationIPC } from './personalization'
 import { registerChatHistoryIPC } from './chatHistory'
+import { registerSecureStoreIPC } from './secureStore'
 import { registerBackupIpc } from './backup'
 import { registerFileIPC } from './fileIPC'
 import { registerScreenshotIPC } from './screenshot'
@@ -39,6 +39,8 @@ import { registerEditorHealthIPC } from './editorHealth'
 import { registerNetworkVaultHandlers } from './networkVault'
 import { registerNetworkVaultV2Handlers } from './networkVaultV2'
 import { registerCatalogLibraryIPC } from './catalogLibrary'
+import { registerTeamIPC } from './team'
+import { registerShareIPC } from './share'
 import { registerDiagnosticsIPC } from './diagnostics'
 // 导入assetImport以注册其IPC处理器
 import './assetImport'
@@ -75,8 +77,6 @@ export function registerAllIPC(setAppIconTheme: SetAppIconTheme): void {
 
   // 注册路径相关IPC
   registerPathIPC()
-  // 注册虚幻AI助手相关IPC
-  registerAssistantIPC()
   // 注册 Unreal 引擎相关IPC
   registerUnrealPathIPC()
   // 注册 Unreal 引擎进程检测相关IPC
@@ -118,10 +118,10 @@ export function registerAllIPC(setAppIconTheme: SetAppIconTheme): void {
   // 注册聊天附件解释 IPC（视频/文档在本地先解释成模型吃得下的东西）
   registerAttachmentIPC()
 
-  // 注册实时语音会话 IPC
+  // 注册实时语音连接 IPC
   registerRealtimeVoiceIPC()
 
-  // 注册语音识别（听写）IPC。和上面那条是两路独立会话，见 speechToText.ts
+  // 注册语音识别（听写）IPC。和上面那条是两条独立的连接，见 speechToText.ts
   registerSpeechToTextIPC()
 
   // 注册视频缩略图相关 IPC（视频首帧截取）
@@ -150,6 +150,9 @@ export function registerAllIPC(setAppIconTheme: SetAppIconTheme): void {
   // 注册 AI 对话历史落盘 IPC（原来存在 localStorage，配额不够）
   registerChatHistoryIPC()
 
+  // 注册渲染层凭据的加密落盘 IPC（原来明文存在 localStorage）
+  registerSecureStoreIPC()
+
   // 注册数据库备份相关 IPC
   registerBackupIpc()
 
@@ -173,6 +176,10 @@ export function registerAllIPC(setAppIconTheme: SetAppIconTheme): void {
 
   // 服务端资产库（新后端 asset-catalog：在线分页，不做本地镜像）
   registerCatalogLibraryIPC()
+
+  // 团队工程（版本控制与资产协作）：加入团队、动态、签出、等你处理……
+  registerTeamIPC()
+  registerShareIPC()
 
   // Register diagnostics and import recovery IPC
   registerDiagnosticsIPC()

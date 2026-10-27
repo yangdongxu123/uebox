@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  CURRENT_LEVEL_LOCK,
   acquire,
   describeConflicts,
   extractPackagePaths,
@@ -8,6 +9,7 @@ import {
   getLockOwner,
   listLocks,
   releaseAll,
+  releasePaths,
   rootSessionId,
   runWithLockOwner,
   setLockConflictNotifier
@@ -191,6 +193,8 @@ describe('describeConflicts', () => {
     expect(text).toContain('/Game/A')
     expect(text).toContain('未做任何改动')
     expect(text).toContain('重试')
+    expect(text).toContain('盒子里的另一条 AI 对话')
+    expect(text).toContain('锁在那一轮结束时自动释放')
   })
 
   it('不把会话 id 交给模型 —— 它只会把一串 uuid 原样转述给用户', () => {
@@ -238,11 +242,11 @@ describe('工作室模式的锁', () => {
     ).toEqual([])
   })
 
-  it('撞上队友的锁：说清是哪个队友、什么时候放，不说「另一条 AI 会话」', () => {
+  it('撞上队友的锁：说清是哪个队友、什么时候放，不说「另一条 AI 对话」', () => {
     const text = describeConflicts([{ path: '/Game/Core/BP_GM', owner: 's1:mate-玩法主程' }], 's1')
     expect(text).toContain('队友「玩法主程」')
     expect(text).toContain('team_message')
-    expect(text).not.toContain('另一条 AI 会话')
+    expect(text).not.toContain('另一条 AI 对话')
     expect(describeConflicts([{ path: '/Game/A', owner: 's1' }], 's1:mate-美术')).toContain(
       '制作人'
     )
@@ -256,5 +260,20 @@ describe('工作室模式的锁', () => {
     expect(notify).not.toHaveBeenCalled()
     acquire(CONN, 's2', ['/Game/A'])
     expect(notify).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('releasePaths', () => {
+  it('只放点名的那几把，别人的、没点名的都不动；关卡哨兵也认', () => {
+    acquire(CONN, 's1', ['/Game/A', '/Game/B', CURRENT_LEVEL_LOCK], { soft: true })
+    acquire(CONN, 's2', ['/Game/C'])
+    expect(releasePaths(CONN, 's1', ['/Game/A.A_C', CURRENT_LEVEL_LOCK, '/Game/C'])).toBe(2)
+    expect(
+      listLocks()
+        .map((l) => l.path)
+        .sort()
+    ).toEqual(['/Game/B', '/Game/C'])
+    // 放掉之后队友能拿到
+    expect(acquire(CONN, 's1:mate-地编', [CURRENT_LEVEL_LOCK], { soft: true }).ok).toBe(true)
   })
 })

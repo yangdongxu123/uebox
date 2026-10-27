@@ -37,7 +37,7 @@ export interface MultimodalContentItem {
 }
 
 /**
- * 聊天消息内容类型（支持纯文本或多模态内容）
+ * 对话消息内容类型（支持纯文本或多模态内容）
  */
 export type ChatMessageContent = string | MultimodalContentItem[]
 
@@ -176,6 +176,21 @@ export interface HydratedTypingMessage {
  */
 const hydratedTypingMessages: HydratedTypingMessage[] = []
 
+/** 一个对话在盘上的样子（`chat-history/sessions/<sid>.json`） */
+export interface PersistedChatSession {
+  sid: string
+  messages: unknown[]
+  historySummary?: string
+  compressedUserCount?: number
+}
+
+/** 盘上的对话怎么读。由持久化插件接上（见 `utils/chatMessagesPersistence.ts`） */
+export interface ChatSessionSource {
+  /** sid → 还挂在 typing 上的消息 id */
+  typing: ReadonlyMap<string, readonly string[]>
+  read: (sid: string) => string | null
+}
+
 /** 取走并清空待裁决清单 —— 只该由重连流程调用一次 */
 export function takeHydratedTypingMessages(): HydratedTypingMessage[] {
   return hydratedTypingMessages.splice(0, hydratedTypingMessages.length)
@@ -186,11 +201,15 @@ export function takeHydratedTypingMessages(): HydratedTypingMessage[] {
  *
  * 内容还是初始占位符就整条换掉（这轮一个字都没输出），已经有正文就在末尾
  * 补一行标记 —— 用户写了一半的那段回复不该因为一次刷新就没了。
+ * `label` 由调用方传入：store 不引 i18n，中断的原话各处可能不同。
  */
-export function interruptedTypingContent(content: ChatMessageContent): ChatMessageContent {
+export function interruptedTypingContent(
+  content: ChatMessageContent,
+  label: string
+): ChatMessageContent {
   if (typeof content !== 'string') return content
-  if (isTypingPlaceholder(content) || content.trim() === '') return '会话已中断（页面刷新）'
-  return `${content}\n\n*[会话已中断（页面刷新）]*`
+  if (isTypingPlaceholder(content) || content.trim() === '') return label
+  return `${content}\n\n*[${label}]*`
 }
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
@@ -228,28 +247,138 @@ export const useChatMessagesStore = defineStore(
   () => {
     const messagesBySid = ref<Record<string, ChatMessage[]>>({})
     const stoppedBySid = ref<Record<string, boolean>>({})
-    // 压缩历史摘要缓存：只保存每个会话的历史对话摘要（assistant消息）
+    // 压缩历史摘要缓存：只保存每个对话的历史对话摘要（assistant消息）
     const historySummaryBySid = ref<Record<string, string>>({})
-    // 已压缩的user消息计数：记录每个会话已经压缩了多少条user消息
+    // 已压缩的user消息计数：记录每个对话已经压缩了多少条user消息
     const compressedUserCountBySid = ref<Record<string, number>>({})
 
     /**
-     * 获取指定会话的消息列表
-     * @param sid 会话ID
+     * 对话正文是**用到才读**的：一个对话一个文件（`main/ipc/chatSessionFiles.ts`），
+     * 第一次碰到某个对话时同步读进来。store 的接口全是同步的，调用方不用管
+     * 这件事 —— 每个按 sid 取数据的地方都先过 `keyOf`。
+     *
+     * 读过的（含读了发现盘上没有的）记在这里，不再读第二遍：之后内存那份是准的。
+     */
+    const loadedSids = new Set<string>()
+    let sessionSource: ChatSessionSource | null = null
+
+    function keyOf(sid: unknown): string {
+      const k = String(sid || '').trim()
+      if (k && !loadedSids.has(k)) loadSession(k)
+      return k
+    }
+
+    /**
+     * 盘上有、但读不出来的对话（文件损坏、IPC 出错）。界面上按空对话显示，
+     * 但**不写回**：写回就是拿一份空的或只有新消息的盖掉那份还可能救回来的文件。
+     */
+    const unreadableSids = new Set<string>()
+
+    function loadSession(k: string): void {
+      loadedSids.add(k)
+      if (!sessionSource) return
+      try {
+        // 不看索引里有没有：索引可能没跟上，盘上有的对话绝不能当成空的
+        const raw = sessionSource.read(k)
+        if (raw) applySession(k, JSON.parse(raw) as PersistedChatSession)
+      } catch (error) {
+        unreadableSids.add(k)
+        console.error(`[chatMessages] 对话 ${k} 的历史读不出来，本次不保存它:`, error)
+      }
+    }
+
+    function applySession(k: string, data: PersistedChatSession): void {
+      if (!Array.isArray(data?.messages)) throw new Error('文件里没有消息列表')
+      // 追加提问请求活在渲染层，重开后无法恢复，不能留一个永远转圈的按钮
+      messagesBySid.value[k] = (data.messages as ChatMessage[]).map((msg) =>
+        msg?.suggestionsLoading ? { ...msg, suggestionsLoading: false } : msg
+      )
+      if (typeof data.historySummary === 'string')
+        historySummaryBySid.value[k] = data.historySummary
+      if (
+        typeof data.compressedUserCount === 'number' &&
+        Number.isFinite(data.compressedUserCount)
+      ) {
+        compressedUserCountBySid.value[k] = data.compressedUserCount
+      }
+    }
+
+    /**
+     * 接上盘上的对话：记下有哪些对话，并把还挂在 typing 上的回复交给重连流程。
+     * 索引里就有 typing 清单，不必为此把每个对话都读一遍。
+     */
+    function attachSessionSource(source: ChatSessionSource): void {
+      sessionSource = source
+      hydratedTypingMessages.splice(0, hydratedTypingMessages.length)
+      for (const [sid, messageIds] of source.typing) {
+        for (const messageId of messageIds) hydratedTypingMessages.push({ sid, messageId })
+      }
+      if (hydratedTypingMessages.length > 0) {
+        console.log(
+          `[chatMessages] ${hydratedTypingMessages.length} 条回复还挂在 typing 上，等重连流程裁决`
+        )
+      }
+    }
+
+    /**
+     * 一个对话落盘用的那份。对话已经没了（删掉或从没有过）返回 null；
+     * 盘上那份读不出来时返回 undefined —— 这种不能写，见 `unreadableSids`
+     */
+    function exportSession(sid: string): { json: string; typing: string[] } | null | undefined {
+      const k = String(sid || '').trim()
+      if (unreadableSids.has(k)) return undefined
+      const messages = toRaw(messagesBySid.value[k])
+      const historySummary = historySummaryBySid.value[k]
+      const compressedUserCount = compressedUserCountBySid.value[k]
+      if (!messages && historySummary === undefined) return null
+      const session: PersistedChatSession = { sid: k, messages: messages ?? [] }
+      if (historySummary !== undefined) session.historySummary = historySummary
+      if (compressedUserCount !== undefined) session.compressedUserCount = compressedUserCount
+      return {
+        json: JSON.stringify(session),
+        typing: (messages ?? [])
+          .filter((m) => m.role === 'assistant' && m.status === 'typing')
+          .map((m) => m.id)
+      }
+    }
+
+    /**
+     * 最后一条是不是还在打字的助手回复。
+     *
+     * 侧栏每个对话都要问一遍（画「在跑」那个小圆点），为它把对话读进来不值得：
+     * 没读过的直接查索引里的 typing 清单。
+     */
+    function isLastReplyTyping(sid: string): boolean {
+      const k = String(sid || '').trim()
+      if (!k) return false
+      // 先读一下响应式的这一格：之后对话被读进来时，侧栏能跟着重算
+      const last = messagesBySid.value[k]?.at(-1)
+      if (!loadedSids.has(k)) return (sessionSource?.typing.get(k)?.length ?? 0) > 0
+      return last?.role === 'assistant' && last?.status === 'typing'
+    }
+
+    /** 已经读进内存的对话。整份落盘（`$persist`）时用 */
+    function loadedSessionIds(): string[] {
+      return [...loadedSids]
+    }
+
+    /**
+     * 获取指定对话的消息列表
+     * @param sid 对话ID
      * @returns 消息数组（若不存在返回空数组）
      */
     function getMessages(sid: string): ChatMessage[] {
-      const k = String(sid || '').trim()
+      const k = keyOf(sid)
       if (!k) return []
       return messagesBySid.value[k] || []
     }
 
     /**
-     * 确保会话消息容器存在
-     * @param sid 会话ID
+     * 确保对话消息容器存在
+     * @param sid 对话ID
      */
     function ensureContainer(sid: string): void {
-      const k = String(sid || '').trim()
+      const k = keyOf(sid)
       if (!k) return
       if (!messagesBySid.value[k]) {
         messagesBySid.value[k] = []
@@ -258,7 +387,7 @@ export const useChatMessagesStore = defineStore(
 
     /**
      * 推入一条用户消息
-     * @param sid 会话ID
+     * @param sid 对话ID
      * @param content 文本内容或多模态内容
      * @param mentionedSources 可选的@提及来源列表
      * @param excelFiles 可选的 Excel 文件列表
@@ -284,7 +413,7 @@ export const useChatMessagesStore = defineStore(
 
     /**
      * 推入一条助手"打字中"的占位消息
-     * @param sid 会话ID
+     * @param sid 对话ID
      * @returns 占位消息ID
      */
     function pushAssistantTyping(sid: string, startTime?: number): string {
@@ -338,7 +467,7 @@ export const useChatMessagesStore = defineStore(
      * 「模型回了什么」是两条独立的管线，识别结果常常比回答的头几批文字晚到。
      * 按到达顺序追加的话，模型回答的前半句会排在用户那句上面。
      *
-     * 认不出那条锚（已经落定、或者根本不在这条会话里）就退回追加 ——
+     * 认不出那条锚（已经落定、或者根本不在这条对话里）就退回追加 ——
      * 位置不完美总好过消息直接丢了。
      *
      * 实现是「先照常 `pushUser`，再挪位置」，**不是自己拼一条**。消息 id 那串
@@ -357,7 +486,7 @@ export const useChatMessagesStore = defineStore(
 
     /**
      * 直接推入一条完成的助手消息
-     * @param sid 会话ID
+     * @param sid 对话ID
      * @param content 文本内容
      * @param options 可选配置（toolResults, actionButtons, agentProcess等）
      * @returns 消息ID
@@ -390,14 +519,14 @@ export const useChatMessagesStore = defineStore(
 
     /**
      * 替换助手“打字中”为最终文本或中间态
-     * @param sid 会话ID
+     * @param sid 对话ID
      * @param typingId 占位消息ID
      * @param content 替换文本内容
      * @param done 是否完成（true 则标记为 done）
      */
     /**
      * 替换助手“打字中”为最终文本或中间态，并可附加工具结果等元数据
-     * @param sid 会话ID
+     * @param sid 对话ID
      * @param typingId 占位消息ID
      * @param content 替换文本内容
      * @param done 是否完成（true 则标记为 done）
@@ -478,7 +607,7 @@ export const useChatMessagesStore = defineStore(
 
     /**
      * 追加文本到助手占位消息（流式）
-     * @param sid 会话ID
+     * @param sid 对话ID
      * @param typingId 占位消息ID
      * @param delta 增量文本
      */
@@ -493,7 +622,7 @@ export const useChatMessagesStore = defineStore(
 
     /**
      * 停止当前流式生成（标记为完成）
-     * @param sid 会话ID
+     * @param sid 对话ID
      * @param typingId 占位消息ID
      */
     function stopTyping(sid: string, typingId: string): void {
@@ -517,39 +646,39 @@ export const useChatMessagesStore = defineStore(
     }
 
     /**
-     * 查询会话是否已请求停止
-     * @param sid 会话ID
+     * 查询对话是否已请求停止
+     * @param sid 对话ID
      */
     function isStopped(sid: string): boolean {
       return !!stoppedBySid.value[String(sid || '').trim()]
     }
 
     /**
-     * 清空指定会话消息
-     * @param sid 会话ID
+     * 清空指定对话消息
+     * @param sid 对话ID
      */
     function clearSessionMessages(sid: string): void {
-      const k = String(sid || '').trim()
+      const k = keyOf(sid)
       if (!k) return
       messagesBySid.value[k] = []
     }
 
-    /** 用一份独立快照替换某个会话的消息（MiniChat → 主窗口同步）。 */
+    /** 用一份独立快照替换某个对话的消息（MiniChat → 主窗口同步）。 */
     function replaceSessionMessages(sid: string, messages: ChatMessage[]): void {
-      const k = String(sid || '').trim()
+      const k = keyOf(sid)
       if (!k || !Array.isArray(messages)) return
       messagesBySid.value[k] = JSON.parse(JSON.stringify(messages)) as ChatMessage[]
     }
 
     /**
-     * 会话被删除时，把它在这个 store 里的所有痕迹拿掉。
+     * 对话被删除时，把它在这个 store 里的所有痕迹拿掉。
      *
      * 与 `clearSessionMessages` 的区别是**删键**而不是置空：置空只清正文，
      * 留下的空数组、摘要、压缩计数会一直躺在历史文件里，删得越多攒得
-     * 越厚，而它们对应的会话早已不存在。
+     * 越厚，而它们对应的对话早已不存在。
      *
      * 四个 map 一个都不能漏 —— 只删 messagesBySid 的话，同一个 sid 万一被
-     * 复用（新会话恰好用了旧 id），历史摘要会以「上一段对话的记忆」的身份
+     * 复用（新对话恰好用了旧 id），历史摘要会以「上一段对话的记忆」的身份
      * 被注入进去。
      */
     function dropSession(sid: string): void {
@@ -557,15 +686,18 @@ export const useChatMessagesStore = defineStore(
     }
 
     /**
-     * 批量版的 `dropSession`：一次清掉一组会话在这四张 map 里的所有痕迹。
+     * 批量版的 `dropSession`：一次清掉一组对话在这四张 map 里的所有痕迹。
      *
-     * 单独存在的原因是动作语义：一批会话应当在同一个检查点里消失，不能让
+     * 单独存在的原因是动作语义：一批对话应当在同一个检查点里消失，不能让
      * 中间态落盘后留下只有摘要、没有正文的半截记录。
      */
     function dropSessions(sids: string[]): void {
       for (const sid of sids) {
         const k = String(sid || '').trim()
         if (!k) continue
+        // 记成「读过」：落盘删除之前再碰到它，不能从盘上把删掉的对话读回来
+        loadedSids.add(k)
+        unreadableSids.delete(k)
         delete messagesBySid.value[k]
         delete stoppedBySid.value[k]
         delete historySummaryBySid.value[k]
@@ -575,7 +707,7 @@ export const useChatMessagesStore = defineStore(
 
     /**
      * 设置消息的建议列表
-     * @param sid 会话ID
+     * @param sid 对话ID
      * @param messageId 消息ID
      * @param suggestions 建议数组
      */
@@ -604,7 +736,7 @@ export const useChatMessagesStore = defineStore(
 
     /**
      * 设置消息的建议加载状态
-     * @param sid 会话ID
+     * @param sid 对话ID
      * @param messageId 消息ID
      * @param loading 是否正在加载
      */
@@ -655,11 +787,11 @@ export const useChatMessagesStore = defineStore(
 
     /**
      * 删除指定索引及之后的所有消息
-     * @param sid 会话ID
+     * @param sid 对话ID
      * @param fromIndex 起始索引（包含该索引）
      */
     function deleteMessagesFromIndex(sid: string, fromIndex: number): void {
-      const k = String(sid || '').trim()
+      const k = keyOf(sid)
       if (!k) return
       const arr = messagesBySid.value[k]
       if (!arr || fromIndex < 0 || fromIndex >= arr.length) return
@@ -677,10 +809,10 @@ export const useChatMessagesStore = defineStore(
      * 工具调用、进度）都攒在**这同一条**消息里，报错文案只是最后盖上去的一层。
      * 删掉按钮所在的消息，等于把那一轮用户能看见的记录全抹了：屏幕上只剩自己
      * 发的那句话和一句「从断点继续执行…」，像是任务从头开始了（其实没有，
-     * 模型上下文在主进程那份会话里，续跑照旧接着断点走）。
+     * 模型上下文在主进程的内核 session 里，续跑照旧接着断点走）。
      */
     function clearActionButtons(sid: string, messageId: string): void {
-      const k = String(sid || '').trim()
+      const k = keyOf(sid)
       const id = String(messageId || '').trim()
       if (!k || !id) return
       const msg = messagesBySid.value[k]?.find((message) => message.id === id)
@@ -691,7 +823,7 @@ export const useChatMessagesStore = defineStore(
 
     /**
      * 更新用户消息内容
-     * @param sid 会话ID
+     * @param sid 对话ID
      * @param messageId 消息ID
      * @param newContent 新的消息内容
      */
@@ -700,7 +832,7 @@ export const useChatMessagesStore = defineStore(
       messageId: string,
       newContent: ChatMessageContent
     ): void {
-      const k = String(sid || '').trim()
+      const k = keyOf(sid)
       if (!k) return
       const arr = messagesBySid.value[k]
       if (!arr) return
@@ -724,7 +856,7 @@ export const useChatMessagesStore = defineStore(
       >,
       protectedId?: string | null
     ): Set<string> {
-      const k = String(sid || '').trim()
+      const k = keyOf(sid)
       if (!k) return new Set()
       let skipped = new Set<string>()
       if (patch.full || patch.order || patch.messages?.length) {
@@ -749,88 +881,79 @@ export const useChatMessagesStore = defineStore(
 
     /**
      * 获取已压缩的user消息数
-     * @param sid 会话ID
+     * @param sid 对话ID
      * @returns 已压缩的user消息数，如果不存在则返回0
      */
     function getCompressedUserCount(sid: string): number {
-      const k = String(sid || '').trim()
+      const k = keyOf(sid)
       if (!k) return 0
       return compressedUserCountBySid.value[k] || 0
     }
 
     /**
      * 设置已压缩的user消息数
-     * @param sid 会话ID
+     * @param sid 对话ID
      * @param count 已压缩的user消息数
      */
     function setCompressedUserCount(sid: string, count: number): void {
-      const k = String(sid || '').trim()
+      const k = keyOf(sid)
       if (!k) return
       compressedUserCountBySid.value[k] = count
     }
 
     /**
      * 获取历史摘要（用于AI请求时插入）
-     * @param sid 会话ID
+     * @param sid 对话ID
      * @returns 历史摘要文本，如果不存在则返回null
      */
     function getHistorySummary(sid: string): string | null {
-      const k = String(sid || '').trim()
+      const k = keyOf(sid)
       if (!k) return null
       return historySummaryBySid.value[k] || null
     }
 
     /**
      * 设置历史摘要（保存压缩后的摘要文本）
-     * @param sid 会话ID
+     * @param sid 对话ID
      * @param summary 摘要文本
      */
     function setHistorySummary(sid: string, summary: string): void {
-      const k = String(sid || '').trim()
+      const k = keyOf(sid)
       if (!k) return
       historySummaryBySid.value[k] = summary
     }
 
     /**
      * 清空历史摘要
-     * @param sid 会话ID
+     * @param sid 对话ID
      */
     function clearHistorySummary(sid: string): void {
-      const k = String(sid || '').trim()
+      const k = keyOf(sid)
       if (!k) return
       delete historySummaryBySid.value[k]
     }
 
     /**
-     * 清空历史摘要（已废弃，保留兼容）
-     */
-    function clearHistorySummary_deprecated(sid: string): void {
-      const k = String(sid || '').trim()
-      if (!k) return
-      delete historySummaryBySid.value[k]
-    }
-
-    /**
-     * 把一个会话的消息复制到另一个会话（会话分支用）。
+     * 把一个对话的消息复制到另一个对话（分支用）。
      *
-     * `upToIndex` 是分叉点的下标，连它一起复制、后面的丢掉；不给就整份复制。
+     * `upToIndex` 是分支点的下标，连它一起复制、后面的丢掉；不给就整份复制。
      * 先按下标切再滤 typing，不能反过来 —— 下标是调用方在**没滤过**的这份
      * 列表上数出来的，先滤会让它错位。
      *
      * 深拷贝是必须的：两边之后各聊各的，共享引用会让分支里的编辑
-     * 写穿回源会话。JSON 往返而不是 structuredClone —— store 里的消息是
+     * 写穿回源对话。JSON 往返而不是 structuredClone —— store 里的消息是
      * Vue 响应式代理，structuredClone 直接 DataCloneError；而且这些数据
      * 本来就是 JSON 持久化的，往返一遍丢不了的才是真会丢的。
-     * typing 状态的丢弃 —— 分支建立时会话必然不在跑，
-     * 万一混进来一条，它在新会话里也永远不会有人收尾。
+     * typing 状态的丢弃 —— 分支建立时对话必然不在跑，
+     * 万一混进来一条，它在新对话里也永远不会有人收尾。
      */
     function copySessionMessages(
       fromSid: string,
       toSid: number | string,
       upToIndex?: number
     ): void {
-      const from = String(fromSid || '').trim()
-      const to = String(toSid || '').trim()
+      const from = keyOf(fromSid)
+      const to = keyOf(toSid)
       if (!from || !to || from === to) return
 
       const source = messagesBySid.value[from]
@@ -846,12 +969,12 @@ export const useChatMessagesStore = defineStore(
     /**
      * 把一条中断的回复收尾。
      *
-     * 页面刷新后，问过主进程、确认这条会话**真的已经不在跑了**才调这里。
+     * 页面刷新后，问过主进程、确认这条对话**真的已经不在跑了**才调这里。
      * 已经收过尾（status 不是 typing）的不再动 —— 重连流程和事件流可能先后
-     * 都碰到同一条消息，重复贴一遍标记会变成「会话已中断」叠两行。
+     * 都碰到同一条消息，重复贴一遍收尾标记会在气泡里叠两行。
      */
-    function markTypingInterrupted(sid: string, messageId: string): void {
-      const arr = messagesBySid.value[String(sid || '').trim()]
+    function markTypingInterrupted(sid: string, messageId: string, label: string): void {
+      const arr = messagesBySid.value[keyOf(sid)]
       if (!Array.isArray(arr)) return
 
       const idx = arr.findIndex((m) => m.id === messageId)
@@ -859,7 +982,7 @@ export const useChatMessagesStore = defineStore(
 
       arr[idx] = {
         ...arr[idx],
-        content: interruptedTypingContent(arr[idx].content),
+        content: interruptedTypingContent(arr[idx].content, label),
         status: 'done'
       }
     }
@@ -884,6 +1007,7 @@ export const useChatMessagesStore = defineStore(
       messagesBySid.value = restoreMessages(persisted.messagesBySid)
       historySummaryBySid.value = restoreStringRecord(persisted.historySummaryBySid)
       compressedUserCountBySid.value = restoreNumberRecord(persisted.compressedUserCountBySid)
+      for (const sid in messagesBySid.value) loadedSids.add(sid)
       // 停止标记只属于当前渲染进程，不跨启动恢复。
       stoppedBySid.value = {}
       hydratedTypingMessages.splice(0, hydratedTypingMessages.length)
@@ -943,7 +1067,11 @@ export const useChatMessagesStore = defineStore(
       markTypingInterrupted,
       applySyncMessages,
       exportChatMessagesPersistence,
-      hydrateChatMessagesPersistence
+      hydrateChatMessagesPersistence,
+      attachSessionSource,
+      exportSession,
+      loadedSessionIds,
+      isLastReplyTyping
     }
   },
   {}

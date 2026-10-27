@@ -23,6 +23,10 @@
         <div class="ask-user-question-head">
           <span class="ask-user-header">{{ current.header }}</span>
           <span class="ask-user-text">{{ current.question }}</span>
+          <!-- 多选和单选长得一样的话，用户点了第二个以为会顶掉第一个，根本不会去试 -->
+          <span v-if="current.multiSelect" class="ask-user-multi">
+            {{ t('assistant.askUser.multi') }}
+          </span>
         </div>
 
         <button
@@ -30,7 +34,7 @@
           :key="oi"
           type="button"
           class="ask-user-option"
-          :class="{ selected: isSelected(step, option.label) }"
+          :class="{ selected: isSelected(step, option.label), multi: current.multiSelect }"
           @click="selectOption(step, option.label, current.multiSelect)"
         >
           <span class="ask-user-option-label">{{ option.label }}</span>
@@ -48,13 +52,19 @@
             class="ask-user-other-input"
             type="text"
             :placeholder="t('assistant.askUser.otherPlaceholder')"
+            @input="delegated[step] = false"
             @keydown.enter.prevent="advance"
           />
         </div>
       </div>
 
       <div class="ask-user-actions">
-        <button type="button" class="ask-user-btn ghost" @click="decline">
+        <button
+          type="button"
+          class="ask-user-btn ghost"
+          :class="{ active: delegated[step] }"
+          @click="delegateCurrent"
+        >
           {{ t('assistant.askUser.decline') }}
         </button>
         <button v-if="step > 0" type="button" class="ask-user-btn ghost" @click="back">
@@ -65,6 +75,10 @@
         </button>
       </div>
       <div class="ask-user-hint">{{ t('assistant.askUser.declineHint') }}</div>
+      <!-- 全部权限档：到点按推荐项继续。倒计时写在脸上，人在场时知道还有多久可以改 -->
+      <div v-if="countdown" class="ask-user-hint ask-user-countdown">
+        {{ t('assistant.askUser.autoCountdown', { time: countdown }) }}
+      </div>
     </template>
 
     <template v-else>
@@ -105,10 +119,10 @@
  * 底下就是输入框，绑全局数字键会让用户没法打字 —— 而运行途中插话是这个
  * 应用里第一等重要的交互。只保留「其他」输入框里按回车走下一步。
  */
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
-import type { AgentQuestionItem } from '@core/shared/agentQuestion'
+import { DELEGATED_ANSWER, type AgentQuestionItem } from '@core/shared/agentQuestion'
 
 const props = defineProps<{ question: AgentQuestionItem }>()
 
@@ -128,6 +142,9 @@ const picked = ref<string[][]>(questions.value.map(() => []))
 /** 每一问「其他」里填的字 */
 const custom = ref<string[]>(questions.value.map(() => ''))
 
+/** 每一问是不是点了「你自己定」。逐问记，放手一问不影响别的几问已经选好的 */
+const delegated = ref<boolean[]>(questions.value.map(() => false))
+
 /** 现在停在第几问（0 起）。分步只影响显示，答案照样按下标存满整份 */
 const step = ref(0)
 
@@ -145,6 +162,7 @@ function isOtherActive(qi: number): boolean {
 
 function toggle(qi: number, label: string, multiSelect: boolean): void {
   const current = picked.value[qi] ?? []
+  delegated.value[qi] = false
 
   if (!multiSelect) {
     // 单选再点一次就是取消 —— 否则选错了没法退回「什么都没选」
@@ -174,6 +192,7 @@ function selectOption(qi: number, label: string, multiSelect: boolean): void {
  * 空串表示这一问没答，主进程那边会照实说「用户跳过了这一问」。
  */
 function answerFor(qi: number): string {
+  if (delegated.value[qi]) return DELEGATED_ANSWER
   const parts = [...(picked.value[qi] ?? [])]
   const extra = custom.value[qi]?.trim()
   if (extra) parts.push(extra)
@@ -194,6 +213,11 @@ function advance(): void {
     return
   }
 
+  // 每一问都放手了，才等于整张卡片「你自己定」
+  if (delegated.value.every(Boolean)) {
+    emit('answer', 'decline')
+    return
+  }
   emit(
     'answer',
     'accept',
@@ -205,13 +229,49 @@ function back(): void {
   if (step.value > 0) step.value -= 1
 }
 
-function decline(): void {
-  emit('answer', 'decline')
+/**
+ * 「你自己定」只管**当前这一问**：清掉这一问的选择，翻到下一问；最后一问就直接提交。
+ * 原来它是整张卡片的 decline，第三问点一下，前两问选好的全没了。
+ */
+function delegateCurrent(): void {
+  const qi = step.value
+  picked.value[qi] = []
+  custom.value[qi] = ''
+  delegated.value[qi] = true
+  advance()
 }
+
+/** 倒计时用的「现在」。只在有倒计时的待答卡片上走表，答完就停 */
+const now = ref(Date.now())
+let ticker: ReturnType<typeof setInterval> | undefined
+
+watch(
+  () => (pending.value ? props.question.autoAnswerAt : undefined),
+  (deadline) => {
+    if (ticker) clearInterval(ticker)
+    ticker = undefined
+    if (!deadline) return
+    now.value = Date.now()
+    ticker = setInterval(() => (now.value = Date.now()), 1000)
+  },
+  { immediate: true }
+)
+onBeforeUnmount(() => {
+  if (ticker) clearInterval(ticker)
+})
+
+/** 剩余时间，m:ss。到点后主进程会作答并收掉卡片，这里停在 0:00 等那一下 */
+const countdown = computed(() => {
+  const deadline = props.question.autoAnswerAt
+  if (!pending.value || !deadline) return ''
+  const left = Math.max(0, Math.ceil((deadline - now.value) / 1000))
+  return `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`
+})
 
 const stateLabel = computed(() => {
   const action = props.question.action
   if (!action) return t('assistant.askUser.waiting')
+  if (props.question.auto) return t('assistant.askUser.autoAnswered')
   if (action === 'decline') return t('assistant.askUser.declined')
   if (action === 'cancel') return t('assistant.askUser.cancelled')
   return t('assistant.askUser.answered')
@@ -225,8 +285,9 @@ const stateClass = computed(() => {
 
 /** 只读态下这一问显示什么。没选的明说「没选」，别留一片空白让人以为界面坏了 */
 function answerLabel(qi: number): string {
-  const answer = props.question.answers?.[qi]?.trim()
-  return answer || t('assistant.askUser.skippedOne')
+  const raw = props.question.answers?.[qi]
+  if (raw === DELEGATED_ANSWER) return t('assistant.askUser.delegatedOne')
+  return raw?.trim() || t('assistant.askUser.skippedOne')
 }
 </script>
 
@@ -301,6 +362,12 @@ function answerLabel(qi: number): string {
   font-size: var(--font-size-xs);
 }
 
+.ask-user-multi {
+  margin-left: var(--space-2);
+  font-size: var(--font-size-xs);
+  color: var(--color-accent-text);
+}
+
 .ask-user-text {
   font-size: var(--font-size-sm);
   color: var(--color-text-primary);
@@ -325,6 +392,23 @@ function answerLabel(qi: number): string {
   &.selected {
     background: var(--color-bg-option-selected);
     border-color: var(--color-accent-border);
+  }
+
+  // 多选项前面画个方框，选中打勾 —— 一眼看出能勾好几个
+  &.multi .ask-user-option-label::before {
+    content: '';
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    margin-right: var(--space-1);
+    border: 1px solid var(--color-border);
+    border-radius: 2px;
+    vertical-align: -1px;
+  }
+
+  &.multi.selected .ask-user-option-label::before {
+    border-color: var(--color-accent-solid);
+    background: var(--color-accent-solid);
   }
 }
 
@@ -385,6 +469,12 @@ function answerLabel(qi: number): string {
     &:hover {
       background: var(--color-bg-surface-hover);
     }
+
+    // 回到一问时，看得出这一问之前点过「你自己定」
+    &.active {
+      border-color: var(--color-accent-border);
+      color: var(--color-accent-text);
+    }
   }
 
   &.primary {
@@ -403,6 +493,11 @@ function answerLabel(qi: number): string {
   text-align: right;
   font-size: var(--font-size-xs);
   color: var(--color-text-muted);
+}
+
+.ask-user-countdown {
+  color: var(--color-accent-text);
+  font-variant-numeric: tabular-nums;
 }
 
 .ask-user-answered {

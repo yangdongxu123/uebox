@@ -12,7 +12,7 @@ import { DEFAULT_GOAL_MAX_ROUNDS, normalizeGoalMaxRounds } from '../shared/goalR
  *
  * - `window`：独立窗口。看得最清楚，也最容易被用户接管，但它会抢焦点、
  *   盖在虚幻上面 —— 用户正在编辑器里干活时，这是一次打断。
- * - `embedded`：嵌在助手页面右侧分屏，聊天和网页同屏看。**这是默认档**：
+ * - `embedded`：嵌在助手页面右侧分屏，对话和网页同屏看。**这是默认档**：
  *   一样看得见（安全前提不变），但不抢窗口。
  * - `hidden`：不显示。**这一档会削弱这套能力的核心安全性质** ——
  *   「用户能看到 agent 在操作什么」不再成立，只剩审批弹窗和台账。
@@ -60,6 +60,12 @@ interface AppSettings {
   /** 启动项目时自动启用 UnrealAgentLink 插件 */
   autoEnableUnrealAgentLink: boolean
   /**
+   * 首次导入工程时「要不要装连接插件」那一问，问过没有。只问一次，答完不再问。
+   *
+   * 老用户（升级前就有配置文件）一律算问过：他们一直是自动安装，没必要补问。
+   */
+  ualinkInstallPromptShown: boolean
+  /**
    * 明确拒绝安装 UnrealAgentLink 的项目（规范化后的 .uproject 路径）。
    *
    * 用户在项目上点过「移除 UnrealAgentLink」就进这个名单。没有它的话，
@@ -105,6 +111,13 @@ interface AppSettings {
    */
   agentDisabledTools: string[]
   /**
+   * 审批卡片上点过「以后都允许」的工具名。默认空。
+   *
+   * 按工具名记，覆盖的是工具声明的风险；逐次审批的工具和只读对话不受它影响
+   * （判定在 `agent-v3/core/approval.ts`）。用户在「偏好设置 → AI」里能看到、能移除。
+   */
+  agentAlwaysAllowedTools: string[]
+  /**
    * 工具搜索模式下，偏离内置常驻清单的那些工具。`true` = 强行常驻，`false` = 改成搜索加载。
    *
    * 同样只存**差量**：内置常驻清单会随实验结论调整（见 `toolSearch.ts` 的
@@ -137,16 +150,37 @@ interface AppSettings {
    * 结果里混着一堆当下动不了的资产，比只看眼前这个库更让人迷糊。
    */
   assetCrossVaultSearch: boolean
+  /**
+   * agent 改资产期间，把它锁住的 `.uasset` 设成只读，挡住用户在编辑器里手动保存。
+   *
+   * 默认关：只读位挡的是**用户自己**的 Ctrl+S —— 用户在编辑器里存不了自己的
+   * 改动、弹一个「文件只读」，比偶尔两边写同一个资产更让人困惑。会话之间的
+   * 内存锁（`agent-v3/core/assetLock.ts`）不受这个开关影响。
+   */
+  assetReadonlyLock: boolean
+  /**
+   * Agent 浏览器能不能打开本机和局域网地址（localhost、192.168.x.x、*.local）。
+   *
+   * 默认关：浏览器打开的往往是不受信任的网页，网页里的链接和跳转能借 agent
+   * 的手去访问路由器后台、本机服务（SSRF）。用户在本机起了开发服务器、
+   * 想让 agent 看一眼时再打开。
+   */
+  agentBrowserAllowLocalNetwork: boolean
 }
 
 /**
  * 默认设置值
  */
 const DEFAULT_SETTINGS: AppSettings = {
-  autoLaunch: true,
+  // 默认关：不问一声就登记开机启动、静默进托盘，用户嫌打扰，安全软件也按可疑处理。
+  // 盒子是从项目里开虚幻时才用得上，想常驻的人去设置页打开
+  autoLaunch: false,
   enableFollowUpSuggestions: false,
   language: 'zh-CN',
-  autoEnableUnrealAgentLink: true,
+  // 默认关：往用户工程里写插件、改 .uproject，得先问一声。首次导入工程时弹窗问，
+  // 用户点了安装才打开（见 `ualinkInstallPromptShown`）
+  autoEnableUnrealAgentLink: false,
+  ualinkInstallPromptShown: false,
   ualinkOptOutProjects: [],
   // 默认嵌入助手：安全前提「用户看得见 agent 在操作什么」照样成立，
   // 但不会弹一个独立窗口盖在虚幻上面打断用户。默认值不该是把它藏起来的那一档
@@ -162,6 +196,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   agentGoalMaxRounds: DEFAULT_GOAL_MAX_ROUNDS,
   // 默认全部打开。设置页里那一长串开关，起手状态就该等于「什么都没设置过」
   agentDisabledTools: [],
+  agentAlwaysAllowedTools: [],
   agentResidentTools: {},
   // 默认开着，但只在窗口不在前台时响。盒子干的是长活，用户派完就切回虚幻里
   // 接着做自己的事 —— 而审批**超时五分钟按拒绝算**，不提醒的话他回来只看到
@@ -174,7 +209,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   // 默认开着。崩溃报告窗口不点就一直挡着，agent 那一轮活也就停在那儿；
   // 重开之前会把未保存的自动存档备份好，不替用户决定恢复不恢复
   autoRecoverEditorCrash: true,
-  assetCrossVaultSearch: false
+  assetCrossVaultSearch: false,
+  assetReadonlyLock: false,
+  agentBrowserAllowLocalNetwork: false
 }
 
 /** 只保留字符串项；不是数组就当空名单 */
@@ -225,16 +262,21 @@ class AppSettingsManager {
           autoLaunch: mergedSettings.autoLaunch,
           enableFollowUpSuggestions: mergedSettings.enableFollowUpSuggestions,
           language: mergedSettings.language,
-          autoEnableUnrealAgentLink: mergedSettings.autoEnableUnrealAgentLink,
+          // 老配置里没写这个字段的，按当时的默认（开）算，别让升级悄悄把它关掉
+          autoEnableUnrealAgentLink: savedSettings.autoEnableUnrealAgentLink !== false,
+          // 有配置文件就是老用户：没写这个字段说明是升级上来的，不再补问
+          ualinkInstallPromptShown: savedSettings.ualinkInstallPromptShown !== false,
           ualinkOptOutProjects: mergedSettings.ualinkOptOutProjects,
           agentBrowserMode: mergedSettings.agentBrowserMode,
           agentFileAccessScope: mergedSettings.agentFileAccessScope,
-          // 没拨过的跟着新默认走（见 `agentToolSearchUserSet`）。全量模式下关过的工具
-          // 切过去之后不再被滤掉，但也不常驻 —— 模型主动搜到才会取回
+          // 没拨过的跟着新默认走（见 `agentToolSearchUserSet`）。例外：在全量模式下关过工具的
+          // 老用户留在全量模式 —— 搜索模式不认那份名单，切过去等于把他关掉的工具又放出来
           agentToolSearchEnabled:
             savedSettings.agentToolSearchUserSet === true
               ? savedSettings.agentToolSearchEnabled === true
-              : DEFAULT_SETTINGS.agentToolSearchEnabled,
+              : sanitizeToolNames(mergedSettings.agentDisabledTools).length > 0
+                ? savedSettings.agentToolSearchEnabled === true
+                : DEFAULT_SETTINGS.agentToolSearchEnabled,
           agentToolSearchUserSet: savedSettings.agentToolSearchUserSet === true,
           // 只有用户明确关掉才算关：旧配置里没有这个字段的，跟着默认走
           agentPersistentAutoResume: mergedSettings.agentPersistentAutoResume !== false,
@@ -244,13 +286,17 @@ class AppSettingsManager {
           // 这两份名单只会让模型少拿到工具，读坏了宁可全给，不能让人对着一个
           // 空空如也的助手查半天
           agentDisabledTools: sanitizeToolNames(mergedSettings.agentDisabledTools),
+          agentAlwaysAllowedTools: sanitizeToolNames(mergedSettings.agentAlwaysAllowedTools),
           agentResidentTools: sanitizeResidentTools(mergedSettings.agentResidentTools),
           notifyTurnComplete: mergedSettings.notifyTurnComplete,
           notifyApprovalRequired: mergedSettings.notifyApprovalRequired,
           notifyQuestionRequired: mergedSettings.notifyQuestionRequired,
           hideWindowOnProjectLaunch: mergedSettings.hideWindowOnProjectLaunch,
           autoRecoverEditorCrash: mergedSettings.autoRecoverEditorCrash,
-          assetCrossVaultSearch: mergedSettings.assetCrossVaultSearch === true
+          assetCrossVaultSearch: mergedSettings.assetCrossVaultSearch === true,
+          // 这两个都是放宽或改动用户文件的开关，只有明确写着 true 才算开
+          assetReadonlyLock: mergedSettings.assetReadonlyLock === true,
+          agentBrowserAllowLocalNetwork: mergedSettings.agentBrowserAllowLocalNetwork === true
         }
       }
     } catch (error) {
@@ -295,6 +341,30 @@ class AppSettingsManager {
   }
 
   /** 同上：先落盘再更新内存 */
+  setAssetReadonlyLock(enabled: boolean): void {
+    const next = { ...this.settings, assetReadonlyLock: enabled }
+    writeFileSync(this.configPath, JSON.stringify(next, null, 2))
+    this.settings = next
+  }
+
+  /** 锁住的资产要不要设只读位。只认 true（见字段注释） */
+  getAssetReadonlyLock(): boolean {
+    return this.settings.assetReadonlyLock === true
+  }
+
+  /** 同上：先落盘再更新内存 */
+  setAgentBrowserAllowLocalNetwork(enabled: boolean): void {
+    const next = { ...this.settings, agentBrowserAllowLocalNetwork: enabled }
+    writeFileSync(this.configPath, JSON.stringify(next, null, 2))
+    this.settings = next
+  }
+
+  /** Agent 浏览器能不能访问本机和局域网地址。只认 true（见字段注释） */
+  getAgentBrowserAllowLocalNetwork(): boolean {
+    return this.settings.agentBrowserAllowLocalNetwork === true
+  }
+
+  /** 同上：先落盘再更新内存 */
   setAgentPersistentAutoResume(enabled: boolean): void {
     const next = { ...this.settings, agentPersistentAutoResume: enabled }
     writeFileSync(this.configPath, JSON.stringify(next, null, 2))
@@ -316,6 +386,27 @@ class AppSettingsManager {
     const next = { ...this.settings, agentDisabledTools: sanitizeToolNames(names) }
     writeFileSync(this.configPath, JSON.stringify(next, null, 2))
     this.settings = next
+  }
+
+  /** 「以后都允许」的名单整份替换（设置页移除一项时用）。先落盘再更新内存 */
+  setAgentAlwaysAllowedTools(names: string[]): void {
+    const next = {
+      ...this.settings,
+      agentAlwaysAllowedTools: [...new Set(sanitizeToolNames(names))]
+    }
+    writeFileSync(this.configPath, JSON.stringify(next, null, 2))
+    this.settings = next
+  }
+
+  /** 审批卡片上点了「以后都允许」。已在名单里就不重写文件 */
+  addAgentAlwaysAllowedTool(name: string): void {
+    const current = this.getAgentAlwaysAllowedTools()
+    if (current.includes(name)) return
+    this.setAgentAlwaysAllowedTools([...current, name])
+  }
+
+  getAgentAlwaysAllowedTools(): string[] {
+    return this.settings.agentAlwaysAllowedTools ?? []
   }
 
   /** 工具搜索模式下偏离内置常驻清单的那些 */
@@ -368,12 +459,19 @@ class AppSettingsManager {
     return this.applyAutoLaunchSetting(enabled, true)
   }
 
+  /**
+   * 启动时对一次开机自启：系统里的状态就是真相，只把它读回设置文件，**不往回写**。
+   *
+   * 以前每次启动都重写一遍：Windows 上这一写会顺手删掉任务管理器 / 360 记的
+   * 「已禁用」（StartupApproved），用户关一次、下次开机又回来 —— 关不掉，
+   * 而「自己把被禁的启动项改回来」正是安全软件按病毒处理的那种行为。
+   */
   ensureAutoLaunchSetting(): boolean {
-    if (!this.settings.autoLaunch) {
-      return true
+    const actual = this.getAutoLaunchStatus()
+    if (actual !== this.settings.autoLaunch) {
+      this.saveSettings({ autoLaunch: actual })
     }
-
-    return this.applyAutoLaunchSetting(true, false)
+    return true
   }
 
   /**
@@ -382,8 +480,13 @@ class AppSettingsManager {
    */
   getAutoLaunchStatus(): boolean {
     try {
-      const loginItemSettings = app.getLoginItemSettings()
-      return loginItemSettings.openAtLogin
+      if (process.platform === 'win32') {
+        // 登记时带了 --hidden，查的时候不带，openAtLogin 永远是 false（设置页一直显示「关」）。
+        // executableWillLaunchAtLogin 不比参数，并且认任务管理器 / 360 里的「已禁用」
+        return app.getLoginItemSettings({ path: process.execPath, args: [START_HIDDEN_ARG] })
+          .executableWillLaunchAtLogin
+      }
+      return app.getLoginItemSettings().openAtLogin
     } catch (error) {
       logger.error('获取开机自启状态失败:', error)
       return this.settings.autoLaunch
@@ -538,6 +641,15 @@ class AppSettingsManager {
    */
   getAutoEnableUnrealAgentLink(): boolean {
     return this.settings.autoEnableUnrealAgentLink
+  }
+
+  /** 首次导入时的安装询问是否已经问过 */
+  getUALinkInstallPromptShown(): boolean {
+    return this.settings.ualinkInstallPromptShown
+  }
+
+  setUALinkInstallPromptShown(shown: boolean): void {
+    this.saveSettings({ ualinkInstallPromptShown: shown })
   }
 
   /**

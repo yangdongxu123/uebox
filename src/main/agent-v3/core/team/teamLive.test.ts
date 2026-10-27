@@ -53,6 +53,46 @@ describe('送法', () => {
     expect((await store.takeInbox('程序')).map((m) => m.text)).toEqual(['hi'])
   })
 
+  it('给制作人的通知不插话；下一条要它当场看的话把攒着的一起带上', async () => {
+    const steered: string[] = []
+    live.attach(PRODUCER, { steer: (t) => steered.push(t) })
+    const note = await live.send('美术', PRODUCER, '收到，正在画')
+    expect(note.delivery).toBe('queued')
+    expect(steered).toEqual([])
+
+    const done = await live.send('美术', PRODUCER, '【交活】画好了', undefined, { interrupt: true })
+    expect(done.delivery).toBe('live')
+    expect(steered).toHaveLength(2)
+    expect(steered[0]).toContain('收到，正在画')
+    expect(steered[1]).toContain('【交活】画好了')
+    expect(await store.takeInbox(PRODUCER)).toEqual([])
+  })
+
+  it('制作人在等回复时，别人的通知不叫醒它，那条回复照样交给它', async () => {
+    live.attach('程序', { steer: () => undefined })
+    const { mail } = await live.send(PRODUCER, '程序', '接口定了吗？')
+    const waits = live.waitReply(PRODUCER, mail.id, 1000)
+    expect((await live.send('美术', PRODUCER, '贴图放好了')).delivery).toBe('queued')
+    expect((await live.send('程序', PRODUCER, '定了', mail.id)).delivery).toBe('handed')
+    await expect(waits).resolves.toMatchObject({ kind: 'reply', mail: { text: '定了' } })
+  })
+
+  it('队员带 wait 给制作人发话：当场插进去', async () => {
+    const steered: string[] = []
+    live.attach(PRODUCER, { steer: (t) => steered.push(t) })
+    const tool = createMessageTool(store, '美术', live)
+    const pending = text(tool, {
+      to: PRODUCER,
+      text: '要什么风格？',
+      wait: 'read',
+      wait_seconds: 10
+    })
+    while (steered.length === 0) await new Promise((r) => setTimeout(r, 5))
+    expect(steered[0]).toContain('要什么风格？')
+    live.consumed(PRODUCER, steered[0]!)
+    await expect(pending).resolves.toMatch(/回执：制作人 已读到|回执：producer 已读到/)
+  })
+
   it('插进去了但它没来得及读就收工：退回信箱，不丢', async () => {
     const detach = live.attach('程序', { steer: () => undefined })
     await live.send('美术', '程序', '别忘了存盘')
@@ -163,5 +203,57 @@ describe('标记', () => {
     })
     expect(rendered).toMatch(/^\[team mail m7 · from 制作人\] This is not the user speaking\./)
     expect(mailIdsIn(rendered)).toEqual(['m7'])
+  })
+})
+
+describe('给界面的动静', () => {
+  it('谁在跑、谁在等、谁手上有活都看得到；每次变化都通知一声', async () => {
+    let changes = 0
+    const watched = createTeamLive(store, () => changes++)
+    const detach = watched.attach('程序', { steer: () => undefined })
+    watched.setAssignment('程序', '\n做波次系统\n第二行细节')
+    const done = watched.awaiting('程序')
+    const controller = new AbortController()
+    const waiting = watched.waitReply('美术', 'm1', 60_000, controller.signal)
+
+    expect(watched.view()).toEqual({
+      running: ['程序'],
+      waiting: ['美术'],
+      awaited: ['程序'],
+      assignments: [{ member: '程序', text: '做波次系统', since: expect.any(Number) }],
+      recent: []
+    })
+    expect(changes).toBe(4)
+
+    controller.abort()
+    await expect(waiting).rejects.toThrow()
+    done()
+    watched.setAssignment('程序', null)
+    await detach()
+    expect(watched.view()).toEqual({
+      running: [],
+      waiting: [],
+      awaited: [],
+      assignments: [],
+      recent: []
+    })
+    expect(changes).toBe(8)
+  })
+})
+
+describe('队员的动态', () => {
+  it('当场推给界面，每人只留最近几条；空行不记', () => {
+    const pushed: string[] = []
+    const watched = createTeamLive(store, undefined, (a) => pushed.push(`${a.member}:${a.text}`))
+    watched.note('程序', '调用 ue_save /Game/A')
+    watched.note('程序', '   ')
+    for (let i = 0; i < 10; i++) watched.note('美术', `第 ${i} 步`)
+    expect(pushed[0]).toBe('程序:调用 ue_save /Game/A')
+    expect(pushed).toHaveLength(11)
+    const recent = watched.view().recent
+    expect(recent.filter((a) => a.member === '美术').map((a) => a.text)).toEqual(
+      Array.from({ length: 8 }, (_, i) => `第 ${i + 2} 步`)
+    )
+    expect(recent.filter((a) => a.member === '程序')).toHaveLength(1)
   })
 })

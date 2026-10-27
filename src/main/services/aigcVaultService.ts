@@ -2,6 +2,7 @@ import Database from 'better-sqlite3'
 import { promises as fs } from 'fs'
 import { existsSync } from 'fs'
 import { join } from 'path'
+import { applyVaultConnectionPragmas } from '../sqliteDataBase/vaultConnectionPragmas'
 import { createAssetFolder, getAssetFolderByKey } from '../sqliteDataBase/models/assetFolder'
 import {
   SYSTEM_VAULT_KEYS,
@@ -10,13 +11,14 @@ import {
   type VaultInfo
 } from '../sqliteDataBase/VaultManager'
 
-export type AIGCAssetType = 'image' | 'model' | 'video' | 'music'
+export type AIGCAssetType = 'image' | 'model' | 'video' | 'music' | 'sound'
 
 const AIGC_SUBDIRS: Record<AIGCAssetType, string> = {
   image: '图片',
   model: '模型',
   video: '视频',
-  music: '音乐'
+  music: '音乐',
+  sound: '音效'
 }
 
 export function getAIGCVaultInfoOrThrow(): VaultInfo {
@@ -59,8 +61,7 @@ export function openAIGCVaultDatabase(): {
   }
 
   const db = new Database(dbPath)
-  db.pragma('journal_mode = WAL')
-  db.pragma('busy_timeout = 5000')
+  applyVaultConnectionPragmas(db)
 
   return {
     db,

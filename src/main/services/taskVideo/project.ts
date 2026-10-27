@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { assertPathAllowed } from '../../agent-v3/tools/builtin/pathBoundary'
 import { retryMediaFile } from './files'
+import { fileNameFor } from '../../ipc/chatSessionFiles'
 
 export interface VideoContextEntry {
   index: number
@@ -80,20 +81,35 @@ export async function loadConversationVideoMessages(
       return {
         messages: [],
         warning:
-          '当前 Agent 尚未对应到唯一的已保存聊天记录，将使用可用的 Agent 记录；早期内容可能仅剩摘要。'
+          '当前 Agent 尚未对应到唯一的已保存对话记录，将使用可用的 Agent 记录；早期内容可能仅剩摘要。'
       }
+    }
+    const chatId = matches[0].id
+    // 一个对话一个文件（见 ipc/chatSessionFiles.ts）；还没迁移的老数据在单文件里
+    try {
+      const own = JSON.parse(
+        await fs.readFile(
+          path.join(userData, 'chat-history', 'sessions', fileNameFor(chatId)),
+          'utf8'
+        )
+      ) as { messages?: unknown }
+      return {
+        messages: conversationMessages({ messagesBySid: { [chatId]: own.messages } }, chatId)
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
     const saved = JSON.parse(
       await fs.readFile(path.join(userData, 'chat-history', 'chat-messages.json'), 'utf8')
     )
-    return { messages: conversationMessages(saved, matches[0].id) }
+    return { messages: conversationMessages(saved, chatId) }
   } catch (error) {
     return {
       messages: [],
       warning:
         (error as NodeJS.ErrnoException).code === 'ENOENT'
-          ? '没有保存的界面聊天记录，将使用可用的 Agent 记录；早期内容可能仅剩摘要。'
-          : '界面聊天记录暂时读不到，将使用可用的 Agent 记录；不要声称已经取得全部历史。'
+          ? '没有保存的界面对话记录，将使用可用的 Agent 记录；早期内容可能仅剩摘要。'
+          : '界面对话记录暂时读不到，将使用可用的 Agent 记录；不要声称已经取得全部历史。'
     }
   }
 }
@@ -155,7 +171,7 @@ export async function createVideoProject(
         ...(images.length
           ? {
               imageNote:
-                '会话预览副本，可能已压缩至 768px 宽；优先从本条及相关工具结果的路径使用磁盘原图。找不到原图时才用此副本，并说明清晰度限制。'
+                '对话预览副本，可能已压缩至 768px 宽；优先从本条及相关工具结果的路径使用磁盘原图。找不到原图时才用此副本，并说明清晰度限制。'
             }
           : {})
       })
@@ -175,7 +191,7 @@ export async function assertVideoProject(projectDir: string, sessionId: string):
   if (denial) throw new Error(denial)
   const metadata = JSON.parse(await fs.readFile(path.join(real, 'project.json'), 'utf8'))
   if (metadata.version !== 1 || metadata.sessionId !== sessionId)
-    throw new Error('该视频工程不属于当前会话。')
+    throw new Error('该视频工程不属于当前对话。')
   return real
 }
 

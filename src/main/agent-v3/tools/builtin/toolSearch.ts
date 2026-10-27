@@ -74,10 +74,12 @@ export const RESIDENT_TOOL_NAMES = [
 
 const CORE_NAMES = new Set<string>([
   ...RESIDENT_TOOL_NAMES,
-  // 宿主交互能力按文档 §5.6 常驻；会话归属沿用首版 Beta 的常驻行为。
+  // 宿主交互能力按文档 §5.6 常驻；对话归属沿用首版 Beta 的常驻行为。
   'ask_user',
   'voice_report',
   'set_session_project',
+  'update_plan',
+  'wrap_up',
   ...BROWSER_TOOL_NAMES
 ])
 
@@ -166,6 +168,7 @@ export const ALWAYS_RESIDENT_TOOL_NAMES = new Set<string>([
   // 工作室模式（`/team`）的四个。只有那种会话里才有它们，有就必须看得见 ——
   // 折进搜索的话，制作人得先搜到「招人」才能开始组队
   'team_hire',
+  'team_dismiss',
   'team_send',
   'team_board',
   'team_deliver',
@@ -191,35 +194,48 @@ export function isDefaultResidentTool(tool: GroupedTool): boolean {
  */
 const DOMAIN_TERMS: Record<string, string> = {
   'ue.blueprint': '蓝图 逻辑 节点 变量 事件 函数 blueprint graph node logic event function',
+  'core.result':
+    '存档 大结果 目录 编号 查行 筛选 翻页 完整的行 archived ref result query rows filter page',
+  'ue.blueprint.usages':
+    '谁在用 哪些蓝图 用到 调用了 引用 波及 改名 删除 全局搜索 在所有蓝图中查找 uproperty ufunction find in blueprints usages callers references rename',
   'ue.material': '材质 材质实例 表面 颜色 贴图 纹理 material shader color surface texture',
   'ue.actor': '物体 场景 对象 位置 旋转 缩放 移动 灯光 actor transform spawn light',
   'ue.content': '内容浏览器 工程资产 内容 资产 content asset',
   'ue.content.import': '导入 导入资产 fbx 贴图 外部文件 入库 import ingest',
   'ue.content.organize': '整理 重命名 移动 删除 重定向 清理 organize rename move delete redirector',
+  'ue.content.edit':
+    '资产设置 属性 贴图设置 压缩 遮罩 最大尺寸 纹理组 翻转绿通道 碰撞复杂度 lod组 asset property texture srgb compression nanite collision lodgroup',
+  'ue.datatable': '数据表 表格 配置表 行 列 数值 datatable data table row column csv',
   'ue.content.audit': '体检 依赖 引用 占用 体积 排行 报错日志 audit dependency size reference log',
   'ue.editor': '编辑器 截图 保存 撤销 运行 测试 重启 editor screenshot save undo playtest restart',
   'ue.editor.autoplay':
     '试玩 自动试玩 机器人 按键 操作 走到 目标 autoplay bot play input objective',
   'ue.level': '关卡 场景 大纲 世界 分区 流送 level world outliner streaming',
+  'ue.level.lights':
+    '灯光 光源 点光源 聚光灯 阴影 阴影缓存 渲染线程 显卡 普查 light shadow point spot gpu census wpo',
   'ue.landscape':
     '地形 地表 高度图 虚拟纹理 rvt 融合 landscape terrain heightmap virtual texture blend',
   'ue.system': '性能 崩溃 日志 插件 控制台 脚本 卡顿 crash log performance plugin python',
-  'ue.widget': '界面 控件 按钮 文本 布局 widget umg ui layout button text',
+  'ue.widget':
+    '界面 控件 按钮 文本 布局 替换 删除 widget umg ui layout button text replace remove commonui',
   'ue.animation': '动画 骨骼 运动 animation skeleton motion',
   'ue.sequencer': '过场 镜头 摄像机 时间轴 序列 sequencer camera cinematic timeline',
   'ue.pcg': '程序化 散布 植被 pcg procedural scatter foliage',
   'ue.mesh': '网格 几何 模型 mesh geometry model',
+  'ue.mesh.optimize':
+    '生成 自动 lod 减面 远处低模 碰撞 简单碰撞 凸包 凸包分解 盒体 胶囊 穿模 lod collision convex hull decomposition box capsule',
   'ue.cpp': '代码 编译 类 模块 c++ compile code module',
   'ue.input': '输入 按键 操作 映射 input action key mapping',
+  'ue.input.edit': '加按键 绑定 键位 新建输入动作 改映射 add bind key mapping input action imc',
   box: '盒子 对话记录 会话 状态 导入 卡住 续传 技能 开关 备份 box session status import skill backup',
   asset: '盒子素材库 保管库 标签 文件夹 asset library vault tag folder',
   library: '蓝图库 材质库 片段 收藏 snippet library',
   project:
     '工程 项目 创建 打开 启动 打包 发布 可执行文件 冒烟 project create open launch package build exe smoke',
   engine: '引擎 版本 安装 路径 engine version install path',
-  aigc: '生成 图片 视频 三维 generate image video 3d',
+  aigc: '生成 图片 视频 三维 音效 声音 generate image video 3d sound effect sfx',
   'video.production':
-    '剪辑 成片 字幕 配音 台词 对白 语音合成 配乐 时间线 video edit subtitle voiceover tts speech render',
+    '剪辑 成片 字幕 配音 台词 对白 语音合成 音色 角色声音 配乐 时间线 video edit subtitle voiceover tts speech voice render',
   note: '笔记 记事 待办 摘录 note todo memo',
   notebook: '知识库 笔记本 wiki 文档库 notebook knowledge wiki',
   browser: '浏览器 网页 点击 输入 browser webpage click',
@@ -319,6 +335,9 @@ const UE_CONTENT_SUBGROUPS: Record<string, string> = {
   ue_fixup_redirectors: 'ue.content.organize',
   ue_project_path_refs: 'ue.content.organize',
   ue_content_naming_audit: 'ue.content.organize',
+  // 改资产自身的设置（细节面板那些）：单独一组。导入、材质、几何、体检四类技能都要它，
+  // 跟任何一组并在一起，都会把那组不相干的工具一起带进来
+  ue_content_set_properties: 'ue.content.edit',
   // 只读的查看一摊：找资产、看资产、查依赖和体积、读报错
   ue_content_search: 'ue.content.audit',
   ue_content_describe: 'ue.content.audit',
@@ -376,11 +395,26 @@ function pickGroups(
  * 以及落盘的 `details.toolSearch` 恢复路径。
  */
 export function toolSearchGroup(tool: GroupedTool): string {
+  // 查存档的大结果。命名空间留在 core（设置页分类不变），但不能跟着 core 组一起加载：
+  // 它由第一次存档自动带上（见 `core/resultArchive.ts`），不是搜出来的
+  if (tool.name === 'result_query') return 'core.result'
   if (tool.name === 'ue_screenshot' || tool.name === 'ue_focus_viewport') return 'ue.actor'
   // 实验性、说明又长（约 5 KB），不跟 ue.editor 整组常驻，要用时 search_tools 按名加载
   if (tool.name === 'ue_autoplay') return 'ue.editor.autoplay'
   // 只在导入了带「资产指南」的资产、或编辑器弹「缺失项目设置」时才用；导入回执会点名让模型加载
   if (tool.name === 'ue_asset_guidelines') return 'ue.editor.guidelines'
+  // 要关编辑器的完整重编，一个会话用不上几次；add_class / compile 的回执和 C++ 技能会点名它
+  if (tool.name === 'cpp_full_rebuild') return 'ue.cpp.rebuild'
+  // 加按键映射是改工程的低频动作，说明又长；不跟 ue.input 整组常驻，ue_input_map 的说明会点名它
+  if (tool.name === 'ue_input_add_mapping') return 'ue.input.edit'
+  // 灯光普查只在排查渲染线程 / GPU 瓶颈时用；不跟 ue.level 整组走，项目体检技能会点名它
+  if (tool.name === 'ue_light_census') return 'ue.level.lights'
+  // 生成 LOD / 碰撞是写操作、说明又长；ue.mesh 整组常驻而常驻预算已满，单拆按需加载。
+  // 几何编辑和导入整理两个技能会点名它
+  if (tool.name === 'mesh_optimize') return 'ue.mesh.optimize'
+  // 「哪些蓝图用了这个名字」：改 UFUNCTION / UPROPERTY 前查波及面。单拆按需子组，按「谁在用」
+  // 搜到时不必连带二十多个写图工具；C++ 和蓝图编辑两个技能点名它
+  if (tool.name === 'blueprint_find_usages') return 'ue.blueprint.usages'
   if (tool.unrealBox.namespace === 'ue.content' && Object.hasOwn(UE_CONTENT_SUBGROUPS, tool.name))
     return UE_CONTENT_SUBGROUPS[tool.name]
   return tool.unrealBox.namespace
@@ -679,7 +713,6 @@ export function createToolSearch(
       const outcome = load(selected, allowed)
       const nextOffset = offset + page < paged.groupCount ? offset + page : null
       return {
-        addedToolNames: outcome.addedToolNames,
         details: { toolSearch: outcome.details },
         text: JSON.stringify({
           loaded: outcome.loaded.map((entry) => ({
@@ -724,7 +757,6 @@ export function createToolSearch(
       )
       const outcome = load(selected, allowed)
       return {
-        addedToolNames: outcome.addedToolNames,
         details: outcome.details,
         text: JSON.stringify({
           toolGroups: outcome.details.loadedGroups,
@@ -741,7 +773,10 @@ export function createToolSearch(
       for (const message of messages) {
         if (message.role !== 'toolResult' || message.isError) continue
         const state = message.details as { toolSearch?: Partial<LoadDetails> } | undefined
-        const names = state?.toolSearch?.loadedToolNames ?? message.addedToolNames ?? []
+        // 0.84 时代的会话把名单记在消息自己的 `addedToolNames` 上（pi 1.0 删了这个字段），
+        // 盘上的老会话还是那样，照读
+        const legacy = (message as { addedToolNames?: unknown }).addedToolNames
+        const names = state?.toolSearch?.loadedToolNames ?? legacy ?? []
         if (!Array.isArray(names)) continue
         for (const name of names) {
           const entry = byName.get(name)

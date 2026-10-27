@@ -24,6 +24,12 @@ describe('describeProbeError', () => {
     expect(describeProbeError(new Error(raw)).code).toBe(expected)
   })
 
+  it('403 带上原话：中转站的「客户端异常」也回 403，不能只说没权限', () => {
+    const failure = describeProbeError(new Error('403 我们检测到您的客户端存在异常'))
+    expect(failure.code).toBe('forbidden')
+    expect(failure.raw).toContain('客户端存在异常')
+  })
+
   /**
    * 5xx 必须明说是对方的问题。真实案例：Kimi 的 coding 端点对任何请求
    * （含 GET /models）都回 500，而界面只是把原文透出来，用户完全看不出
@@ -135,6 +141,24 @@ describe('testProvider 的探测方式', () => {
     expect(result.skipped).toBe('generativeNoCheapCall')
   })
 
+  // 中转站上的生图模型只挂在 /images/generations，对话 ping 打过去 404，
+  // 用户会被「模型不存在」指去反复改一个本来就对的模型名
+  it('生图用途不拿对话 ping 去测', async () => {
+    let called = false
+    globalThis.fetch = (async () => {
+      called = true
+      return { ok: false, status: 404, text: async () => '', json: async () => ({}) }
+    }) as unknown as typeof fetch
+
+    const result = await testProvider(
+      providerWith([{ id: 'gemini-3.1-flash-image-preview' }], 'image'),
+      'gemini-3.1-flash-image-preview'
+    )
+
+    expect(called, '不该发出任何请求').toBe(false)
+    expect(result).toEqual({ ok: true, skipped: 'generativeNoCheapCall' })
+  })
+
   // 实时语音、网页检索都没有 /chat/completions，对话 ping 的 404 会被说成「模型不存在」
   it('实时语音和网页检索不拿对话 ping 去测，也不去拉 /models', async () => {
     let called = false
@@ -193,6 +217,56 @@ describe('testProvider 的探测方式', () => {
     await testProvider(providerWith([{ id: 'glm-4-plus' }], 'chat'), 'glm-4-plus')
 
     expect(urls[0]).toContain('/chat/completions')
+  })
+
+  /*
+   * 对话探测要和对话里同一种形状：带工具，会思考的模型带思考档位。只发光秃秃的 ping 时，
+   * 「工具 + reasoning_effort」被拒的配置照样显示「连接成功」，一开工就 400。
+   */
+  describe('对话探测的请求形状', () => {
+    function captureChatBody(bodies: Record<string, unknown>[]): void {
+      globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body ?? '{}')))
+        return new Response(
+          JSON.stringify({
+            id: 'x',
+            object: 'chat.completion',
+            created: 0,
+            model: 'm',
+            choices: [
+              { index: 0, message: { role: 'assistant', content: 'pong' }, finish_reason: 'stop' }
+            ]
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        )
+      }) as unknown as typeof fetch
+    }
+
+    it('会思考、能调工具的模型：请求里带工具和思考档位', async () => {
+      const bodies: Record<string, unknown>[] = []
+      captureChatBody(bodies)
+
+      await testProvider(
+        providerWith([{ id: 'thinker', supportsTools: true, supportsReasoning: true }], 'chat'),
+        'thinker'
+      )
+
+      expect(bodies[0]?.tools).toBeDefined()
+      expect(bodies[0]?.reasoning_effort).toBeDefined()
+    })
+
+    it('不会思考、标明不能调工具的模型：两样都不带，免得误报', async () => {
+      const bodies: Record<string, unknown>[] = []
+      captureChatBody(bodies)
+
+      await testProvider(
+        providerWith([{ id: 'plain', supportsTools: false, supportsReasoning: false }], 'chat'),
+        'plain'
+      )
+
+      expect(bodies[0]?.tools).toBeUndefined()
+      expect(bodies[0]?.reasoning_effort).toBeUndefined()
+    })
   })
 
   it('向量化探测的失败走同一套错误翻译', async () => {

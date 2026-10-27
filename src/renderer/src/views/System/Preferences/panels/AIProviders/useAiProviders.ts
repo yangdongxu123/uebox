@@ -2,11 +2,12 @@ import { computed, ref, type ComputedRef, type Ref } from 'vue'
 import {
   BUILTIN_BROWSER_PROVIDER_ID,
   ROLE_KIND,
+  modelAllowsRole,
   type CatalogEntry,
   type ModelConfig,
   type ModelRole,
   type ProbeFailure,
-  type ProbeSkipCode,
+  type TestProviderResult,
   type ProviderDraft,
   type ProviderKind,
   type ProviderView,
@@ -46,8 +47,10 @@ export interface ModelOption {
   label: string
   /** 它所属 Provider 的用途。角色候选按这一位过滤 */
   kind: ProviderKind
-  /** 视觉是**唯一**还留在模型上的角色判据：同一个对话 Provider 下有的模型看得懂图，有的不行 */
+  /** 视觉是**唯一**还留在模型上的能力判据：同一个对话 Provider 下有的模型看得懂图，有的不行 */
   supportsVision: boolean
+  /** 模型只开放给这几个角色（套餐的可选模型，服务端定）。不写 = 不限 */
+  allowedRoles?: ModelRole[]
 }
 
 /**
@@ -64,7 +67,10 @@ export function filterModelOptionsForRole<T extends ModelOption>(
 ): T[] {
   // 用途对不上的一律不列。这一条替掉了以前那一排 supportsXxx 判断 ——
   // 「哪个模型能干这件事」现在由 Provider 的用途回答，不再逐个模型猜
-  const usable = options.filter((option) => option.kind === ROLE_KIND[role])
+  // 服务端说了只能接哪几个角色的（套餐可选模型），别的角色不列
+  const usable = options.filter(
+    (option) => option.kind === ROLE_KIND[role] && modelAllowsRole(option, role)
+  )
   // 视觉是唯一的例外：同一个对话 Provider 下，能力仍然逐模型不同
   if (role === 'vision') return usable.filter((option) => option.supportsVision)
   return usable
@@ -122,6 +128,7 @@ export function draftFromCatalog(entry: CatalogEntry): ProviderDraft {
   return {
     id: entry.id,
     displayName: entry.displayName,
+    catalogId: entry.id,
     kind: entry.kind,
     model3dApi: entry.model3dApi,
     videoApi: entry.videoApi,
@@ -135,11 +142,39 @@ export function draftFromCatalog(entry: CatalogEntry): ProviderDraft {
   }
 }
 
+/**
+ * 目录里有、这条已保存的 provider 却没有的预置模型。
+ *
+ * 模型清单是添加 provider 那一刻从目录复制的，之后升级带来的新型号（比如
+ * GPT-6.1 Sol）不会自己进去。这里只算差集，加不加由用户在树上点 ——
+ * 不自动补，免得用户删掉的预置型号在下次启动时又冒出来。
+ *
+ * 按 id 认目录条目；`openai-2` 这种第二份按 Base URL 认，换了网关的就不算。
+ */
+export function missingCatalogModels(
+  draft: Pick<ProviderDraft, 'id' | 'kind' | 'baseUrl' | 'models'>,
+  catalog: readonly CatalogEntry[]
+): ModelConfig[] {
+  const trimSlash = (url: string): string => url.trim().replace(/\/+$/, '')
+  const entry =
+    catalog.find((item) => item.id === draft.id) ??
+    catalog.find(
+      (item) =>
+        item.kind === draft.kind &&
+        !!item.baseUrl &&
+        trimSlash(item.baseUrl) === trimSlash(draft.baseUrl)
+    )
+  if (!entry) return []
+  const present = new Set(draft.models.map((model) => model.id.trim()))
+  return entry.models.filter((model) => !present.has(model.id)).map((model) => ({ ...model }))
+}
+
 /** 把已保存的 provider 还原成可编辑草稿 */
 export function draftFromProvider(provider: ProviderView): ProviderDraft {
   return {
     id: provider.id,
     displayName: provider.displayName,
+    catalogId: provider.catalogId,
     kind: provider.kind,
     model3dApi: provider.model3dApi,
     videoApi: provider.videoApi,
@@ -207,6 +242,9 @@ export interface AiProvidersState {
   /** 草稿与上一次存盘（或刚进入编辑时）相比有没有改动 */
   isDirty: ComputedRef<boolean>
   providers: ComputedRef<ProviderView[]>
+  /** 启用的加停用的，模型管理弹窗列的是这一份 */
+  managedProviders: ComputedRef<ProviderView[]>
+  disabledIds: ComputedRef<Set<string>>
   roles: ComputedRef<RoleBindings>
   configured: ComputedRef<boolean>
   encryptionAvailable: ComputedRef<boolean>
@@ -217,13 +255,14 @@ export interface AiProvidersState {
   cancelEdit: () => void
   save: () => Promise<{ ok: boolean; error?: string }>
   remove: (providerId: string) => Promise<{ ok: boolean; error?: string }>
+  setEnabled: (providerId: string, enabled: boolean) => Promise<{ ok: boolean; error?: string }>
   /**
    * `skipped` 有值表示根本没发请求（3D 那一档，探测一次就扣钱），界面别显示成绿勾。
    *
    * `error` 是**码**不是文案：主进程只判是哪一种，措辞在 `probeCopy.ts` 查语言包 ——
    * 原来这里是一整句中文，英文用户点「测试连接」读不懂自己配错在哪。
    */
-  test: (modelId: string) => Promise<{ ok: boolean; error?: ProbeFailure; skipped?: ProbeSkipCode }>
+  test: (modelId: string) => Promise<TestProviderResult>
   importModels: () => Promise<{ ok: boolean; count?: number; error?: ProbeFailure }>
   oauthLogin: (
     oauthProvider: string
@@ -279,6 +318,9 @@ export function useAiProviders(): AiProvidersState {
   const providers = computed(() =>
     (settings.value?.providers ?? []).filter((item) => item.id !== BUILTIN_BROWSER_PROVIDER_ID)
   )
+  const disabledProviders = computed(() => settings.value?.disabledProviders ?? [])
+  const disabledIds = computed(() => new Set(disabledProviders.value.map((item) => item.id)))
+  const managedProviders = computed(() => [...providers.value, ...disabledProviders.value])
   const roles = computed(() => settings.value?.roles ?? {})
   const configured = computed(() => settings.value?.configured ?? false)
   const encryptionAvailable = computed(() => settings.value?.encryptionAvailable ?? true)
@@ -295,9 +337,9 @@ export function useAiProviders(): AiProvidersState {
       catalog.value = nextCatalog
 
       // 选中项还在就保持不动，免得存一次盘右侧就跳回空态
-      const stillThere = nextSettings.providers.some((item) => item.id === selectedId.value)
+      const stillThere = managedProviders.value.some((item) => item.id === selectedId.value)
       if (!stillThere) {
-        selectedId.value = firstEditableId(nextSettings.providers)
+        selectedId.value = firstEditableId(managedProviders.value)
         setDraft(null)
       }
     } finally {
@@ -308,7 +350,7 @@ export function useAiProviders(): AiProvidersState {
   function selectProvider(providerId: string): void {
     // 套餐来源只读，操作都走套餐卡片（主进程的保存、删除也会拦）
     if (isPlanProvider(providerId)) return
-    const provider = providers.value.find((item) => item.id === providerId)
+    const provider = managedProviders.value.find((item) => item.id === providerId)
     if (!provider) return
     selectedId.value = providerId
     setDraft(draftFromProvider(provider))
@@ -320,7 +362,7 @@ export function useAiProviders(): AiProvidersState {
     // 目录里选来的 provider 会与已存在的同 id 撞车（比如配两个 OpenAI 走不同网关）。
     // id 是 models.json 的主键，撞了就会**静默覆盖**掉原来那条，所以必须让开。
     if (next.id) {
-      next.id = uniqueProviderId(next.id, providers.value)
+      next.id = uniqueProviderId(next.id, managedProviders.value)
     }
     setDraft(next)
     selectedId.value = null
@@ -330,7 +372,7 @@ export function useAiProviders(): AiProvidersState {
   function cancelEdit(): void {
     if (isNew.value) {
       setDraft(null)
-      selectedId.value = firstEditableId(providers.value)
+      selectedId.value = firstEditableId(managedProviders.value)
       if (selectedId.value) selectProvider(selectedId.value)
       return
     }
@@ -368,8 +410,10 @@ export function useAiProviders(): AiProvidersState {
       isNew.value = false
       // 用存盘后的结果重建草稿：密钥字段要重新变回空，
       // 否则用户会以为明文还留在框里，再点一次保存就重复写入密钥库。
+      const stored = managedProviders.value.find((item) => item.id === payload.id)
+      if (stored) setDraft(draftFromProvider(stored))
+      // 停用中的来源不绑角色
       const saved = result.data.providers.find((item) => item.id === payload.id)
-      if (saved) setDraft(draftFromProvider(saved))
 
       /*
        * 第一个对话 Provider 存下来就自动绑「对话」角色。
@@ -406,26 +450,43 @@ export function useAiProviders(): AiProvidersState {
     if (!result.ok) return { ok: false, error: result.error }
     settings.value = result.data
     if (selectedId.value === providerId) {
-      selectedId.value = firstEditableId(result.data.providers)
+      selectedId.value = firstEditableId(managedProviders.value)
       setDraft(
         selectedId.value
-          ? draftFromProvider(result.data.providers.find((i) => i.id === selectedId.value)!)
+          ? draftFromProvider(managedProviders.value.find((i) => i.id === selectedId.value)!)
           : null
       )
     }
     return { ok: true }
   }
 
-  async function test(
-    modelId: string
-  ): Promise<{ ok: boolean; error?: ProbeFailure; skipped?: ProbeSkipCode }> {
+  /** 停用 / 启用。停用的来源不出现在任何选模型的地方，也不会被自动选中 */
+  async function setEnabled(
+    providerId: string,
+    enabled: boolean
+  ): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const result = await window.api.aiProvider.setEnabled(providerId, enabled)
+      if (!result.ok) return { ok: false, error: result.error }
+      settings.value = result.data
+      // 停用会顺带清掉绑着它的角色，按角色缓存的上限跟着作废
+      invalidateModelLimitsCache()
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  async function test(modelId: string): Promise<TestProviderResult> {
     const payload = normalizedDraft()
     if (!payload) return { ok: false, error: { code: 'noDraft' } }
     testing.value = true
     try {
       const result = await window.api.aiProvider.test(payload, modelId)
-      // skipped 要原样带到界面：把「没测」显示成「测过了」比不测更糟
-      return result.ok ? { ok: true, skipped: result.skipped } : { ok: false, error: result.error }
+      // skipped、caveat 要原样带到界面：把「没测」「有一项用不了」显示成绿勾比不测更糟
+      return result.ok
+        ? { ok: true, skipped: result.skipped, caveat: result.caveat }
+        : { ok: false, error: result.error }
     } finally {
       testing.value = false
     }
@@ -557,6 +618,8 @@ export function useAiProviders(): AiProvidersState {
     isNew,
     isDirty,
     providers,
+    managedProviders,
+    disabledIds,
     roles,
     configured,
     encryptionAvailable,
@@ -567,6 +630,7 @@ export function useAiProviders(): AiProvidersState {
     cancelEdit,
     save,
     remove,
+    setEnabled,
     test,
     importModels,
     oauthLogin,

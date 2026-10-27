@@ -201,7 +201,8 @@ export function createSetBlueprintVariableMetaTool() {
 
 const RemoveVariableSchema = z.object({
   blueprint_path: z.string().describe('蓝图路径，如 /Game/Blueprints/BP_Hero'),
-  name: z.string().describe('要删除的变量名')
+  name: z.string().describe('要删除的变量名'),
+  function: z.string().optional().describe('删函数局部变量时填所属函数名')
 })
 
 interface RemoveVariableResponse {
@@ -209,16 +210,20 @@ interface RemoveVariableResponse {
   blueprint_path: string
   name: string
   removed: boolean
+  /** 局部变量才有 */
+  function?: string
+  /** 局部变量才有：顺带删掉的 Get / Set 节点数 */
+  removed_node_count?: number
   note?: string
 }
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
 export function createRemoveBlueprintVariableTool() {
   return defineV2Tool({
-    description: `删除蓝图成员变量。
+    description: `删除蓝图成员变量；给 function 时删该函数的局部变量。
 
-**不可逆，而且会波及图表**：引用这个变量的 Get / Set 节点会变成孤儿节点，
-删完要 blueprint_compile 一次才能看到哪些图断了。
+**不可逆，而且会波及图表**：成员变量的 Get / Set 节点会变成孤儿节点，
+删完要 blueprint_compile 一次才能看到哪些图断了；局部变量的 Get / Set 节点会一起删掉。
 
 建错变量时用它收拾，别留着不管 —— 留着的话它会出现在后续每一次
 blueprint_describe 里，模型会以为那是有意义的状态。`,
@@ -229,10 +234,36 @@ blueprint_describe 里，模型会以为那是有意义的状态。`,
       try {
         const response = await callBlueprint<RemoveVariableResponse>(
           'blueprint.remove_variable',
-          { blueprint_path: input.blueprint_path, name: input.name },
+          {
+            blueprint_path: input.blueprint_path,
+            name: input.name,
+            ...(input.function ? { function: input.function } : {})
+          },
           '删除变量失败'
         )
         if (isFailure(response)) return response
+
+        if (response.function) {
+          if (response.removed === false) {
+            return {
+              success: false,
+              error: `删除局部变量失败：${response.name} 仍在函数 ${response.function} 上`
+            }
+          }
+          const nodes = response.removed_node_count ?? 0
+          return {
+            success: true,
+            blueprint_path: response.blueprint_path,
+            name: response.name,
+            function: response.function,
+            removed_node_count: nodes,
+            message:
+              `已删除函数 ${response.function} 的局部变量 ${response.name}` +
+              (nodes > 0
+                ? `，连带删掉 ${nodes} 个引用它的 Get / Set 节点，原来接在上面的线也断了。`
+                : '。')
+          }
+        }
 
         return {
           success: true,
@@ -255,7 +286,10 @@ const ComponentEventSchema = z.object({
   blueprint_path: z.string().describe('蓝图路径，如 /Game/Blueprints/BP_Door'),
   component_name: z
     .string()
-    .describe('组件名，就是组件面板里显示的那个名字。用 blueprint_describe 可以查到'),
+    .describe(
+      '组件名，就是组件面板里显示的那个名字，用 blueprint_describe 可以查到。' +
+        '控件蓝图写控件名（按钮、滑条），用 widget_get_hierarchy 查'
+    ),
   action: z
     .enum(['list', 'add'])
     .describe('list 列出这个组件能绑哪些事件（连参数签名）；add 在事件图里放一个绑定节点'),
@@ -285,6 +319,9 @@ export function createBlueprintComponentEventTool() {
     description: `列出或绑定组件上的事件（OnComponentBeginOverlap、OnClicked、OnComponentHit 等）。
 
 **所有触发式交互的入口都在这里**：走进触发区就开门、点一下就捡起来、撞到就扣血。
+
+控件蓝图（UMG 界面）里的按钮也走这里：blueprint_path 写控件蓝图，component_name 写控件名，
+普通 Button 绑 OnClicked，CommonUI 按钮绑 OnButtonBaseClicked。控件还不是变量的会自动设成变量。
 
 先 action="list" 看这个组件到底能绑什么 —— 事件名很容易记混
 （OnComponentBeginOverlap 不是 OnBeginOverlap），而且不同组件类型能绑的不一样。
@@ -660,6 +697,79 @@ export function createSetBlueprintParentClassTool() {
           compile_warnings: warnings,
           messages,
           message: lines.join('\n')
+        }
+      } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : String(error) }
+      }
+    }
+  })
+}
+
+// ── 新建事件图 ────────────────────────────────────────────────────────────
+
+const CreateEventGraphSchema = z.object({
+  blueprint_path: z.string().describe('蓝图路径，如 /Game/Blueprints/BP_Hero'),
+  graph_name: z.string().describe('新事件图的名字，如 Combat。不能和已有的图、函数、变量、组件重名')
+})
+
+interface CreateEventGraphResponse {
+  ok: boolean
+  blueprint_path: string
+  graph_name: string
+  event_graphs?: string[]
+  /** 蓝图是否存盘成功。旧插件不发 —— 缺这个字段就不说已存盘 */
+  saved?: boolean
+}
+
+/**
+ * 新建一页事件图。
+ *
+ * 此前只能建函数图，事件图得让用户去 UE 里点「+」——
+ * 蓝图库「放进空图」要的偏偏常常是一张空事件图（事件节点只能放事件图里）。
+ */
+// eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+export function createBlueprintCreateEventGraphTool() {
+  return defineV2Tool({
+    description: `给蓝图新建一页空的事件图（编辑器「我的蓝图」里 Graphs 旁边那个「+」）。
+
+什么时候用：
+- 默认的 EventGraph 已经有内容，又要一张**空**图放东西（比如 blueprint_library_apply 只放进空图）
+- 想把一块事件逻辑单独放一页，不和别的挤在一起
+
+事件节点（BeginPlay、CustomEvent、输入事件、Timeline、Delay）只能放事件图，
+函数图里放不了 —— 要放这些就建事件图，不要建函数。
+
+建出来是空的。之后用 blueprint_apply_graph / blueprint_library_apply 写内容时，
+graph_name 填返回的那个名字。函数库、宏库、接口没有事件图，会被拒。`,
+
+    inputSchema: CreateEventGraphSchema,
+
+    execute: async (input) => {
+      try {
+        const response = await callBlueprint<CreateEventGraphResponse>(
+          'blueprint.create_event_graph',
+          { blueprint_path: input.blueprint_path, graph_name: input.graph_name },
+          '新建事件图失败'
+        )
+        if (isFailure(response)) return response
+
+        const pages = response.event_graphs ?? []
+        const saveNote =
+          response.saved === true
+            ? '蓝图已存盘。'
+            : response.saved === false
+              ? '⚠️ 蓝图**没**存盘成功，这页图只在编辑器内存里，关掉编辑器前要手动保存。'
+              : ''
+        return {
+          success: true,
+          blueprint_path: response.blueprint_path,
+          graph_name: response.graph_name,
+          event_graphs: pages,
+          saved: response.saved,
+          message:
+            `已新建空事件图 ${response.graph_name}。${saveNote}` +
+            (pages.length > 0 ? `这个蓝图现在的事件图：${pages.join('、')}。` : '') +
+            `写内容时 graph_name 填 "${response.graph_name}"。`
         }
       } catch (error) {
         return { success: false, error: error instanceof Error ? error.message : String(error) }

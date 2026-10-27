@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto'
 import {
   contentText,
   createModels,
@@ -33,8 +34,13 @@ import type { ModelRequest, ModelRole, ProviderConfig } from './types'
  * `agent-v3` 的事，那边直接用 pi 的 Agent，不经过这里。
  */
 
-/** pi 的模型 + 它所属的 Models 实例。两者要一起用，分开拿没有意义 */
-function resolveModel(
+/**
+ * pi 的模型 + 它所属的 Models 实例。两者要一起用，分开拿没有意义。
+ *
+ * 导出给拼装通话（`realtime/cascadeDeps.ts`）：那边要带工具的流，这个模块按边界不做，
+ * 但「按 Provider 造一个 pi 模型」这一步两边必须是同一份，免得厂商怪癖修两遍。
+ */
+export function resolveModel(
   provider: ProviderConfig,
   modelId: string
 ): {
@@ -96,10 +102,11 @@ export interface CompletionRequest {
   /** 原样并进请求体的额外字段（如 response_format）。只有 OpenAI 兼容那几家会读 */
   samplingParams?: Record<string, unknown>
   /**
-   * 请模型别思考。关不掉的模型（有些推理模型只有档位没有开关）pi 会夹到它支持的
-   * 最低一档（`clampThinkingLevel`），不报错。不给就按模型自己的默认。
+   * 思考档位。`off` 是请模型别思考：关不掉的模型（有些推理模型只有档位没有开关）pi 会
+   * 夹到它支持的最低一档（`clampThinkingLevel`），不报错。不给就按模型自己的默认。
+   * 给具体档位的只有「测试连接」：它要发出和对话里同一种形状的请求，见 probe.ts
    */
-  reasoning?: 'off'
+  reasoning?: 'off' | ThinkingLevel
 }
 
 /** 一条纯文本的用户消息。单轮调用点占多数，省得每处都拼一遍 */
@@ -163,12 +170,17 @@ export async function complete(
     ...(request.tools ? { tools: request.tools } : {})
   }
   const options = {
+    // 每次单发也带一个会话 id，pi 会据此发 prompt_cache_key。有的 Codex 专线中转
+    // （packyapi）缺这一位就回 403「客户端异常」：对话里带着所以能用，测试连接
+    // 不带就测不过，被说成「密钥没权限」
+    sessionId: randomUUID(),
     ...(request.signal ? { signal: request.signal } : {}),
     ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
     ...(request.maxTokens !== undefined ? { maxTokens: request.maxTokens } : {}),
     ...(request.samplingParams ? { samplingParams: request.samplingParams } : {})
   }
   // 思考档位只有 simple 那条路认。`off` 不在 pi 的类型里但运行时认，理由见 streamFn 的 toPiReasoning。
+  // 下面那个 as 只为 `off`；具体档位本来就是 ThinkingLevel
   // 有几家光靠 `off` 关不掉，得在请求体里补自家字段（见 piModel 的 thinkingOffFields）
   const offFields = request.reasoning === 'off' ? thinkingOffFields(provider.baseUrl) : undefined
   const message = request.reasoning

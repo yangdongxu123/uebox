@@ -83,7 +83,7 @@ export function trimForResume(messages: AgentMessage[]): AgentMessage[] {
  * ## 为什么是「截」而不是「补一条假结果」
  *
  * 补假结果等于往上下文里写一句没发生过的话，模型会照着它往下推理。
- * 侧边对话是只读的旁支，少看见半步工具调用没有任何损失。
+ * 侧边问一句是只读的旁支，少看见半步工具调用没有任何损失。
  */
 export function trimDanglingToolCalls(messages: AgentMessage[]): AgentMessage[] {
   const pending = new Set<string>()
@@ -134,7 +134,7 @@ export const UNANSWERED_ON_RESTART =
  *
  * ## 为什么是「补」而不是「截」
  *
- * `trimDanglingToolCalls` 那条路（截掉半截调用）对侧边对话是对的：那是只读旁支，
+ * `trimDanglingToolCalls` 那条路（截掉半截调用）对侧边问一句来说是对的：那是只读旁支，
  * 少看半步没有损失。但这里截掉等于把「我问过用户」这一步从历史里抹掉，模型会
  * 重新走一遍推理、再问一次同样的问题。补一条如实说明「没人回答」的结果，
  * 它才知道自己问过、也知道没得到答案。
@@ -200,7 +200,7 @@ export function planResume(previous: AgentMessage[]): ResumePlan {
 
   if (messages.length === 0) {
     // 整个 transcript 只有失败标记：第一轮就没调通，没有"断点"可言
-    return { ok: false, reason: '这个对话还没有成功跑过一轮，请重新发送消息' }
+    return { ok: false, reason: '该对话尚未成功执行过任何一轮，请重新发送消息' }
   }
 
   // 摘完之后最后一条仍是 assistant，说明那是一条**正常收尾**的回复 ——

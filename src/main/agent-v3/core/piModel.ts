@@ -25,7 +25,9 @@ import type { Api, Model, ProviderStreams, ThinkingLevelMap } from '@earendil-wo
 import { findCatalogEntry } from '../../ai/catalog'
 import { resolveModelLimits } from '../../ai/modelLimits'
 import { resolveRequestAuth } from '../../ai/credentials'
+import { readSettings } from '../../ai/store'
 import { isOpenCodeEndpoint, openCodeHeaders } from '../../ai/opencode'
+import { isZCodeEndpoint, withZCodeTransport } from '../../ai/zcode'
 import type { ProviderConfig } from '../../ai/types'
 import type { ModelConfig, ProviderProtocol } from '../../../shared/aiProvider'
 
@@ -62,8 +64,33 @@ function limitsFor(
   }
 }
 
+/**
+ * 查目录时依次试哪几个 provider id。
+ *
+ * 先试自己的 id，再试它是从目录哪一条加的；走 Anthropic 协议的最后再试一次
+ * `anthropic`。加第二个渠道时自动起的 `anthropic-4` / `openai-4` 这类 id 两本目录
+ * 都查不到，而思考方式是型号的事，跟从哪条渠道发出去无关 —— 查不到时 Sonnet 5.5
+ * 就退回老式思考预算，对面整轮 400「requires adaptive thinking」（2026-10-15）；
+ * GPT-6.1 Sol 则丢了 `off: null`，「自动」档发 `effort: "none"` 整轮 400（2026-10-18）。
+ *
+ * 早期存下的配置没有 `catalogId`，就按 `uniqueProviderId` 起名的规矩把 `-N` 去掉，
+ * 协议对得上才算同一家 —— 用户恰好把自建网关叫成 `openai-2` 也不会认错。
+ */
+function catalogIdsFor(provider: ProviderConfig): string[] {
+  const ids = [provider.id]
+  if (provider.catalogId) ids.push(provider.catalogId)
+  const base = /^(.+)-\d+$/.exec(provider.id)?.[1]
+  if (base && findCatalogEntry(base)?.protocol === provider.protocol) ids.push(base)
+  if (provider.protocol === 'anthropic-messages') ids.push('anthropic')
+  return [...new Set(ids)]
+}
+
 function catalogModel(provider: ProviderConfig, model: ModelConfig): ModelConfig | undefined {
-  return findCatalogEntry(provider.id)?.models.find((item) => item.id === model.id)
+  for (const id of catalogIdsFor(provider)) {
+    const hit = findCatalogEntry(id)?.models.find((item) => item.id === model.id)
+    if (hit) return hit
+  }
+  return undefined
 }
 
 /**
@@ -78,7 +105,8 @@ function catalogModel(provider: ProviderConfig, model: ModelConfig): ModelConfig
  * 列出模型根本没有的 minimal / medium，又漏掉它真有的 max。
  *
  * 按 (provider id, model id) 对齐 —— 我们的目录 id 与 pi 的同源，能对上。
- * 用户自建的网关对不上，那就没有这张表，回落到缺省行为。
+ * 用户自建的网关对不上，那就没有这张表，回落到缺省行为（Anthropic 协议例外，
+ * 见 `catalogIdsFor`）。
  */
 function builtinModel(provider: ProviderConfig, model: ModelConfig): Model<Api> | undefined {
   // getBuiltinModel 的入参是字面量联合类型，动态查得放宽；查不到会回 undefined
@@ -86,7 +114,11 @@ function builtinModel(provider: ProviderConfig, model: ModelConfig): Model<Api> 
     providerId: string,
     modelId: string
   ) => Model<Api> | undefined
-  return lookup(provider.id, model.id)
+  for (const id of catalogIdsFor(provider)) {
+    const hit = lookup(id, model.id)
+    if (hit) return hit
+  }
+  return undefined
 }
 
 /**
@@ -118,11 +150,37 @@ function thinkingLevelMapFor(
   const known =
     (catalogModel(provider, model)?.thinkingLevelMap as ThinkingLevelMap | undefined) ??
     builtinModel(provider, model)?.thinkingLevelMap
-  if (!own) return known
+  const fallback = known ?? unknownModelLevelMap(provider, model)
+  if (!own) return fallback
   // 用户那份没提 `off` 就跟随目录：Opus 5.5 的 `off: null`（关不掉思考）是模型的事实，
-  // 以前存盘时会被滤掉 —— 丢了它，「自动」档就会发 thinking: disabled，整轮 400
-  if (!('off' in own) && known && 'off' in known) return { off: known.off, ...own }
+  // 以前存盘时会被滤掉 —— 丢了它，「自动」档就会发 thinking: disabled，整轮 400。
+  // 目录也查不到时按目录外的模型处理，responses 那两条路上同样不发 `effort: "none"`
+  if (!('off' in own) && fallback && 'off' in fallback) return { off: fallback.off, ...own }
   return own
+}
+
+/** 不给档位时 pi 会替我们发 `reasoning.effort: "none"` 的那两条路 */
+const EFFORT_NONE_BY_DEFAULT: ReadonlySet<ProviderProtocol> = new Set([
+  'openai-responses',
+  'openai-codex-responses'
+])
+
+/**
+ * 哪本目录都没收录的推理模型：responses 那两条路上标成「`off` 这一档不存在」。
+ *
+ * pi 在没给档位（输入框的「自动」、入职体检这类单轮调用）时会发 `effort: "none"`，
+ * 除非表里写明 `off: null`。认不认 `none` 是逐个型号的事 —— GPT-6.1 Sol 就不认，
+ * 整轮 400。不知道的型号宁可什么都不发、按它自己的默认来，代价只是「关思考」那一档
+ * 对它不起作用；猜错的代价却是这个模型完全用不了。
+ */
+function unknownModelLevelMap(
+  provider: ProviderConfig,
+  model: ModelConfig
+): ThinkingLevelMap | undefined {
+  if (!EFFORT_NONE_BY_DEFAULT.has(provider.protocol) || !reasoningFor(provider, model)) {
+    return undefined
+  }
+  return { off: null }
 }
 
 /**
@@ -282,6 +340,13 @@ const THINKING_OFF_FIELDS: readonly { match: RegExp; body: Record<string, unknow
     // 小米 MiMo（按量 api. 与 Token Plan token-plan-cn. 两个入口）。v2.5 / v2.6 默认开思考
     match: /\.xiaomimimo\.com/i,
     body: { thinking: { type: 'disabled' } }
+  },
+  {
+    // 火山方舟。带「深度思考」标签的豆包 Seed 默认就想；Chat API 关思考是 thinking.type=disabled
+    // （官方「深度思考」文档）。不发 auto：Seed 2.1 直接 400 Unsupported thinking type。
+    // 不带这个标签的模型本来就不想，文档说直接调用即可
+    match: /ark\.[a-z-]+\.volces\.com/i,
+    body: { thinking: { type: 'disabled' } }
   }
 ]
 
@@ -343,6 +408,11 @@ export function toPiModel(provider: ProviderConfig, model: ModelConfig): Model<A
  */
 export function toPiProvider(config: ProviderConfig): Provider<Api> {
   const models = config.models.map((model) => toPiModel(config, model))
+  const streams = API_IMPL[config.protocol]()
+  const api =
+    config.protocol === 'anthropic-messages' && isZCodeEndpoint(config.baseUrl)
+      ? withZCodeTransport(streams)
+      : streams
 
   return createProvider<Api>({
     id: config.id,
@@ -357,7 +427,18 @@ export function toPiProvider(config: ProviderConfig): Provider<Api> {
         // 这里忽略传入的 credential，直接按 ProviderConfig 上的引用去取。
         // 每次请求都会调一次，所以账号登录要求的逐次请求头（CodeBuddy）也从这里带出去
         resolve: async () => {
-          const { apiKey, headers: authHeaders } = await resolveRequestAuth(config.apiKey)
+          if (
+            config.apiKey.kind === 'oauth' &&
+            config.apiKey.provider === 'zcode' &&
+            (config.protocol !== 'anthropic-messages' || !isZCodeEndpoint(config.baseUrl))
+          ) {
+            throw new Error(
+              'ZCode sign-in tokens can only be used with the ZCode subscription endpoint.'
+            )
+          }
+          const { apiKey, headers: authHeaders } = await resolveRequestAuth(config.apiKey).catch(
+            (error: unknown) => explainAuthFailure(config, error)
+          )
           const endpointHeaders = isOpenCodeEndpoint(config.baseUrl)
             ? { ...openCodeHeaders(), ...authHeaders }
             : authHeaders
@@ -377,8 +458,22 @@ export function toPiProvider(config: ProviderConfig): Provider<Api> {
     },
     // 单 provider 可能混用多种协议（比如 OpenAI 同时有 completions 和 responses），
     // 用 map 形态按 model.api 分派，以后放开混用不用改这里。
-    api: { [config.protocol]: API_IMPL[config.protocol]() } as Partial<Record<Api, ProviderStreams>>
+    api: { [config.protocol]: api } as Partial<Record<Api, ProviderStreams>>
   })
+}
+
+/**
+ * 取不到密钥时先看服务商还在不在。
+ *
+ * 对话开跑时就把服务商配置定下了，用户中途在设置里删掉它，密钥跟着删了，
+ * 密钥库那边只能报「密钥不存在」—— 真正的原因是服务商没了，照实说
+ */
+async function explainAuthFailure(config: ProviderConfig, error: unknown): Promise<never> {
+  const settings = await readSettings().catch(() => null)
+  if (settings && !settings.providers.some((provider) => provider.id === config.id)) {
+    throw new Error(`「${config.displayName}」已从模型设置中删除，请换一个模型后重试`)
+  }
+  throw error
 }
 
 /** 给状态 UI 用的密钥来源描述，不含密钥本身 */

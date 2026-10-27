@@ -5,7 +5,7 @@
  * 想查时点开就在。一轮只有一两块的不收 —— 收成一行和原样摆着差不多长。
  * 还有没答的提问时也不收：那是要用户动手的东西，藏起来就没人答了。
  *
- * 主聊天页和小窗共用这一份：两边收不收、收到哪、那一行怎么说必须一致。
+ * 主对话页和小窗共用这一份：两边收不收、收到哪、那一行怎么说必须一致。
  */
 import { computed, ref, type ComputedRef, type Ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -76,8 +76,8 @@ export function useRunFold(options: RunFoldOptions): {
     return {
       hiddenCount: finalText,
       label: label || t('assistant.agentProcess.processFinished'),
-      images: groups.flatMap((group) => group.deliverableImages),
-      videos: groups.flatMap((group) => group.videos)
+      images: [...new Set(groups.flatMap((group) => group.deliverableImages))],
+      videos: [...new Set(groups.flatMap((group) => group.videos))]
     }
   })
 

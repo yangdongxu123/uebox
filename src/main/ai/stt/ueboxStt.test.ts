@@ -84,16 +84,17 @@ describe('协议形状', () => {
   })
 
   it('会话里的套餐错误说清下一步', () => {
-    expect(ueboxSttErrorMessage({ code: 'quota_exhausted' })).toContain('额度用完了')
-    expect(ueboxSttErrorMessage({ code: 'role_not_in_plan' })).toContain('套餐不含')
+    expect(ueboxSttErrorMessage({ code: 'quota_exhausted' })).toContain('额度已用完')
+    expect(ueboxSttErrorMessage({ code: 'role_not_in_plan' })).toContain('套餐不包含')
     expect(ueboxSttErrorMessage({ code: 'content_blocked', message: 'x' })).toBe(
       'content_blocked：x'
     )
   })
 
   it('套餐来源按来源 id 认，不看域名', () => {
-    expect(hasSttAdapter('https://plan.example/v1')).toBe(false)
-    expect(hasSttAdapter('https://plan.example/v1', true)).toBe(true)
+    // 用 wss 地址：http(s) 的陌生地址本来就会落到 OpenAI 兼容转写那一路，测不出「不看域名」
+    expect(hasSttAdapter('wss://plan.example/v1')).toBe(false)
+    expect(hasSttAdapter('wss://plan.example/v1', true)).toBe(true)
   })
 })
 
@@ -160,7 +161,7 @@ describe('会话', () => {
     openUeboxSttSession({ apiKey: 'k', baseUrl: base, model: 'uebox-stt', onEvent })
     await closed
     expect(events[0]).toMatchObject({ type: 'error' })
-    expect((events[0] as { message: string }).message).toContain('额度用完了')
+    expect((events[0] as { message: string }).message).toContain('额度已用完')
   })
 
   it('握手 401：引导重新连接', async () => {

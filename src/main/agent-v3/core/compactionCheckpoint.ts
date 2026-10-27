@@ -80,7 +80,20 @@ export function promptCacheKey(
   contextEpoch: number,
   toolPrefix?: string
 ): string {
-  return `agent-v3:${PROMPT_PROTOCOL_VERSION}:${sessionId}:e${contextEpoch}${toolPrefix ? `:t${toolPrefix}` : ''}`
+  const tool = toolPrefix ? `:t${headerSafe(toolPrefix)}` : ''
+  return `agent-v3:${PROMPT_PROTOCOL_VERSION}:${headerSafe(sessionId)}:e${contextEpoch}${tool}`
+}
+
+/**
+ * 缓存键会进请求头：Codex 那条路把它原样放进 `session-id` / `x-client-request-id`，
+ * 请求头只收 Latin-1。队员的 sessionId 带着名字（`<会话>:mate-审核`），原样放进去
+ * fetch 当场抛「Cannot convert argument to a ByteString」，请求根本发不出去。
+ *
+ * 只有含非 ASCII 的才换成指纹：纯 ASCII 的键一个字都不变，已有的缓存不受影响。
+ */
+function headerSafe(part: string): string {
+  if (/^[ -~]*$/.test(part)) return part
+  return `h${createHash('sha256').update(part).digest('hex').slice(0, 24)}`
 }
 
 /**
@@ -111,11 +124,20 @@ function checkpointPath(sessionId: string): string {
  */
 export async function loadCheckpoint(sessionId: string): Promise<CompactionCheckpoint | undefined> {
   try {
-    const parsed = JSON.parse(await fs.readFile(checkpointPath(sessionId), 'utf8')) as unknown
-    return isCheckpoint(parsed) ? parsed : undefined
+    return parseCheckpoint(JSON.parse(await fs.readFile(checkpointPath(sessionId), 'utf8')))
   } catch {
     return undefined
   }
+}
+
+/**
+ * 盘上读回来的一份是不是检查点，是就原样给回，不是给 undefined。
+ *
+ * 导出给队员那份用：队员的检查点存在团队目录里（`TeamStore.memberCheckpoint`），
+ * 那边只管读写文件，格式校验还在这一处
+ */
+export function parseCheckpoint(value: unknown): CompactionCheckpoint | undefined {
+  return isCheckpoint(value) ? value : undefined
 }
 
 /** 手写校验而不是信任盘上的 JSON —— 半个文件也能 parse 成功，字段却是 undefined */
@@ -149,7 +171,7 @@ export async function saveCheckpoint(
 /**
  * 作废检查点。
  *
- * 会话被删、被截回某一轮时必须调 —— 留着的话，那份摘要描述的是一段已经不存在的
+ * 对话被删、被截回某一轮时必须调 —— 留着的话，那份摘要描述的是一段已经不存在的
  * 对话。`sourceHash` 本来也能挡住（指纹对不上），但那要等到下一轮才发现，
  * 而这里能当场清掉一个明知已经过期的文件。
  */

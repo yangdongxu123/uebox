@@ -42,6 +42,15 @@ import {
 
 import { getTargetConnectionId } from '../../../core/projectTargetContext'
 import { UE_NOT_CONNECTED_MESSAGE } from '../../defineUeTool'
+import {
+  deriveConnectionsFromPins,
+  describePin,
+  graphNameMissHint,
+  isGraphNotFound,
+  lookupMissedGraphName,
+  type BlueprintGraphNodeInfo,
+  type BlueprintGraphPinInfo
+} from './getBlueprintGraph'
 
 /**
  * 节点类型。
@@ -64,8 +73,8 @@ const NodeDefinitionSchema = z.object({
     .string()
     .describe(
       '节点类型。常用：Event、EnhancedInputAction、Function、VariableGet、VariableSet、Branch、Sequence、' +
-        'Cast、SpawnActor、CustomEvent、Select、MakeArray、MakeStruct、BreakStruct、Self、Timeline、' +
-        'CallDispatcher、BindEvent、UnbindEvent、UnbindAllEvents、' +
+        'Cast、SpawnActor、CreateWidget、CustomEvent、Select、MakeArray、MakeStruct、BreakStruct、Self、Timeline、' +
+        'CallDispatcher、BindEvent、UnbindEvent、UnbindAllEvents、CreateEvent、' +
         'ForLoop、WhileLoop、DoOnce、Gate、FlipFlop、IsValid、ForEachLoop。' +
         '动画图里还有 OutputPose、SequencePlayer、BlendSpacePlayer、StateMachine 等动画节点；' +
         '状态机那一页只放 State / Conduit / StateAlias'
@@ -76,11 +85,13 @@ const NodeDefinitionSchema = z.object({
     .describe(
       '成员名。CallDispatcher / BindEvent / UnbindEvent / UnbindAllEvents 写事件分发器名' +
         '（别人身上的写 BP_Chest.OnChestOpened）；' +
+        'CreateEvent 写 EventGraph 里那个 CustomEvent 的名字（别的对象上的函数写 BP_Other.FuncName）；' +
         'Function 必须是 ClassName.FunctionName（如 KismetSystemLibrary.PrintString，' +
         '用 blueprint_search_nodes 查到的 member_name 可直接填）；' +
         'Event 用 ReceiveBeginPlay / ReceiveTick；EnhancedInputAction 写 Input Action 资产名或路径（IA_Jump）；' +
-        'VariableGet 写变量名、组件名（如 Light）或父类变量名；' +
+        'VariableGet 写变量名（写函数图时也认这个函数的局部变量）、组件名（如 Light）或父类变量名；' +
         '别的蓝图上的变量写 蓝图名.变量名（如 WBP_HUD.Health），节点多一根 self 输入接那个对象；' +
+        '引擎类的属性同理（Character.CharacterMovement —— 它是属性不是函数，别写成 Function）；' +
         'Timeline 写 Timeline 自己的名字；控制节点可省略。' +
         '动画节点：SequencePlayer 等写动画资产，StateMachine / State 写它的名字，' +
         'SaveCachedPose / UseCachedPose 写缓存名'
@@ -197,7 +208,14 @@ const NodeDefinitionSchema = z.object({
     .boolean()
     .optional()
     .describe('CustomEvent 专用：可靠 RPC，只在 replication 非 None 时有效'),
-  target_class: z.string().optional().describe('Cast / SpawnActor 的目标类'),
+  target_class: z
+    .string()
+    .optional()
+    .describe(
+      'Cast / SpawnActor / CreateWidget 的目标类，蓝图写名字即可（BP_Player、WBP_HUD）。' +
+        'CreateWidget 建出的控件加到屏幕：Function 写 UserWidget.AddToViewport，Target 接它的返回值。' +
+        'Cast 的输出引脚连线时写 As —— 真名随编辑器语言变（As玩家控制器、AsBP Player），不用猜'
+    ),
   struct_type: z.string().optional().describe('MakeStruct / BreakStruct 的结构体'),
   raw_class: z
     .string()
@@ -249,7 +267,7 @@ const ApplyGraphSchema = z
       .string()
       .optional()
       .describe(
-        '图表名，默认 EventGraph。必须是已存在的图；新函数图先用 blueprint_create_function 建。' +
+        '图表名，默认 EventGraph。必须是已存在的图；新函数图先用 blueprint_create_function 建，新事件图先用 blueprint_create_event_graph 建。' +
           '子图写路径：AnimGraph/Locomotion（状态机）、AnimGraph/Locomotion/Idle（状态里）、' +
           'AnimGraph/Locomotion/Idle->Walk（转换条件）'
       ),
@@ -269,6 +287,27 @@ const ApplyGraphSchema = z
   })
 
 type ApplyGraphInput = z.infer<typeof ApplyGraphSchema>
+type NodeDefinition = ApplyGraphInput['nodes'][number]
+
+/**
+ * 写图回话里的节点和连线，引脚按读图（`blueprint_get_graph`）那份的样子给。
+ *
+ * 插件原样回的每个引脚都带着 `is_array:false`、`friendly_name:""`、`linked_count:0`
+ * 这类默认值，一根线还在两头的 `linked_to` 里各记一遍：一次写 18 个节点就是两万多字符。
+ * 真机上一个队员一局写四五十次，这些回话一直留在上下文里，之后每一步都要重发。
+ * 引脚一个不少，名字、方向、具体类型、字面量都在；连线收成一张表，同读图
+ */
+function describeWrittenNodes(
+  nodes: NonNullable<ApplyGraphResponse['nodes']>
+): Record<string, unknown> {
+  const connections = deriveConnectionsFromPins(nodes as unknown as BlueprintGraphNodeInfo[])
+  return {
+    nodes: nodes.map(({ pins, ...rest }) =>
+      pins ? { ...rest, pins: (pins as unknown as BlueprintGraphPinInfo[]).map(describePin) } : rest
+    ),
+    ...(connections.length > 0 ? { connections } : {})
+  }
+}
 
 interface ApplyGraphResponse {
   ok: boolean
@@ -310,6 +349,8 @@ interface ApplyGraphResponse {
     graph?: string
   }>
   errors?: string[]
+  /** 整条命令没进门时插件只回这一句（见 describeFailure） */
+  error?: string
   message?: string
   /** 状态机那一页才有 */
   graph_kind?: string
@@ -356,6 +397,21 @@ async function existingContentBottom(
   } catch {
     return undefined
   }
+}
+
+/**
+ * 填了 raw_class 又把 class 写成 Function 时，按 raw_class 建。
+ *
+ * 插件先认具名类型，class=Function 一命中就去要 member_name，raw_class 被晾在一边，
+ * 回一句「Function not found:（空）」—— 真机上模型拿它点名 AnimGraphNode_SequencePlayer，
+ * 被这句话带去查函数名（2026-10-13 反馈）。只写 raw_class 的意思是明确的，
+ * class=Function 又没给 member_name，不可能是想建函数调用。
+ */
+function preferRawClass(node: NodeDefinition): NodeDefinition {
+  // 插件比类型名前会去掉下划线（Call_Function 也算），这里同一套规矩
+  const isBareFunction =
+    /^(call)?function$/i.test(node.class.replace(/_/g, '')) && !node.member_name
+  return node.raw_class && isBareFunction ? { ...node, class: node.raw_class } : node
 }
 
 /** 新一批和已有内容之间留的空档，够看出是两段逻辑 */
@@ -436,7 +492,9 @@ function describeWildcardRetry(errors: string[]): string {
 }
 
 function describeFailure(response: ApplyGraphResponse): string {
-  const errors = response.errors ?? []
+  // 整条命令没进门的（图找不到、蓝图找不到）插件只回一句 error，没有 errors 数组。
+  // 不接住它，模型拿到的是一句光秃秃的「写入失败。」，只能瞎猜是哪里不认
+  const errors = response.errors?.length ? response.errors : response.error ? [response.error] : []
   const head =
     response.rolled_back === true
       ? '整批已回滚，蓝图没有任何改动。修正后重新提交完整的 nodes + connections（不要只补失败的那几个）。'
@@ -485,6 +543,8 @@ nodes 传空数组表示「只补连线」—— 那是给「两个已有节点�
 
 VariableGet / VariableSet 引用的变量必须已经存在，先用
 blueprint_add_variable 建。常量不要建变量 —— 直接写 pin_defaults。
+函数里的累加器、中间结果建成局部变量（blueprint_add_variable 带 function），
+写这个函数的图时直接写名字，同名时局部变量优先。
 
 **组件也是变量**：VariableGet 的 member_name 写组件名（blueprint_describe 里
 components 的 name，如 Light、Mesh）就能拿到组件引用，接着连 SetMaterial /
@@ -501,7 +561,7 @@ Private 的读不到；控件要在 UMG 里勾「是变量」才读得到，而�
 资产（IA_Jump，或完整路径 /Game/Input/IA_Jump）。不要用 Event 去建它，也不要
 raw_class 点名 K2Node_EnhancedInputAction —— 那样建出来的节点没绑资产。
 出口引脚：Triggered / Started / Ongoing / Canceled / Completed，值在 ActionValue。
-资产名用 ue_input_map 查。
+资产名用 ue_input_map 查；动作资产还没有，用 ue_input_add_mapping 连同按键一起建，别走 Python。
 
 ## Timeline
 
@@ -574,6 +634,15 @@ replication：Server（客户端→服务器）、Client（服务器→拥有者
 连线：把 CustomEvent 的 **OutputDelegate** 引脚接到 BindEvent 的 **Delegate** 引脚
 （那根红线）。事件的 params 要和分发器的 params 类型、顺序一致。
 
+**在函数图里绑**：事件（CustomEvent / Event / 输入 / Timeline）只能放在事件图里，
+函数图里建会被拒（Delay 这类潜伏节点同理，函数里放不了）。分两次写：先往 EventGraph
+写 CustomEvent（带事件体），再往函数图写
+
+{ "id": "bind", "class": "BindEvent", "member_name": "BP_Chest.OnChestOpened" },
+{ "id": "ref", "class": "CreateEvent", "member_name": "OnChestOpened_Handler" }
+
+把 CreateEvent 的 **OutputDelegate** 接到 BindEvent 的 **Delegate**。
+
 **别人身上的分发器**写 member_name="BP_Chest.OnChestOpened"，再把那个 Actor 接到
 节点的 Target 引脚上。组件自带的事件（OnComponentBeginOverlap 之类）不走这里，
 用 blueprint_component_event。
@@ -607,7 +676,8 @@ warnings 里 —— **读一下**，否则你以为写成了 A，图里其实是
 ## 图表必须已存在
 
 graph_name 默认 EventGraph。要写进新的函数图，先用
-blueprint_create_function 建出来。本工具不创建图表。
+blueprint_create_function 建出来；要一张新的事件图，先用 blueprint_create_event_graph。
+本工具不创建图表。
 
 ## 动画蓝图
 
@@ -627,23 +697,37 @@ AnimGraph、状态机、状态内部、转换条件都用这个工具写，graph
           }
         }
 
-        const laidOut = await withLayout(input)
+        const send = async (request: ApplyGraphInput): Promise<ApplyGraphResponse | null> => {
+          const laidOut = await withLayout(request)
 
-        const params: Record<string, unknown> = {
-          blueprint_path: laidOut.blueprint_path,
-          nodes: laidOut.nodes,
-          connections: laidOut.connections ?? []
+          const params: Record<string, unknown> = {
+            blueprint_path: laidOut.blueprint_path,
+            nodes: laidOut.nodes.map(preferRawClass),
+            connections: laidOut.connections ?? []
+          }
+          if (laidOut.graph_name) params.graph_name = laidOut.graph_name
+          if (laidOut.clear_existing !== undefined) params.clear_existing = laidOut.clear_existing
+          if (laidOut.compile !== undefined) params.compile = laidOut.compile
+
+          return wsService.callRequest<ApplyGraphResponse>(
+            'blueprint.create_graph',
+            params,
+            getTargetConnectionId(),
+            60000
+          )
         }
-        if (laidOut.graph_name) params.graph_name = laidOut.graph_name
-        if (laidOut.clear_existing !== undefined) params.clear_existing = laidOut.clear_existing
-        if (laidOut.compile !== undefined) params.compile = laidOut.compile
 
-        const response = await wsService.callRequest<ApplyGraphResponse>(
-          'blueprint.create_graph',
-          params,
-          getTargetConnectionId(),
-          60000
-        )
+        let response = await send(input)
+
+        // 图找不到时插件一个节点都没动。只写了状态 / 状态机名字的，换成完整路径整批重发
+        let missHint = ''
+        if (response && !response.ok && input.graph_name && isGraphNotFound(response)) {
+          const miss = await lookupMissedGraphName(input.blueprint_path, input.graph_name)
+          if (miss?.kind === 'resolved') {
+            response = await send({ ...input, graph_name: miss.path })
+          }
+          missHint = graphNameMissHint(input.graph_name, miss)
+        }
 
         if (!response) {
           return { success: false, error: '插件没有响应（blueprint.create_graph）' }
@@ -652,7 +736,7 @@ AnimGraph、状态机、状态内部、转换条件都用这个工具写，graph
         if (!response.ok) {
           return {
             success: false,
-            error: describeFailure(response),
+            error: describeFailure(response) + (missHint ? `\n\n${missHint}` : ''),
             rolled_back: response.rolled_back === true,
             errors: response.errors
           }
@@ -682,7 +766,7 @@ AnimGraph、状态机、状态内部、转换条件都用这个工具写，graph
           connection_count: response.connection_count,
           ...(response.removed_count ? { removed_count: response.removed_count } : {}),
           compiled: response.compiled,
-          nodes: response.nodes,
+          ...(response.nodes ? describeWrittenNodes(response.nodes) : {}),
           ...(response.transitions ? { transitions: response.transitions } : {}),
           ...(response.entry_state ? { entry_state: response.entry_state } : {}),
           ...(diagnostics.length > 0 ? { diagnostics } : {}),

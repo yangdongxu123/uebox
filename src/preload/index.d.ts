@@ -10,6 +10,15 @@ import type {
 } from '../shared/agentNotificationActivation'
 import type { TrayAction, TrayRecentSession } from '../shared/trayActions'
 import type {
+  SharedSkillInstallFailure,
+  SharedSkillInstallOutcome,
+  SharedSkillInstallRequest,
+  SharedSkillOrigin,
+  SharedSkillPack,
+  SharedSkillConnectPrompt,
+  SharedSkillSubmitResult
+} from '../shared/share'
+import type {
   CommunityFetchResult,
   CommunityTemplate,
   TemplateDownloadProgress,
@@ -23,9 +32,20 @@ import type {
 } from '../shared/assetDependency'
 import type { AgentTurnUsage } from '../shared/agentUsage'
 import type { EditorHealthResult } from '../shared/editorHealth'
-import type { ModelCheckup, TeamStateView } from '../shared/agentTeam'
+import type {
+  DismissalErrorCode,
+  ExternalTeamSummary,
+  ModelCheckup,
+  ModelDossier,
+  TeamStateView
+} from '../shared/agentTeam'
 import type { AgentReviewResult, AgentReviewTarget } from '../shared/agentReview'
-import type { SideChatContext } from '../shared/sideChat'
+import type {
+  AgentStartRejectionCode,
+  SteerRejectionCode,
+  SteerRejectionErrorParams
+} from '../shared/agentRunRejection'
+import type { SideQuestionContext } from '../shared/sideQuestion'
 import type { ChatSyncPatch } from '../shared/chatWindowSync'
 import type {
   EditorSnapshot,
@@ -72,6 +92,7 @@ import type {
   CatalogClosure,
   CatalogUnclaimed
 } from '../shared/catalogLibrary'
+import type { TeamEvent, TeamFact, TeamJoinLink } from '../shared/teamProject'
 
 /** 服务端资产库 IPC 的统一返回形状（见 src/main/ipc/catalogLibrary.ts） */
 type CatalogIpcResult<T> =
@@ -802,6 +823,13 @@ declare global {
       ualinkRemove: (uprojectPath: string) => Promise<{ success: boolean; error?: string }>
       /** 把 UnrealAgentLink 装回项目 */
       ualinkInstall: (uprojectPath: string) => Promise<{ success: boolean; error?: string }>
+      /** 首次导入时那一问的答案；装失败的工程和原因码原样返回 */
+      ualinkPromptAnswer: (
+        install: boolean,
+        uprojectPaths: string[]
+      ) => Promise<Array<{ uprojectPath: string; reason: string }>>
+      /** 首次导入工程、自动安装又关着时，请界面问一句要不要装，返回退订函数 */
+      onUALinkInstallPrompt: (callback: (uprojectPath: string) => void) => () => void
       /** 「我的项目」里多了工程时的通知，返回退订函数 */
       onLibraryChanged: (callback: () => void) => () => void
       /** 开机后台升级插件失败时的通知，返回退订函数 */
@@ -1186,17 +1214,6 @@ declare global {
       filename: string
     ) => Promise<{ success: boolean; data?: string; error?: string }>
   }
-  interface AssistantAPI {
-    ask: (args: {
-      content: string
-      conversationId?: string | null
-    }) => Promise<{ success: boolean }>
-    onChunk: (listener: (chunk: string) => void) => () => void
-    onDone: (listener: () => void) => () => void
-    onError: (listener: (err: { message?: string; status?: number }) => void) => () => void
-    onConversation: (listener: (id: string) => void) => () => void
-  }
-
   // Unreal 引擎与插件 API
   interface UnrealEngineInfo {
     name: string
@@ -1444,15 +1461,15 @@ declare global {
       sessionSaved: (session: { id: string; title: string; messages?: unknown[] }) => void
       requestInitialMessage: () => void
       /** 带着主对话的上下文打开侧边窗口（主窗口调） */
-      openWithContext: (context: SideChatContext) => void
+      openWithContext: (context: SideQuestionContext) => void
       requestInitialContext: () => void
       /** 这些 on* 一律返回取消订阅的函数，组件卸载时调它 */
       onInitialMessage: (callback: (message: MiniChatInitialMessage) => void) => () => void
-      onInitialContext: (callback: (context: SideChatContext) => void) => () => void
+      onInitialContext: (callback: (context: SideQuestionContext) => void) => () => void
       onPinChanged: (callback: (pinned: boolean) => void) => () => void
       onResetSession: (callback: () => void) => () => void
     }
-    /** 从标签栏拖出来的独立聊天窗口，以及它和主窗口之间的对话同步 */
+    /** 从标签栏拖出来的独立对话窗口，以及它和主窗口之间的对话同步 */
     chatWindow: {
       /** 打开这条对话的独立窗口；已经开着就提到前面。坐标是松手处的屏幕坐标 */
       open: (args: {
@@ -1462,16 +1479,16 @@ declare global {
       }) => Promise<{ success: boolean; error?: string }>
       /** 现在开在独立窗口里的对话 */
       list: () => Promise<string[]>
-      /** 独立窗口报上它那条对话的内核会话 id（审批镜像按它找窗口） */
+      /** 独立窗口报上它那条对话的内核 session id（审批镜像按它找窗口） */
       bindAgentSession: (args: { chatSid: string; agentSessionId: string }) => void
       /** 在主窗口里打开一个路由（独立窗口里点了属于主界面的东西） */
       openInMain: (path: string) => void
       push: (patch: ChatSyncPatch) => void
       /** 独立窗口要一份这条对话的最新全量，主窗口用 full 补丁回 */
       requestSnapshot: (chatSid: string) => void
-      /** 把这几条会话的待审批补发给自己 */
+      /** 把这几个内核 session 的待审批补发给自己 */
       resendApprovals: (sessionIds: string[]) => Promise<number>
-      /** 别的窗口正在跑的 agent 会话 */
+      /** 别的窗口正在跑的内核 session */
       runsElsewhere: () => Promise<string[]>
       /** 这些 on* 一律返回取消订阅的函数 */
       onChanged: (callback: (chatSids: string[]) => void) => () => void
@@ -1669,7 +1686,6 @@ declare global {
         error?: string
       }>
     }
-    assistant: AssistantAPI
     unrealPath: UnrealPathAPI
     unrealProcess: UnrealProcessAPI
     /**
@@ -1696,7 +1712,7 @@ declare global {
         error?: string
       }>
     }
-    /** 顶栏状态监控：这条会话归属的工程现在的编辑器状况 */
+    /** 顶栏状态监控：这条对话归属的工程现在的编辑器状况 */
     ueEditorHealth: {
       get: (params: { projectPath: string }) => Promise<EditorHealthResult>
     }
@@ -2146,6 +2162,14 @@ declare global {
       ) => Promise<
         import('../shared/aiProvider').AiProviderResult<import('../shared/aiProvider').SettingsView>
       >
+      setEnabled: (
+        providerId: string,
+        enabled: boolean
+      ) => Promise<
+        import('../shared/aiProvider').AiProviderResult<import('../shared/aiProvider').SettingsView>
+      >
+      /** 正在跑的对话里有几个用着这个服务商 */
+      usage: (providerId: string) => Promise<number>
       /** 只发改了的角色，null = 清空；主进程在最新的配置上合并 */
       setRoles: (
         patch: import('../shared/aiProvider').RoleBindingsPatch
@@ -2234,7 +2258,7 @@ declare global {
       }>
     }
     /**
-     * 聊天附件解释 API
+     * 对话附件解释 API
      *
      * 视频、PDF、Word 这类文件模型吃不下，得先在本地解释成描述文本或图片帧。
      */
@@ -2337,7 +2361,7 @@ declare global {
        */
       check: () => Promise<{ configured: boolean; defaultModel: string }>
     }
-    /** 实时语音会话。密钥只在主进程，渲染层只负责麦克风与喇叭 */
+    /** 实时语音连接。密钥只在主进程，渲染层只负责麦克风与喇叭 */
     realtimeVoice: {
       /** 上行采样率。开会话之前问，麦克风要赶在连接之前开起来攒首字 */
       audioSpec: () => Promise<
@@ -2349,6 +2373,8 @@ declare global {
         voice?: string
         history?: Array<{ role: 'user' | 'assistant'; text: string }>
         echoGuard?: RealtimeEchoGuard
+        /** 这条对话输入框里选的模型。拼装通话（没绑实时语音时）拿它接电话 */
+        brain?: { providerId: string; modelId: string }
       }) => Promise<
         | { ok: true; inputSampleRate: number; outputSampleRate: number; connectionId: number }
         | { ok: false; error: string }
@@ -2805,8 +2831,22 @@ declare global {
      * AI 对话历史落盘 API（原来存 localStorage，配额只有几 MB）
      */
     chatHistory: {
-      read: () => Promise<{ 'chat-messages'?: string; 'chat-sessions'?: string }>
+      read: () => Promise<{ 'chat-sessions'?: string; 'follow-up-queue'?: string }>
       write: (key: string, value: string) => Promise<void>
+      sessionsIndex: () => Promise<Record<string, { typing?: string[] }>>
+      importLegacySessions: (json: string) => Promise<Record<string, { typing?: string[] }>>
+      readSessionSync: (sid: string) => string | null
+      readSessions: (sids: string[]) => Promise<Record<string, string>>
+      writeSessions: (
+        writes: Array<{ sid: string; json: string | null; typing?: string[] }>
+      ) => Promise<void>
+    }
+    /**
+     * 渲染层凭据的加密落盘；available 为 false 时 write 会被拒绝
+     */
+    secureStore: {
+      read: () => Promise<{ available: boolean; values: Record<string, string> }>
+      write: (key: string, value: string | null) => Promise<void>
     }
     /**
      * 个性化 API：用户写给 agent 的那段常驻说明。技能的列与删在 `agentV3` 下。
@@ -2816,21 +2856,21 @@ declare global {
       getInstructions: () => Promise<{ text: string; limit: number; path: string }>
       setInstructions: (text: string) => Promise<{ success: boolean; error?: string }>
     }
-    /** agent 系统通知：用户点了之后界面要跳到那条会话 */
+    /** agent 系统通知：用户点了之后界面要跳到那条对话 */
     agentNotifications: {
       /** 取走主进程存着的那条激活（取走即清）。推送落空时靠它补回来 */
       takePending: () => Promise<NotificationActivatePayload | null>
       /** 回话：这条激活认没认出来。没认出来主进程会把通知重新弹一条 */
       reportActivation: (result: NotificationActivationResult) => Promise<void>
     }
-    /** 系统托盘菜单：界面报最近会话、取还没送到的托盘动作 */
+    /** 系统托盘菜单：界面报最近对话、取还没送到的托盘动作 */
     tray: {
       /** 最近活跃的三条对话变了，主进程据此重建菜单 */
       setRecentSessions: (sessions: TrayRecentSession[]) => Promise<{ success: boolean }>
       /** 取走主进程存着的那条托盘动作（取走即清）—— 唯一的送达路径 */
       takePending: () => Promise<TrayAction | null>
       /** 用户在退出确认框里选了「仍然退出」 */
-      confirmQuit: () => Promise<{ success: boolean }>
+      confirmQuit: (reason?: 'update') => Promise<{ success: boolean }>
     }
     /**
      * 应用设置 API
@@ -2851,6 +2891,8 @@ declare global {
         agentGoalMaxRounds: number
         /** 全量模式下关掉的工具名 */
         agentDisabledTools: string[]
+        /** 审批卡片上点过「以后都允许」的工具名 */
+        agentAlwaysAllowedTools: string[]
         /** 工具搜索模式下偏离内置常驻清单的那些 */
         agentResidentTools: Record<string, boolean>
         notifyTurnComplete: 'off' | 'unfocused' | 'always'
@@ -2860,6 +2902,10 @@ declare global {
         autoRecoverEditorCrash: boolean
         /** agent 搜素材时看不看别的保管库，默认关 */
         assetCrossVaultSearch: boolean
+        /** agent 改资产期间把锁住的文件设成只读，默认关 */
+        assetReadonlyLock: boolean
+        /** Agent 浏览器能否访问本机和局域网地址，默认关 */
+        agentBrowserAllowLocalNetwork: boolean
       }>
       /** 更新应用设置 */
       set: (settings: {
@@ -2872,6 +2918,7 @@ declare global {
         agentPersistentAutoResume?: boolean
         agentGoalMaxRounds?: number
         agentDisabledTools?: string[]
+        agentAlwaysAllowedTools?: string[]
         agentResidentTools?: Record<string, boolean>
         notifyTurnComplete?: 'off' | 'unfocused' | 'always'
         notifyApprovalRequired?: boolean
@@ -2879,6 +2926,8 @@ declare global {
         hideWindowOnProjectLaunch?: boolean
         autoRecoverEditorCrash?: boolean
         assetCrossVaultSearch?: boolean
+        assetReadonlyLock?: boolean
+        agentBrowserAllowLocalNetwork?: boolean
       }) => Promise<{ success: boolean }>
       /** 设置开机自启 */
       setAutoLaunch: (enabled: boolean) => Promise<{ success: boolean }>
@@ -3103,6 +3152,110 @@ declare global {
       /** 订阅主进程推来的失效 / 状态 / 作业进度；返回取消订阅 */
       onEvent: (listener: (event: CatalogLibraryEvent) => void) => () => void
     }
+    /** 共享技能（官网共享库）。类型见 src/shared/share.ts */
+    share: {
+      pendingInstalls: () => Promise<ShareIpcResult<SharedSkillInstallRequest[]>>
+      installReply: (
+        requestId: string,
+        approve: boolean
+      ) => Promise<ShareIpcResult<SharedSkillInstallOutcome>>
+      packSkill: (name: string) => Promise<ShareIpcResult<SharedSkillPack>>
+      submitSkill: (name: string) => Promise<ShareIpcResult<SharedSkillSubmitResult>>
+      connect: () => Promise<ShareIpcResult<{ account: string | null }>>
+      cancelConnect: () => Promise<void>
+      onConnectPrompt: (listener: (prompt: SharedSkillConnectPrompt) => void) => () => void
+      openPage: (url: string) => Promise<ShareIpcResult<void>>
+      onInstallRequest: (listener: (request: SharedSkillInstallRequest) => void) => () => void
+      onInstallFailed: (listener: (failure: SharedSkillInstallFailure) => void) => () => void
+    }
+    /**
+     * 团队工程（版本控制与资产协作）。`call` 的动作名和参数见
+     * src/main/libraryV3/team/teamOps.ts；返回值是团队服务成员面的 JSON（src/shared/teamProject.ts）。
+     */
+    team: {
+      join: (input: {
+        server: string
+        caFingerprint?: string | null
+        project?: string | null
+        member: string
+        password: string
+      }) => Promise<
+        CatalogIpcResult<{
+          member: string
+          displayName: string
+          keys: string[]
+          openKey: string | null
+          noProjects: boolean
+        }>
+      >
+      peek: (link: TeamJoinLink) => Promise<CatalogIpcResult<{ projectName: string | null }>>
+      parseLink: (raw: string) => Promise<CatalogIpcResult<TeamJoinLink | null>>
+      pendingJoinLink: () => Promise<CatalogIpcResult<TeamJoinLink | null>>
+      call: (key: string, op: string, args?: unknown) => Promise<CatalogIpcResult<unknown>>
+      facts: (
+        key: string,
+        hashes: string[],
+        library?: string | null
+      ) => Promise<CatalogIpcResult<Record<string, TeamFact | null>>>
+      inviteLink: (key: string) => Promise<CatalogIpcResult<string | null>>
+      startStreams: () => Promise<CatalogIpcResult<void>>
+      restartStream: (serverId: string) => Promise<CatalogIpcResult<void>>
+      streamState: (
+        serverId: string
+      ) => Promise<CatalogIpcResult<{ connected: boolean; signedOut: boolean }>>
+      localInfo: (key: string) => Promise<
+        CatalogIpcResult<{
+          localPath: string | null
+          exists: boolean
+          uproject: string | null
+          unsynced: string[]
+        }>
+      >
+      freeSpace: (path: string) => Promise<CatalogIpcResult<number | null>>
+      inspectFolder: (
+        path: string
+      ) => Promise<CatalogIpcResult<{ hasLore: boolean; uproject: string | null; empty: boolean }>>
+      syncToLocal: (
+        key: string,
+        input: { targetDir: string; existing?: boolean }
+      ) => Promise<CatalogIpcResult<string>>
+      putIn: (key: string, input: { sourceDir: string }) => Promise<CatalogIpcResult<string>>
+      setFolderSynced: (
+        key: string,
+        folder: string,
+        synced: boolean
+      ) => Promise<CatalogIpcResult<{ ok: boolean; pending: number }>>
+      restore: (
+        key: string,
+        input: { path: string; number: number }
+      ) => Promise<CatalogIpcResult<{ ok: boolean }>>
+      isModified: (key: string, path: string) => Promise<CatalogIpcResult<boolean>>
+      cancelCheckout: (
+        key: string,
+        input: { path: string; discard: boolean }
+      ) => Promise<CatalogIpcResult<{ kept: string | null }>>
+      deliver: (
+        key: string,
+        input: { files: string[]; message: string; facts?: unknown[] }
+      ) => Promise<CatalogIpcResult<string>>
+      approveDelivery: (
+        key: string,
+        input: { id: string; paths: string[]; message: string }
+      ) => Promise<CatalogIpcResult<string>>
+      sendReference: (
+        key: string,
+        input: { company: string; paths: string[]; note: string }
+      ) => Promise<CatalogIpcResult<string>>
+      openPath: (path: string) => Promise<CatalogIpcResult<boolean>>
+      notify: (input: {
+        key?: string
+        title: string
+        body: string
+        open?: { serverId: string; project: string; path?: string } | null
+      }) => Promise<CatalogIpcResult<boolean>>
+      /** 订阅团队事件（通知、该重新取了、通知流连上 / 断开、邀请链接）；返回取消订阅 */
+      onEvent: (listener: (event: TeamEvent) => void) => () => void
+    }
     /**
      * Agent V3 —— 扁平单 agent + pi 内核。
      *
@@ -3139,7 +3292,7 @@ declare global {
       ) => void
       /** 关掉当前页面 */
       close: (sessionId?: string) => Promise<{ success: boolean }>
-      /** 查询状态；进入会话时传 restore 恢复已保存页面 */
+      /** 查询状态；进入对话时传 restore 恢复已保存页面 */
       getState: (
         sessionId?: string,
         restore?: boolean
@@ -3157,7 +3310,7 @@ declare global {
       }>
     }
     agentV3: {
-      /** 发起一轮对话。会自动恢复该 sessionId 此前的 transcript */
+      /** 发起一轮。会自动恢复该 sessionId 此前的 transcript */
       execute: (args: {
         sessionId: string
         prompt: string
@@ -3165,6 +3318,8 @@ declare global {
         approvalMode?: AgentV3ApprovalMode
         /** 思考程度。不传等于 auto（不指定，随模型默认） */
         thinkingLevel?: AgentV3ThinkingLevel
+        /** 「快速」：Codex 订阅走 priority 档，别的模型忽略 */
+        fastMode?: boolean
         /** 技能沉淀档位。不传等于 ask（想沉淀时先问用户） */
         skillLearning?: AgentV3SkillLearning
         /**
@@ -3178,9 +3333,9 @@ declare global {
         images?: Array<{ type: 'image'; data: string; mimeType: string }>
         /** 随这轮带的音视频（本地路径）。主进程决定传对象存储换链接，还是只给路径 */
         mediaFiles?: Array<{ filePath: string; fileName: string; kind: 'video' | 'audio' }>
-        /** 这条会话归属的 UE 工程；主进程只知道「谁连着」，归属得由渲染层带下来 */
+        /** 这条对话归属的 UE 工程；主进程只知道「谁连着」，归属得由渲染层带下来 */
         sessionProject?: AgentV3SessionProject | null
-        /** 这条会话绑着的知识库。绑了主进程才给 search_notebook_sources 工具 */
+        /** 这条对话绑着的知识库。绑了主进程才给 search_notebook_sources 工具 */
         notebook?: { id: string; title?: string } | null
         /**
          * 用户按下发送那一刻的编辑器状态（闪存）。
@@ -3189,15 +3344,17 @@ declare global {
          * `null` 是用户明确去掉了，不传是这个入口还没接。
          */
         editorSnapshot?: EditorSnapshot | null
-        /** 这条会话绑定的模型。不传就用执行记录里那份，都没有按全局默认绑定 */
+        /** 这条对话绑定的模型。不传就用执行记录里那份，都没有按全局默认绑定 */
         sessionModel?: { providerId: string; modelId: string }
       }) => Promise<{
         success: boolean
+        /** 按码拒绝（如 SESSION_BUSY）时带，渲染层查文案用；error 原文始终保留给日志 */
+        code?: AgentStartRejectionCode
         error?: string
         modelId?: string
         providerId?: string
         toolCount?: number
-        /** 这次会话真正拿到的工具名。数量答不了「那个工具在不在池里」，只能逐个核对 */
+        /** 这条内核 session 真正拿到的工具名。数量答不了「那个工具在不在池里」，只能逐个核对 */
         toolNames?: string[]
         ueConnected?: boolean
         restoredMessages?: number
@@ -3209,17 +3366,23 @@ declare global {
         sessionProject?: AgentV3SessionProject | null
         /** 不带的话续跑会退回默认的「每步都问」，而用户什么都没改过 */
         approvalMode?: AgentV3ApprovalMode
-        /** 会话此刻绑的模型；用户报错后换了模型再续跑，得用新的 */
+        /** 对话此刻绑的模型；用户报错后换了模型再续跑，得用新的 */
         sessionModel?: { providerId: string; modelId: string }
-      }) => Promise<{ success: boolean; error?: string; restoredMessages?: number }>
+      }) => Promise<{
+        success: boolean
+        /** 按码拒绝（如 SESSION_BUSY）时带，渲染层查文案用；error 原文始终保留给日志 */
+        code?: AgentStartRejectionCode
+        error?: string
+        restoredMessages?: number
+      }>
       /**
-       * 用户在界面上改了这条会话归属哪个工程（顶栏胶囊、侧边栏「归入工程 / 移出项目」）。
+       * 用户在界面上改了这条对话归属哪个工程（顶栏胶囊、侧边栏「归入工程 / 移出项目」）。
        *
        * 必须发这一条：归属的主人是主进程那张表，而随消息捎带的那份戳只在表里
-       * 还空着时用来初始化。不发的话，会话发过第一条消息之后用户再改归属，
+       * 还空着时用来初始化。不发的话，对话发过第一条消息之后用户再改归属，
        * 主进程永远收不到 —— 胶囊上写着新工程，引擎命令还发往旧的那个。
        *
-       * `project: null` = 移出项目。`sessionId` 是**内核**会话 id。
+       * `project: null` = 移出项目。`sessionId` 是**内核** session id。
        */
       setSessionProject: (args: {
         sessionId: string
@@ -3248,8 +3411,16 @@ declare global {
         mediaFiles?: Array<{ filePath: string; fileName: string; kind: 'video' | 'audio' }>
         /** 已经解析好的文档 / 表格正文 */
         contextText?: string
-        /** 撤回这一条要用的号。会话已经收尾、内核不收时没有它 */
-      }) => Promise<{ success: boolean; error?: string; steerId?: string }>
+        /** 撤回这一条要用的号。这一轮已经收尾、内核不收时没有它 */
+      }) => Promise<{
+        success: boolean
+        /** 按码拒绝（NOT_RUNNING / PROJECT_MISMATCH）时带，渲染层查文案用 */
+        code?: SteerRejectionCode
+        error?: string
+        /** PROJECT_MISMATCH 时带：快照抓的工程 / 这一轮在跑的工程，原值，可能为空串 */
+        errorParams?: SteerRejectionErrorParams
+        steerId?: string
+      }>
       /**
        * 撤回一条还排着的插话。
        *
@@ -3269,14 +3440,14 @@ declare global {
        */
       captureEditorSnapshot: (args: {
         sessionProject?: AgentV3SessionProject | null
-        /** 这条会话正在跑时传它的 agent 会话号：排队的和插的都要跟着那一轮的工程 */
+        /** 这条对话正在跑时传它的内核 session id：排队的和插的都要跟着那一轮的工程 */
         runningSessionId?: string
       }) => Promise<{ success: true; data: EditorSnapshotCaptureResult }>
       /**
-       * 停止一条会话。**等它真的停下来**才返回。
+       * 停止一条内核 session。**等它真的停下来**才返回。
        *
        * `drained` 为 false 表示等超时了它还没停 —— 这时紧接着再 execute 一次
-       * 会被主进程以「会话正在执行中」拒掉，调用方该改成提示用户稍后再试。
+       * 会被主进程以 `SESSION_BUSY` 拒掉，调用方该改成提示用户稍后再试。
        */
       stop: (args: {
         sessionId: string
@@ -3293,22 +3464,29 @@ declare global {
       }>
       /** 全部强制解锁 —— 逃生口。锁卡死时用户唯一的出路 */
       releaseAllLocks: () => Promise<{ success: boolean; released: number }>
-      /** 目标模式（`/goal`）这条会话的目标。没有时 goal 为 null；settled = 这一轮复核已有结论 */
+      /** 目标模式（`/goal`）这条内核 session 的目标。没有时 goal 为 null；settled = 这一轮复核已有结论 */
       goalState: (args: {
         sessionId: string
       }) => Promise<{ success: boolean; goal: { objective: string; settled: boolean } | null }>
-      /** 取消这条会话的目标。正在跑的时候不行（errorKey 'running'） */
+      /** 取消这条内核 session 的目标。正在跑的时候不行（errorKey 'running'） */
       goalEnd: (args: {
         sessionId: string
       }) => Promise<{ success: boolean; error?: string; errorKey?: 'running' }>
-      /** 工作室模式（`/team`）的任务板面板。不是工作室的会话 team 为 null */
+      /** 工作室模式（`/team`）的任务板面板。不是工作室的内核 session team 为 null */
       teamState: (args: {
         sessionId: string
       }) => Promise<{ success: boolean; team: TeamStateView | null }>
+      /** 「外部团队」页：Claude Code 当大脑的那些团队（`ext-*`），最近的在前 */
+      externalTeams: () => Promise<{ success: boolean; teams: ExternalTeamSummary[] }>
       /** 任务板上卡住的一项改回待办，下一轮制作人会看到 */
       teamTaskReopen: (args: {
         sessionId: string
         taskId: string
+      }) => Promise<{ success: boolean; error?: string }>
+      /** 把一件停下的活交回制作人：任务板上加一项「用户重开」的待办 */
+      teamJobReopen: (args: {
+        sessionId: string
+        jobId: string
       }) => Promise<{ success: boolean; error?: string }>
       /** 给一个队员换模型，记成用户定的。先过入职体检，没过带回 checkup。正在跑也行：它下一件活开始用 */
       teamMemberModel: (args: {
@@ -3317,11 +3495,24 @@ declare global {
         providerId: string
         modelId: string
       }) => Promise<{ success: boolean; error?: string; checkup?: ModelCheckup }>
+      /** 辞退一个队员。理由必填；手上有活的不行（errorKey 'busy'）。档案留在团队的账里 */
+      teamMemberDismiss: (args: {
+        sessionId: string
+        name: string
+        reason: string
+      }) => Promise<{ success: boolean; error?: string; errorKey?: DismissalErrorCode }>
       /** 结束团队模式。正在跑的时候不行（errorKey 'running'）；任务板和队员留在盘上 */
       teamEnd: (args: {
         sessionId: string
       }) => Promise<{ success: boolean; error?: string; errorKey?: 'running' }>
-      /** 改某条会话的审批档位。运行中也立刻生效，下一个工具调用就按新档位走 */
+      /** 设置「团队」页：检测过或干过活的模型，各自的体检结论和履历汇总 */
+      teamModels: () => Promise<{ success: boolean; models: ModelDossier[] }>
+      /** 设置「团队」页的「重新检测」：不管上次结论新不新都测一次 */
+      teamModelCheckup: (args: {
+        providerId: string
+        modelId: string
+      }) => Promise<{ success: boolean; error?: string; checkup?: ModelCheckup }>
+      /** 改某条对话的审批档位（`sessionId` 传它当前的内核 session id）。运行中也立刻生效，下一个工具调用就按新档位走 */
       setApprovalMode: (args: {
         sessionId: string
         approvalMode: AgentV3ApprovalMode
@@ -3342,7 +3533,7 @@ declare global {
         answers?: string[]
       }) => void
       /**
-       * 刷新页面后重新接回还在跑的会话。
+       * 刷新页面后重新接回还在跑的内核 session。
        *
        * 传界面记得的那些 sessionId，回其中**真的还在主进程里跑**的那些
        * （`pendingApprovals` / `pendingQuestions` 是顺带补发的审批弹窗和
@@ -3407,8 +3598,10 @@ declare global {
         levels: AgentV3ThinkingLevel[]
         levelMap: Record<string, string | null>
         modelId: string
+        /** 这个模型能不能开「快速」（目前只有 ChatGPT 订阅） */
+        fastMode: boolean
       } | null>
-      /** 这条会话绑定的模型（执行记录里那份）。没绑过为 null */
+      /** 这条对话绑定的模型（执行记录里那份）。没绑过为 null */
       sessionModel: (args: {
         sessionId: string
       }) => Promise<{ providerId: string; modelId: string } | null>
@@ -3451,9 +3644,9 @@ declare global {
       loadSession: (args: { sessionId: string }) => Promise<{ messages: unknown[] }>
       deleteSession: (args: { sessionId: string }) => Promise<{ success: boolean; error?: string }>
       /**
-       * 会话分支：把 transcript 复制成一个新 sessionId，之后两边各聊各的。
+       * 分支：把 transcript 复制成一个新 sessionId，之后两边各聊各的。
        *
-       * `keepUserTurns` 是「从这条往后砍掉」——只复制前这么多个用户回合；
+       * `keepUserTurns` 是「从这条往后砍掉」——只复制前这么多个用户轮次；
        * 不给就整份复制。`reason` 是失败的**类型**（'busy'=正在跑，
        * 'missing'=还没有 transcript / 截完是空的），措辞归渲染层。
        */
@@ -3465,7 +3658,7 @@ declare global {
         error?: string
       }>
       /**
-       * 把 transcript 截回前 `keepUserTurns` 个用户回合 —— 重新生成 / 编辑消息用。
+       * 把 transcript 截回前 `keepUserTurns` 轮 —— 重新生成 / 编辑消息用。
        *
        * 界面删掉气泡只动渲染层那份历史，内核每轮都从盘上恢复自己那份；不截的话
        * 模型看着刚被丢掉的答案再答一遍。`reason` 同 `forkSession`。
@@ -3484,7 +3677,7 @@ declare global {
        *
        * 和 `forkSession` 的区别是**跑着的时候也能分** —— 那正是这个功能的用处。
        */
-      forkForSideChat: (args: { sessionId: string }) => Promise<{
+      forkForSideQuestion: (args: { sessionId: string }) => Promise<{
         success: boolean
         sessionId?: string
         messageCount?: number
@@ -3611,6 +3804,13 @@ declare global {
           blenderPath?: string
           statuses?: McpServerStatus[]
         }>
+        /** 用 winget 装 Blender 接入缺的 Git / Python。装完主进程会刷新 PATH 再探一次 */
+        blenderInstallPrereqs: (args: { ids: Array<'git' | 'python'> }) => Promise<{
+          success: boolean
+          message: string
+          /** winget 的退出码和原话，「交给 AI 排查」时原样带上 */
+          error?: string
+        }>
       }
       /** 把虚幻引擎能力对外暴露成 MCP server */
       mcpServer: {
@@ -3675,8 +3875,9 @@ declare global {
    */
   type AgentV3SkillLearning = 'off' | 'ask' | 'auto'
 
-  /** always = 批准且本会话内该工具不再询问 */
-  type AgentV3ApprovalVerdict = 'approve' | 'always' | 'reject'
+  /** always = 批准且本对话内该工具不再询问（按内核 session 记：重启、清空对话、切到 Ask 模式后失效，分出的新对话也不继承） */
+  /** forever = 批准且以后所有对话里该工具都不再询问（存进应用设置，在偏好设置里移除） */
+  type AgentV3ApprovalVerdict = 'approve' | 'always' | 'forever' | 'reject'
 
   /**
    * 用户对 agent 反问的处置。
@@ -3701,7 +3902,11 @@ declare global {
     source: 'user' | 'plugin' | 'builtin'
     /** 用户有没有把它关掉。关掉的仍然在清单里 —— 否则没法再打开 */
     enabled: boolean
+    /** 从官网共享库装的 */
+    shared?: SharedSkillOrigin
   }
+
+  type ShareIpcResult<T> = { success: true; data: T } | { success: false; error: string }
 
   /** 一条经验在哪。主进程只认项目库里登记过的工程路径 */
   interface AgentV3ExperienceRef {
@@ -3722,6 +3927,15 @@ declare global {
     source: string
     verified?: { date: string; engine?: string }
     status: 'trial' | 'proven' | 'retired'
+    /** 退休的才有；这个字段出现之前退休的旧经验没有 */
+    retiredBecause?:
+      | 'capacity'
+      | 'replaced'
+      | 'failed'
+      | 'ignored'
+      | 'no-lift'
+      | 'refuted'
+      | 'script-bug'
     pinned?: boolean
     engines?: string[]
     notFor?: string[]
@@ -3775,9 +3989,9 @@ declare global {
   }
 
   /**
-   * 会话归属的 UE 工程（侧边栏按它分组）。
+   * 对话归属的 UE 工程（侧边栏按它分组）。
    *
-   * 和「当前连着的工程」不是一回事：会话的归属在第一条消息时就定死了，
+   * 和「当前连着的工程」不是一回事：对话的归属在第一条消息时就定死了，
    * 之后用户可能关了那个工程去开另一个。
    */
   interface AgentV3SessionProject {
@@ -3813,6 +4027,8 @@ declare global {
      * 渲染层就会在往返时把它当成不存在的东西丢掉。
      */
     readOnlyTools?: string[]
+    /** 用户信任这个 server：它的工具按 mutating 审批。见主进程 `capabilities/mcp/types.ts` */
+    trusted?: boolean
   }
 
   interface McpServerStatus {

@@ -25,6 +25,8 @@ const ALL_CODES = [
   'modelNotFound',
   'rateLimited',
   'badRequest',
+  'protocolMismatch',
+  'toolsRejected',
   'unreachable',
   'unknown',
   'listUnsupportedGenerative',
@@ -69,8 +71,14 @@ describe('describeProbeFailure', () => {
       code: 'providerServerError',
       raw: 'quota pool missing'
     })
-    expect(text).toContain('不是你的配置问题')
+    expect(text).toContain('通常与本地配置无关')
     expect(text).toContain('quota pool missing')
+  })
+
+  it('403 把厂商原话带上 —— 中转站的客户端校验也回 403，不全是密钥没权限', () => {
+    const text = describeProbeFailure({ code: 'forbidden', raw: '403 请使用标准 Codex 客户端请求' })
+    expect(text).toContain('403')
+    expect(text).toContain('请使用标准 Codex 客户端请求')
   })
 
   it('不带原文的码不拼后缀', () => {
@@ -120,4 +128,12 @@ describe('describeProbeFailure', () => {
     expect(describeProbeFailure(null)).toBeTypeOf('string')
     expect(describeProbeFailure(undefined)).toBeTypeOf('string')
   })
+})
+
+// 换着试出来的协议要写进那句话里：只说「协议不对」用户还得自己猜该换成哪个
+it('protocolMismatch 说出试通的那个协议', () => {
+  i18n.global.locale.value = 'zh-CN'
+  expect(
+    describeProbeFailure({ code: 'protocolMismatch', suggestedProtocol: 'openai-responses' })
+  ).toContain('openai-responses')
 })

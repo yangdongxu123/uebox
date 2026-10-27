@@ -69,6 +69,8 @@ import {
 import { runEditorPython } from '../../../core/editorPython'
 import { isSameProjectPath } from '../../../core/projectPathKey'
 import { awaitProjectLive, DEFAULT_WAIT_MS, MAX_WAIT_MS } from './awaitProjectLive'
+import { editorStillLoading, noteEditorLaunch } from './editorLaunch'
+import { applyVaultConnectionPragmas } from '../../../../sqliteDataBase/vaultConnectionPragmas'
 
 /**
  * 按文件夹导入时，一次最多导多少个。
@@ -135,6 +137,8 @@ interface ImportedAssetSummary {
   assetName: string
   assetClass: string
   uePath?: string
+  /** 素材库里记的软路径，只在和 uePath 不同时出现 */
+  softPath?: string
   sourceType: 'uasset' | 'external'
   imported: boolean
   alreadyExists?: boolean
@@ -163,11 +167,6 @@ interface ProjectImportResult {
     hasMore: boolean
     nextFolderOffset?: number
   }
-  output?: {
-    importedAssets: ImportedAssetSummary[]
-    spawnCandidates: ImportedAssetSummary[]
-    placedActors: Array<Record<string, unknown>>
-  }
 }
 
 interface SequenceSetupResult {
@@ -181,11 +180,6 @@ interface SequenceSetupResult {
   actor_binding_added?: boolean
   animation_path?: string
   animation_applied?: boolean
-  output?: {
-    sequencePath?: string
-    actorPath?: string
-    animationPath?: string
-  }
 }
 
 interface SequenceSetupOptions {
@@ -646,17 +640,13 @@ async function openProject(projectKey: string): Promise<OpenProjectResult> {
 
   const running = await alreadyRunning(uprojectPath)
   if (running === 'stuck') return stuckEditorResult(uprojectPath)
-  if (running === 'yes' || running === 'busy') {
+  if (running !== 'no') {
     console.log(`[ProjectTool] ${project.projectName} 已经开着，不再启动一次`)
     return {
       success: true,
       projectName: project.projectName ?? undefined,
       openedPath: uprojectPath,
-      details: [
-        running === 'busy'
-          ? '♻️ 这个工程本来就开着，但它手上还有请求没回话 —— 要是一直不回，可能已经卡死，用 ue_session_health 看一眼'
-          : '♻️ 这个工程本来就开着'
-      ]
+      details: [ALREADY_OPEN_DETAIL[running]]
     }
   }
 
@@ -679,7 +669,8 @@ async function openProject(projectKey: string): Promise<OpenProjectResult> {
   const pluginDetails = pluginFailure
     ? [
         `⚠️ UnrealAgentLink 插件没装上（${pluginFailure}）—— 这个工程连不上盒子，` +
-          'ue.* 那些工具都用不了。让用户在工程卡片右键里手动安装一次。'
+          'ue.* 那些工具都用不了。用 project_update_plugin 再装一次，它会说清装不上的具体原因；' +
+          '还是装不上就把原因如实告诉用户，不要让用户去手动安装。'
       ]
     : []
 
@@ -693,6 +684,7 @@ async function openProject(projectKey: string): Promise<OpenProjectResult> {
     }
   }
 
+  noteEditorLaunch(uprojectPath)
   console.log(`[ProjectTool] 已成功启动项目: ${project.projectName}`)
   return {
     success: true,
@@ -756,16 +748,12 @@ async function openProjectByPath(projectPath: string): Promise<OpenProjectResult
 
   const runningByPath = await alreadyRunning(uprojectPath)
   if (runningByPath === 'stuck') return stuckEditorResult(uprojectPath)
-  if (runningByPath === 'yes' || runningByPath === 'busy') {
+  if (runningByPath !== 'no') {
     console.log(`[ProjectTool] ${uprojectPath} 已经开着，不再启动一次`)
     return {
       success: true,
       openedPath: uprojectPath,
-      details: [
-        runningByPath === 'busy'
-          ? '♻️ 这个工程本来就开着，但它手上还有请求没回话 —— 要是一直不回，可能已经卡死，用 ue_session_health 看一眼'
-          : '♻️ 这个工程本来就开着'
-      ]
+      details: [ALREADY_OPEN_DETAIL[runningByPath]]
     }
   }
 
@@ -788,7 +776,8 @@ async function openProjectByPath(projectPath: string): Promise<OpenProjectResult
   const pluginDetails = pluginFailure
     ? [
         `⚠️ UnrealAgentLink 插件没装上（${pluginFailure}）—— 这个工程连不上盒子，` +
-          'ue.* 那些工具都用不了。让用户在工程卡片右键里手动安装一次。'
+          'ue.* 那些工具都用不了。用 project_update_plugin 再装一次，它会说清装不上的具体原因；' +
+          '还是装不上就把原因如实告诉用户，不要让用户去手动安装。'
       ]
     : []
 
@@ -802,6 +791,7 @@ async function openProjectByPath(projectPath: string): Promise<OpenProjectResult
     }
   }
 
+  noteEditorLaunch(uprojectPath)
   console.log(`[ProjectTool] 已成功启动项目: ${uprojectPath}`)
   return {
     success: true,
@@ -814,7 +804,7 @@ async function openProjectByPath(projectPath: string): Promise<OpenProjectResult
  * 已经开着的工程不要再 `shell.openPath` 一次。
  *
  * 两条真实路径都会走到这儿：模型不知道工程已经开着就调了 `open_project`；
- * 以及会话归属挡下第一次切换、模型换完归属再调一次 —— 那时编辑器已经在启动了。
+ * 以及对话归属挡下第一次切换、模型换完归属再调一次 —— 那时编辑器已经在启动了。
  * 再交给系统打开一次，Windows 会按文件关联再拉一个 UnrealEditor 进程，
  * 用户面前多出一个「工程已被占用」的弹窗，或者干脆开出第二个编辑器。
  *
@@ -831,10 +821,29 @@ async function openProjectByPath(projectPath: string): Promise<OpenProjectResult
  * - 连接不答话、进程还在 → `stuck`：多半卡在崩溃处理或弹窗上。这时再启动一个
  *   就是两个编辑器抢同一个工程（反馈里正好出现过），宁可停下来说清楚
  */
-async function alreadyRunning(uprojectPath: string): Promise<'yes' | 'busy' | 'no' | 'stuck'> {
+/**
+ * 已经开着、不再启动时回给模型的那一句。`loading` 要说清「这不是没开」，
+ * 不然它会接着反复调 open_project 等就绪
+ */
+const ALREADY_OPEN_DETAIL: Record<'yes' | 'busy' | 'loading', string> = {
+  yes: '♻️ 这个工程本来就开着',
+  busy: '♻️ 这个工程本来就开着，但它手上还有请求没回话 —— 要是一直不回，可能已经卡死，用 ue_session_health 看一眼',
+  loading:
+    '♻️ 这个工程的编辑器已经在启动、还没连上盒子，没有再启动一个。用 ue_session_health 看它连上没有，不要重复调 open_project'
+}
+
+async function alreadyRunning(
+  uprojectPath: string
+): Promise<'yes' | 'busy' | 'loading' | 'no' | 'stuck'> {
   // `isSameProject` 自己会削掉 `.uproject` 并抹平大小写和斜杠方向，原样传进去就行
   const connectionId = findLiveConnection(uprojectPath)
-  if (!connectionId) return 'no'
+  // 没连上不等于没开：编辑器加载要几十秒到几分钟，这时再启动就是第二个编辑器（见 editorLaunch.ts）
+  if (!connectionId) {
+    const loading = await editorStillLoading(uprojectPath, {
+      findProcess: (p) => UnrealProcessDetector.findRunningProjectByPath(p, { throwOnError: true })
+    })
+    return loading ? 'loading' : 'no'
+  }
   const ws = serviceManager.getWebSocketService()
   const verdict = await ws.probeConnection(connectionId)
   // 忙 = 有请求在路上、没去探：既可能在跑长操作，也可能已经卡死，不能直接说「开着、好着」
@@ -889,7 +898,7 @@ interface OpenProjectResult {
  * ## 三种结局都要说清楚
  *
  * - **切过去了**：告诉模型可以接着干，别再自己去核连接。
- * - **会话被钉住**：用户把这条会话归到别的工程下了，切过去等于越界
+ * - **对话被钉住**：用户把这条对话归到别的工程下了，切过去等于越界
  *   （见 `core/sessionScope.ts`）。这一条挡得对，但必须让模型把原因转告用户，
  *   而不是自己憋着重试。
  * - **没等到**：工程可能编译很久，也可能插件没装。不谎报 —— 说清楚等了多久、
@@ -1473,12 +1482,7 @@ output_data = {
     actor_created: actorCreated,
     actor_binding_added: actorBindingAdded,
     animation_path: animationPath || undefined,
-    animation_applied: animationApplied,
-    output: {
-      sequencePath: sequencePath || `${sequenceFolderPath}/${sequenceName}`,
-      actorPath: actorPath || undefined,
-      animationPath: animationPath || undefined
-    }
+    animation_applied: animationApplied
   }
 }
 
@@ -1607,7 +1611,9 @@ export async function enablePluginsForProject(
       success: false,
       error:
         `本机没有这些插件：${check.notInstalled.join('、')}。写进去会让工程打不开，所以一个都没写。` +
-        '去掉它们再调一次；本机没有的插件只能让用户自己装（导入结果里有 Fab 链接的就给他）。'
+        '去掉它们再调一次，或者先把插件装进工程的 Plugins 目录再调：免费、公开源码的插件，' +
+        '经用户同意可以用 run_shell_command 把源码 git clone 或拷进去（工程有 C++ 时随后 cpp_full_rebuild）；' +
+        'Fab / 商城上的和付费插件请用户自己装（导入结果里有 Fab 链接的就给他）。'
     }
   }
 
@@ -1885,7 +1891,7 @@ async function resolveExternalAssetPath(asset: AssetData, tempDir: string): Prom
 /**
  * 根据导入结果构造统一的资产摘要
  */
-function buildImportedAssetSummary(args: {
+export function buildImportedAssetSummary(args: {
   assetKey: string
   assetName: string
   assetClass: string
@@ -1903,8 +1909,16 @@ function buildImportedAssetSummary(args: {
     softPath: args.softPath || args.uePath
   })
   const spawnable = isSpawnableAssetClass(resolvedAssetClass)
+  // `className` 只是推 assetClass 用的原料，不往外发；`softPath` 和 `uePath`
+  // 同值时只发 uePath（.uasset 导入几乎总是同值，外部文件导入两者才不同）
   return {
-    ...args,
+    assetKey: args.assetKey,
+    assetName: args.assetName,
+    ...(args.uePath !== undefined ? { uePath: args.uePath } : {}),
+    ...(args.softPath && args.softPath !== args.uePath ? { softPath: args.softPath } : {}),
+    sourceType: args.sourceType,
+    imported: args.imported,
+    ...(args.alreadyExists !== undefined ? { alreadyExists: args.alreadyExists } : {}),
     assetClass: resolvedAssetClass,
     spawnable,
     reference:
@@ -2053,6 +2067,7 @@ async function importAssetsToProject(
   // eslint-disable-next-line @typescript-eslint/no-require-imports -- 懒加载：静态 import 会在模块加载期就拉起原生模块
   const Database = require('better-sqlite3')
   const db = new Database(vaultDbPath)
+  applyVaultConnectionPragmas(db)
   const contentBase = getProjectContentBase(projectRecord)
   const details: string[] = []
   const importedAssets: ImportedAssetSummary[] = []
@@ -2480,12 +2495,9 @@ async function importAssetsToProject(
       ...(folderSelection ? { folder_selection: folderSelection } : {}),
       imported_assets: importedAssets,
       spawn_candidates: spawnCandidates,
-      placed_actors: placedActors,
-      output: {
-        importedAssets,
-        spawnCandidates,
-        placedActors
-      }
+      // 原来这里还有一个 `output: { importedAssets, spawnCandidates, placedActors }`，
+      // 是上面三项的驼峰复本，没有任何读方。导两百个资产时它独占十四万字符
+      placed_actors: placedActors
     }
   } finally {
     db.close()
@@ -2518,7 +2530,7 @@ export function createProjectTool(): V2Tool {
     connected=true 就是「验证过能干活」，switched_target=true 就是「已经切过去了」——
     这时直接接着干，不要让用户去界面上切工程、也不要请他再发一条消息
   - 等待默认 ${DEFAULT_WAIT_MS / 1000} 秒，用 waitSeconds 调整
-  - 会话被用户归到别的工程下时不会切（那是越界），details 里会说明，照实转告用户
+  - 对话被用户归到别的工程下时不会切（那是越界），details 里会说明，照实转告用户
 - import_assets: 将资产库中的资产导入 UE 项目（需要 assetKeys **或** folder，可选 destinationPath）
   - **工程不用打开。** .uasset/.umap 是把文件拷进 <工程>/Content/ 并解析依赖，不经过引擎，
     所以别为了导资产先去 open_project —— 那会白等一趟编辑器启动。用 projectKey

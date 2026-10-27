@@ -5,7 +5,7 @@
  *
  * 之前的硬边界是「不做渲染出片」：渲染是不可逆的资源消耗（几小时机器时间、几十 GB
  * 磁盘），交付责任必须在人。这条理由没变，变的是**谁来拍板**：
- * 现在每一次渲染都要用户当场批准（`requiresExplicitApproval`，「本次会话都允许」对它
+ * 现在每一次渲染都要用户当场批准（`requiresExplicitApproval`，「本对话内都允许」对它
  * 无效），参数就写在审批卡上。拍板仍然在人，只是不用再让人自己去点 MRQ。
  *
  * 画质档和流程来自维护者早年的 MRQ 插件 UNTRender：档位制、按相机切出片、
@@ -43,6 +43,11 @@
 import { z } from 'zod'
 
 import { findFFmpeg } from '../../../services/ffmpegPath'
+import {
+  getTargetConnectionId,
+  getTargetProjectPath,
+  runWithTargetConnectionId
+} from '../../core/projectTargetContext'
 import { callUe, callUeRaw } from '../defineUeTool'
 import { defineTool, type ToolCallContext, type UnrealAgentTool } from '../defineTool'
 import { composeVideo, type ComposedVideo } from './composeVideo'
@@ -69,6 +74,9 @@ export const MRQ_DISABLED_HINT =
 export const RENDER_FORMATS = ['png', 'jpg', 'exr', 'bmp', 'mp4', 'mp4_mrq'] as const
 export const RENDER_QUALITIES = ['draft', 'standard', 'high', 'ultra'] as const
 
+/** 控制台变量名：非空、不带任何空白。与插件 Handle_Render 的校验一致 */
+const CVAR_NAME = /^\S+$/
+
 const InputSchema = z.object({
   sequence_path: z.string().trim().min(1).describe('要渲的序列，如 /Game/Cinematics/SQ_Intro'),
   map_path: z
@@ -89,7 +97,7 @@ const InputSchema = z.object({
     .enum(RENDER_QUALITIES)
     .optional()
     .describe(
-      '画质档，不填是 standard。draft：不加采样，最快，用来看镜头对不对；standard：每帧 4 次时间采样；' +
+      '画质档，不填是 standard。draft：不加采样、预热很少，最快，用来看镜头对不对；standard：每帧 4 次时间采样；' +
         'high：2×8；ultra：4×16，最慢。档位越高，同一帧渲得越久'
     ),
   renderer: z
@@ -99,8 +107,10 @@ const InputSchema = z.object({
       '不填是 lumen。lumen：延迟渲染，和视口里看到的一致。' +
         'path_tracer：路径追踪，质量最高但慢得多，要求项目开了硬件光追'
     ),
+  // 不用 z.tuple：转出来是元组式 items: [...]，MiMo 等 OpenAI 兼容端点整单 400
   resolution: z
-    .tuple([z.number().int().min(16).max(16384), z.number().int().min(16).max(16384)])
+    .array(z.number().int().min(16).max(16384))
+    .length(2)
     .optional()
     .describe('输出分辨率 [宽, 高]，如 [3840, 2160]。不填是 [1920, 1080]'),
   frame_start: z
@@ -127,7 +137,18 @@ const InputSchema = z.object({
     .trim()
     .min(1)
     .optional()
-    .describe('输出目录的绝对路径。不填就是 工程/Saved/MovieRenders/序列名/时间戳')
+    .describe('输出目录的绝对路径。不填就是 工程/Saved/MovieRenders/序列名/时间戳'),
+  // 只挡写不进去的名字（空、带空白 —— MRQ 按名字查变量，查不到就静默跳过），不设白名单
+  console_variables: z
+    .record(z.string(), z.number())
+    .refine((m) => Object.keys(m).every((k) => CVAR_NAME.test(k)), {
+      message: '控制台变量名不能为空、不能带空格或换行；名字和值分开写，如 {"r.ForceLOD": 0}'
+    })
+    .optional()
+    .describe(
+      '渲染期间临时设的控制台变量 {名字: 数值}，渲完 MRQ 自动恢复，叠在预设之上。' +
+        '首帧贴图糊、切镜 LOD 跳一下：{"r.Streaming.FullyLoadUsedTextures": 1, "r.ForceLOD": 0}。只收数值'
+    )
 })
 
 type RenderInput = z.infer<typeof InputSchema>
@@ -144,9 +165,36 @@ export interface RenderStartOutput {
   quality: string
   /** 实际要渲的范围，闭开区间，显示帧号 */
   frame_range: [number, number]
+  /** 真写进 MRQ 配置的控制台变量（值是引擎存的 float）。没有写进去的在 warnings 里 */
+  console_variables?: Record<string, number>
   /** 用了用户的预设时才有 */
   preset_path?: string
   warnings?: string[]
+}
+
+/** 旧版插件不认 console_variables，会静默忽略；这时得照实说没生效 */
+export const CVARS_IGNORED =
+  '编辑器里的插件没有回报 console_variables —— 多半是插件版本旧、不认这个参数，这些控制台变量没有生效'
+
+/**
+ * 要了控制台变量、引擎却一个都没回报也没给理由时，补一条警告。
+ * 插件对查不到的变量会写进 warnings，那种情况不重复说
+ */
+export function checkConsoleVariables(
+  requested: Record<string, number> | undefined,
+  job: RenderStartOutput
+): RenderStartOutput {
+  const names = Object.keys(requested ?? {})
+  if (names.length === 0 || job.console_variables) return job
+  if ((job.warnings ?? []).some((w) => names.some((n) => w.includes(n)))) return job
+  return { ...job, warnings: [...(job.warnings ?? []), CVARS_IGNORED] }
+}
+
+/** 引擎回的是 float：0.1 会变成 0.10000000149011612，给人看时收一下 */
+function formatCVars(cvars: Record<string, number>): string {
+  return Object.entries(cvars)
+    .map(([k, v]) => `${k}=${Number(v.toPrecision(6))}`)
+    .join('、')
 }
 
 export type RenderState = 'rendering' | 'finished' | 'failed' | 'canceled' | 'none'
@@ -209,9 +257,13 @@ function describeJob(j: RenderStartOutput): string {
   const settings = j.preset_path
     ? `预设 ${j.preset_path}`
     : `${j.renderer === 'path_tracer' ? '路径追踪' : 'Lumen'}，${j.quality} 档`
+  const cvars =
+    j.console_variables && Object.keys(j.console_variables).length > 0
+      ? `，控制台变量 ${formatCVars(j.console_variables)}`
+      : ''
   return (
     `${j.sequence_path}（关卡 ${j.map_path}）→ ${j.format.toUpperCase()} ${w}×${h}，` +
-    `${settings}，帧 [${j.frame_range[0]}, ${j.frame_range[1]})`
+    `${settings}，帧 [${j.frame_range[0]}, ${j.frame_range[1]})${cvars}`
   )
 }
 
@@ -220,7 +272,13 @@ export function formatResult(j: RenderStartOutput, s: RenderStatusOutput): strin
   const lines: string[] = []
   const head = describeJob(j)
 
-  if (s.state === 'finished') {
+  if (s.state === 'finished' && (s.files_written ?? 0) === 0) {
+    // 一个文件都没写出来就不是「完成」：第一句就得说没成
+    lines.push(`渲染失败：${head}。引擎说渲完了，但输出目录里一个文件都没有。`)
+    lines.push(`输出目录：${s.output_dir}`)
+    if (s.error) lines.push(`引擎报过错：${s.error}`)
+    lines.push('先看输出日志里的 LogMovieRenderPipeline。')
+  } else if (s.state === 'finished') {
     const expected = j.frame_range[1] - j.frame_range[0]
     const written = s.files_written ?? 0
     lines.push(`渲染完成：${head}，用时 ${formatDuration(s.elapsed_seconds)}。`)
@@ -239,11 +297,6 @@ export function formatResult(j: RenderStartOutput, s: RenderStatusOutput): strin
     for (const f of s.sample_files ?? []) lines.push(`  ${f}`)
     // 渲完了但中途报过错（非致命）：照实转述，别让「完成」盖住它
     if (s.error) lines.push(`⚠️ 渲染过程中引擎报过错：${s.error}`)
-    if (written === 0) {
-      lines.push(
-        '⚠️ 引擎说渲完了，但输出目录里一个文件都没有。先看输出日志里的 LogMovieRenderPipeline。'
-      )
-    }
   } else if (s.state === 'canceled') {
     lines.push(`渲染已取消：${head}。`)
     lines.push(`取消前已经写出的文件在 ${s.output_dir}（${s.files_written ?? 0} 个）。`)
@@ -380,14 +433,13 @@ export function createSequenceRenderTool(): UnrealAgentTool<RenderDetails> {
   return defineTool<typeof InputSchema, RenderDetails>({
     name: 'sequence_render',
     namespace: NAMESPACE,
+    // 只写新的输出文件，不动工程内容；占机器时间这件事靠描述里「用户要了才渲」管
     risk: 'mutating',
-    // 每次渲染都要用户当场点头：参数每次不同，而参数本身就是代价（几小时、几十 GB）
-    requiresExplicitApproval: true,
     concurrency: 'sequential',
     description: `用 Movie Render Queue（MRQ）把一条 Level Sequence 渲成文件：序列帧（PNG / JPG / EXR / BMP），或者先出 PNG 再用 FFmpeg 合成 MP4。这是**引擎真实渲染**，不是 AI 生图。
 
 【什么时候用】
-用户说「出片」「渲染序列」「用 MRQ 渲」「出序列帧」「出 EXR 给合成」「渲个视频」。
+用户说「出片」「渲染序列」「用 MRQ 渲」「出序列帧」「出 EXR 给合成」「渲个视频」。用户没要就不要主动开渲。
 
 【调之前】
 1. 先跑 \`sequence_audit\`，FAIL 就先修 —— 黑屏、缺相机切轨的序列渲出来也是废片
@@ -419,22 +471,49 @@ export function createSequenceRenderTool(): UnrealAgentTool<RenderDetails> {
       // 用户明确要 MRQ 自带的 MP4 编码器：原样交给插件（5.6 以下插件会报没有这个输出）
       if (input.format === 'mp4_mrq') params.format = 'mp4'
 
+      // 停止回调跑在停止按钮的执行流里，那边认不出目标编辑器；连着两个以上编辑器时
+      // 不带目标就发不出去，所以在这儿把这次渲染的目标记下来
+      const connectionId = getTargetConnectionId()
+      const projectPath = getTargetProjectPath()
+      const target = {
+        ...(connectionId ? { connectionId } : {}),
+        ...(projectPath ? { projectPath } : {})
+      }
+      const cancelJob = (jobId: string): void => {
+        void runWithTargetConnectionId(target, () =>
+          callUeRaw('sequence.render_cancel', { job_id: jobId }, { timeoutMs: 15_000 })
+        ).catch(() => undefined)
+      }
+
+      // 开始请求不挂停止信号：请求已经发出去了，编辑器照样会开渲；这边放手只会丢掉任务号，
+      // 留下一个没人管、后面每次都报「上一次还没结束」的渲染。停止发生在等回执的时候，
+      // 回执一到就取消
+      const started = callUe<RenderStartOutput>('sequence.render', params, { timeoutMs: 60_000 })
+      const cancelOnceStarted = (): void => {
+        void started
+          .then((value) => value?.job_id && cancelJob(value.job_id))
+          .catch(() => undefined)
+      }
+      ctx.signal?.addEventListener('abort', cancelOnceStarted, { once: true })
+
       let job: RenderStartOutput
       try {
-        job = await callUe<RenderStartOutput>('sequence.render', params, {
-          timeoutMs: 60_000,
-          ...(ctx.signal ? { signal: ctx.signal } : {})
-        })
+        job = await started
       } catch (error) {
         // 第一次用最常见的就是这一条。下一步写死在报错里，比指望模型翻回描述可靠
         if (error instanceof Error && error.message.includes('MovieRenderPipeline')) {
           throw new Error(`${error.message}\n${MRQ_DISABLED_HINT}`)
         }
         throw error
+      } finally {
+        ctx.signal?.removeEventListener('abort', cancelOnceStarted)
       }
+      // 等回执期间被停了：上面挂的监听已经在回执到手时发了取消
+      if (ctx.signal?.aborted) throw ctx.signal.reason ?? new Error('Operation aborted')
       if (!job?.job_id) {
         return { text: '失败：引擎没有返回渲染任务', isError: true }
       }
+      job = checkConsoleVariables(input.console_variables, job)
 
       ctx.report({
         text: `已开始渲染：${describeJob(job)}`,
@@ -454,13 +533,7 @@ export function createSequenceRenderTool(): UnrealAgentTool<RenderDetails> {
 
       // 停止 = 取消。发出去就不管了：编辑器卡死时这条也会超时，那时 note 里的
       // 「已请求取消」就是全部真相
-      const onAbort = (): void => {
-        void callUeRaw(
-          'sequence.render_cancel',
-          { job_id: job.job_id },
-          { timeoutMs: 15_000 }
-        ).catch(() => undefined)
-      }
+      const onAbort = (): void => cancelJob(job.job_id)
       ctx.signal?.addEventListener('abort', onAbort, { once: true })
       ctx.setAbortNote?.(
         () =>
@@ -494,7 +567,11 @@ export function createSequenceRenderTool(): UnrealAgentTool<RenderDetails> {
         return {
           text,
           details: { start: job, status, ...(video ? { video } : {}) },
-          isError: status.state === 'failed'
+          // 没写出文件的「完成」、编辑器里已经没有这个任务（none）都按失败交出去
+          isError:
+            status.state === 'failed' ||
+            status.state === 'none' ||
+            (status.state === 'finished' && (status.files_written ?? 0) === 0)
         }
       } finally {
         ctx.signal?.removeEventListener('abort', onAbort)

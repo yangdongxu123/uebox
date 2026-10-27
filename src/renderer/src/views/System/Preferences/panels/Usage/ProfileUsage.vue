@@ -15,6 +15,7 @@ import { useI18n } from 'vue-i18n'
 import { useChatMessagesStore } from '@renderer/store/modules/chatMessages'
 import type { ChatMessage } from '@renderer/store/modules/chatMessages'
 import { useChatSessionsStore } from '@renderer/store/modules/chatSessions'
+import { chatHistoryStorage } from '@renderer/utils/chatHistoryStorage'
 
 import {
   average,
@@ -27,6 +28,7 @@ import {
   HEATMAP_DAYS,
   metricValue,
   rangeDays,
+  slimForUsage,
   uncachedOf,
   USAGE_METRICS,
   USAGE_RANGES,
@@ -60,7 +62,7 @@ const report = ref<UsageReport | null>(null)
 /** 热力图那一年的日汇总。和上面同一个函数算出来的，不会有两份对不上的数字 */
 const yearDays = ref<UsageDay[]>([])
 
-/** 会话 id → 工程名。没绑工程的会话不进这张表，统计层会把它们归到「没绑工程」 */
+/** 对话 id → 工程名。没绑工程的对话不进这张表，统计层会把它们归到「没绑工程」 */
 function projectBySid(): Record<string, string> {
   const table: Record<string, string> = {}
   for (const session of chatSessionsStore.sessions) {
@@ -70,9 +72,35 @@ function projectBySid(): Record<string, string> {
   return table
 }
 
+/** 盘上的历史对话，削到只剩统计用得到的字段。读完之前先拿内存里已经打开的那些算 */
+let onDisk: Record<string, ChatMessage[]> = {}
+
+/** 一批读几个对话。单个对话几百 KB 到几 MB，一批几十个不至于让一条 IPC 消息太大 */
+const READ_BATCH = 20
+
+async function loadHistoryOnDisk(): Promise<void> {
+  const read = window.api?.chatHistory?.readSessions
+  if (!read) return
+  const sids = Object.keys(chatHistoryStorage.sessionIndex)
+  const loaded: Record<string, ChatMessage[]> = {}
+  for (let i = 0; i < sids.length; i += READ_BATCH) {
+    const batch = await read(sids.slice(i, i + READ_BATCH))
+    for (const [sid, raw] of Object.entries(batch)) {
+      try {
+        loaded[sid] = slimForUsage((JSON.parse(raw) as { messages?: unknown }).messages)
+      } catch {
+        // 读不出来的对话不计入统计
+      }
+    }
+  }
+  onDisk = loaded
+}
+
 function refresh(): void {
-  const snapshot = chatMsgStore.exportChatMessagesPersistence()
-  const messages = (snapshot.messagesBySid ?? {}) as Record<string, ChatMessage[]>
+  // 内存里的那份更新（可能还没落盘），盖在盘上那份上面
+  const inMemory = chatMsgStore.exportChatMessagesPersistence().messagesBySid ?? {}
+  const messages: Record<string, ChatMessage[]> = { ...onDisk }
+  for (const [sid, list] of Object.entries(inMemory)) messages[sid] = slimForUsage(list)
   const now = Date.now()
   const projects = projectBySid()
 
@@ -227,7 +255,10 @@ function monthLabel(dateKey: string): string {
   )
 }
 
-onMounted(refresh)
+onMounted(() => {
+  refresh()
+  void loadHistoryOnDisk().then(refresh)
+})
 </script>
 
 <template>
@@ -464,7 +495,7 @@ onMounted(refresh)
             <span class="rank-name">{{ tool.name }}</span>
             <span class="rank-count">{{ formatCount(tool.calls) }}</span>
             <span class="rank-count" :class="{ danger: tool.failed > 0 }">
-              {{ tool.failed > 0 ? `${formatCount(tool.failed)} · ${failRate(tool)}` : '—' }}
+              {{ tool.failed > 0 ? `${formatCount(tool.failed)} (${failRate(tool)})` : '—' }}
             </span>
             <span class="rank-count">{{ formatDuration(tool.medianMs) }}</span>
           </div>

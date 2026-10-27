@@ -27,13 +27,14 @@ export default {
     notebookDetail: 'Notebook Detail',
     profile: 'Profile',
     aiAssistant: 'AI Assistant',
-    newChat: 'New AI Chat',
+    newChat: 'New chat',
     tools: 'Tools',
     aiChat: 'AI Chat',
     requirements: 'Requirements',
     model3dStudio: '3D Studio',
     aigcStudio: 'AIGC Studio',
     serverManagement: 'Server Management',
+    externalTeams: 'External Teams',
     appName: 'Unreal Box'
   },
   // Sidebar tool customization: pinned list and the "More" group
@@ -112,7 +113,7 @@ export default {
     delete: 'Delete',
     deleteTitle: 'Delete chat',
     deleteContent: 'Delete "{title}"? This cannot be undone.',
-    deleteTranscriptFailed: 'Chat removed, but its agent memory could not be deleted',
+    deleteTranscriptFailed: 'Chat removed, but some of its history could not be cleaned up',
     cancel: 'Cancel',
     // Batch bar for multi-select: Ctrl/Cmd+click adds one by one, Shift+click picks a range
     batch: {
@@ -135,11 +136,11 @@ export default {
     followUpSystemPrompt:
       "You are a senior Unreal Engine technical assistant. Output only JSON and must strictly follow the schema. The field is followUps (array), containing 2-3 follow-up questions for the assistant from the user's perspective, within 15 words each in {lang}. Each must be a complete sentence that can be asked directly. Do not output any other content or explanations.",
     followUpUserPrompt:
-      "Based on the conversation above, generate follow-up questions for the assistant from the user's perspective in {lang}.",
+      "Based on the chat above, generate follow-up questions for the assistant from the user's perspective in {lang}.",
     sessionTitleSystemPrompt:
-      'You are a chat title generator. From the user\'s first message, write a title in {lang} that captures what the conversation is about, at most 6 words. Write the topic only: no quotes, no trailing punctuation, no prefixes like "About" or "How to", and do not repeat the whole sentence. Output only JSON and must strictly follow the schema. The field is title (string). Do not output any other content or explanations.',
+      'You are a chat title generator. From the user\'s first message, write a title in {lang} that captures what the chat is about, at most 6 words. Write the topic only: no quotes, no trailing punctuation, no prefixes like "About" or "How to", and do not repeat the whole sentence. Output only JSON and must strictly follow the schema. The field is title (string). Do not output any other content or explanations.',
     sessionRenameSystemPrompt:
-      'You are a chat title generator. Below is an outline of a conversation: the user\'s questions in order and the latest answer, sometimes with the current title. Write a title in {lang} that captures the main thread of the whole conversation, at most 6 words. Cover what the conversation has been working on throughout, not just the details of the last question; if a current title is given and still fits, return it unchanged. Write the topic only: no quotes, no trailing punctuation, no prefixes like "About" or "How to", and do not repeat the wording. Output only JSON and must strictly follow the schema. The field is title (string). Do not output any other content or explanations.',
+      'You are a chat title generator. Below is an outline of a chat: the user\'s questions in order and the latest answer, sometimes with the current title. Write a title in {lang} that captures the main thread of the whole chat, at most 6 words. Cover what the chat has been working on throughout, not just the details of the last question; if a current title is given and still fits, return it unchanged. Write the topic only: no quotes, no trailing punctuation, no prefixes like "About" or "How to", and do not repeat the wording. Output only JSON and must strictly follow the schema. The field is title (string). Do not output any other content or explanations.',
     speechBriefingConciseSystemPrompt:
       'You are a voice narration editor. Rewrite the AI reply the user sends you as a short script to be read aloud, keeping only the conclusion: what was done, the outcome, and what the listener needs to do. At most three sentences and about 50 words. Use the same language as the reply. No code, file paths, URLs, Markdown symbols, lists or headings; no preamble and no references to "this reply", just the script itself. Output only the script, no explanation.',
     speechBriefingDetailedSystemPrompt:
@@ -152,7 +153,7 @@ export default {
     releaseAll: 'Release all',
     conflict: '{path} is being modified by "{session}"; nothing was changed',
     dismiss: 'Dismiss',
-    unknownSession: 'another session',
+    unknownChat: 'another chat',
     currentLevel: 'Current level'
   },
   agentV3Debug: {
@@ -229,7 +230,8 @@ export default {
       needsRestart: 'Configured · restart the editor',
       unsupported: 'Engine too old · needs 5.8+',
       ready: 'Enabled · running',
-      readyHint: 'The engine service is running; the box will connect on the next conversation.',
+      readyHint:
+        'The engine service is running; the box will connect automatically the next time you chat.',
       // The most common reason the button "disappears" — say it instead of showing nothing.
       noProject:
         'No Unreal Engine project is connected yet. Open a project from the home page and its status will show here.',
@@ -264,6 +266,20 @@ export default {
       unsupported: 'No installer for this platform yet — Windows and macOS only.',
       failed: 'Check failed: {error}. If you just updated the app, restart it and try again.',
       hint: 'Installs the official Blender Lab server and Blender add-on, then fills in the MCP config. Needs network access.',
+      installPrereqs: 'Install {names}',
+      installingPrereqs: 'Installing {names}. This takes a few minutes…',
+      nameJoiner: ' and ',
+      prereqsUacHint:
+        'Windows will ask for administrator permission while installing Git. Click "Yes" in the prompt.',
+      prereqsInstalled: '{names} installed.',
+      askAi: 'Ask AI to troubleshoot',
+      askAiFailed: 'Could not hand off to AI: {reason}',
+      aiPrompt: `Help me install {names} on this Windows PC so I can connect Blender. Unreal Box tried to install it automatically (Python from a mirror in China, then winget) and failed. Raw output:
+
+{detail}
+
+Requirements: after installing Git, git must run from the command line; Python must be 3.11 or newer and runnable as py or python.
+First work out why the install failed from the output above. If you can run commands, install it and verify; if you can't, walk me through installing it by hand. Finally, remind me to reopen Settings → MCP so the Blender row re-checks.`,
       // Name what is missing. "Environment not satisfied" is exactly the failure the
       // install script already had (one line of Command failed: git).
       prereq: {
@@ -349,6 +365,9 @@ export default {
       command: 'Launch command',
       url: 'Server URL',
       disabled: 'Disabled',
+      trusted: 'Trust this server',
+      trustedHint:
+        'When on, its tools no longer ask for confirmation in "Approve for me" mode. "Ask for approval" mode still asks.',
       env: 'Environment',
       envPlaceholder: 'KEY=VALUE',
       envHint: 'Follow the service instructions: one KEY=VALUE per line, or paste JSON.'
@@ -399,6 +418,7 @@ export default {
       empty: 'No providers yet',
       add: '+ Add Provider',
       searchPlaceholder: 'Search providers or models',
+      enableProvider: 'Enable {name}',
       keyReady: 'Key configured',
       keyMissing: 'Key missing',
       linked: 'Signed in',
@@ -430,7 +450,7 @@ export default {
       supportsModel3d: '3D generation',
       supportsModel3dDesc: 'Generate 3D models from text or images',
       supportsRealtimeVoice: 'Realtime voice',
-      supportsRealtimeVoiceDesc: 'Supports real-time voice conversations',
+      supportsRealtimeVoiceDesc: 'Supports real-time voice calls',
       supportsReasoning: 'Reasoning',
       supportsReasoningDesc: 'Thinks before answering',
       ttsVoice: 'Reading voice',
@@ -438,7 +458,7 @@ export default {
         'Enter a voice ID supported by this model. Leave empty to use its default voice.',
       realtimeVoice: 'Voice',
       realtimeVoiceHint:
-        'Takes effect the next time you start a voice conversation. It will not switch an active call mid-session.',
+        'Takes effect the next time you start a voice call. A call already in progress keeps its current voice.',
       realtimeVoices: {
         zh_female_vv_jupiter_bigtts: 'VV · lively, expressive female voice',
         zh_female_xiaohe_jupiter_bigtts:
@@ -481,6 +501,8 @@ export default {
       baseUrl: 'Base URL',
       kind: 'Purpose',
       kindDesc: 'Choose a purpose. Add separate entries if a provider serves multiple purposes.',
+      kindLockedDesc:
+        'The catalog entry sets the purpose. To use this provider for something else, add its matching catalog entry.',
       kinds: {
         chat: 'Chat',
         embedding: 'Embedding (knowledge search)',
@@ -488,6 +510,7 @@ export default {
         video: 'Video generation',
         model3d: '3D generation',
         music: 'Music generation',
+        sfx: 'Sound effects',
         tts: 'Text to speech',
         stt: 'Speech to text',
         realtime: 'Realtime voice',
@@ -528,7 +551,10 @@ export default {
       models: 'Models',
       import: 'Import models…',
       importing: 'Importing…',
-      addModel: '+ Add Model'
+      addModel: '+ Add Model',
+      // Preset models in the catalog that this saved provider does not have yet
+      addCatalogModel: '+ Add new model {name}',
+      addCatalogModels: '+ Add {count} new models, incl. {name}'
     },
     apiKey: {
       placeholder: 'Enter a key, environment variable, or !command',
@@ -537,7 +563,11 @@ export default {
       oauthLogin: 'Sign in with {name}',
       oauthRelogin: 'Sign in again',
       oauthLinked: 'Signed in with {name}. Tokens refresh automatically',
+      zcodeLinked: 'Signed in with {name}. Sign in again when the token expires',
+      zcodeHint:
+        'Authorize your account in ZCode and activate Coding Plan before signing in with Z.ai, or enter a subscription JWT. This connection only uses the ZCode subscription and never falls back to API balance. If verification is required, complete it in ZCode and retry.',
       oauthKeyFetched: 'Key fetched from {name} and filled in above — click Save to apply',
+      oauthShared: 'Uses the sign-in from "{name}" — just click Save',
       getKey: 'Get an API key ↗',
       oauthOpening: 'Browser opened — complete the authorization there',
       authorizing: 'Waiting for browser… click to cancel',
@@ -569,6 +599,8 @@ export default {
       saved: 'Saved',
       saveFailed: 'Save failed',
       testOk: 'Connected ({model})',
+      testOkThinkingRejected:
+        'Connected ({model}), but requests with thinking enabled are rejected. Keep the thinking level on Auto or Off for this model.',
       imported: 'Imported, {count} models added',
       importFailed: 'Import failed',
       oauthOk: 'Authorized. The key is filled in — press Save to apply.',
@@ -590,13 +622,18 @@ export default {
       timeout:
         'Request timed out. Check that the Base URL is reachable, or whether a proxy is needed.',
       unauthorized: 'The API key is invalid or has expired.',
-      forbidden: 'This key does not have access to that model.',
+      forbidden:
+        'Request rejected (403). The key may lack access to this model, or the provider may restrict how it is accessed.',
       providerServerError:
         "The provider's server returned an error. This is usually not your configuration — try again in a little while.",
       modelNotFound:
         'No such model. Check the model ID, or use "Import models" to pull the available list.',
       rateLimited: 'Rate limited, or out of quota.',
       badRequest: 'Request rejected (400). Check the model ID, API URL, and protocol.',
+      protocolMismatch:
+        'Rejected under the current protocol, but the test passes with {protocol}. Change the protocol.',
+      toolsRejected:
+        'This model does not accept tool calls, so it cannot operate the editor in chat.',
       unreachable:
         'Cannot reach that address. Check the Base URL, and whether the local service is running.',
       unknown: 'The connection failed, but the provider gave no reason.',
@@ -624,6 +661,7 @@ export default {
       title: 'Delete {name}?',
       content:
         'Deletes this provider’s configuration and key, and clears default models that use it.',
+      inUse: '{count} running chat(s) use this provider. They will fail on their next model call.',
       ok: 'Delete',
       cancel: 'Cancel'
     },
@@ -637,20 +675,21 @@ export default {
       desc: 'Assign models by purpose.',
       unset: 'Not set',
       moreLabel: 'Show details',
-      chat: 'Chat',
-      chatDesc: 'Default model for the assistant and every chat window.',
-      chatMerged: 'Agent, Vision and Quick tasks use this model too.',
+      chat: 'Main model',
+      chatDesc:
+        'Shared by chat and Agent; the composer switches this one. Also used wherever no other model is set.',
+      chatMerged: 'Vision and Quick tasks use this model too.',
       chatSplit: 'Set separately',
       agent: 'Agent',
       agentDesc: 'For multi-step tasks. Uses the Chat model if unconfigured.',
       vision: 'Vision',
-      visionDesc: 'Used when the Chat or Agent model cannot understand images.',
+      visionDesc: 'Used when the main model cannot understand images.',
       visionMore:
         'No setup is needed if the primary model supports images. Otherwise choose a vision model; images cannot be sent if neither supports them.',
       visionMissing: 'Image requests will fail',
       summary: 'Quick tasks',
       summaryDesc:
-        'For summaries, titles, and intent classification. Uses the Chat or Agent model if unconfigured.',
+        'For summaries, titles, and intent classification. Uses the main model if unconfigured.',
       embedding: 'Embedding',
       embeddingDesc: 'Index knowledge base content for the assistant to search.',
       embeddingMore:
@@ -677,25 +716,32 @@ export default {
       musicMore:
         'Generates instrumental music with the selected provider. Charges and commercial rights depend on your plan.',
       musicMissing: 'Automatic music unavailable',
+      sfx: 'Sound effects',
+      sfxDesc:
+        'Generate footsteps, clicks, explosions and other game sounds. Uses local FFmpeg synthesis when unset.',
+      sfxMore:
+        'With ElevenLabs, realistic sounds are generated from a description and may be charged. When unset, the agent synthesizes synth-style sounds with local FFmpeg, which must be installed first. Both output WAV files ready to import into UE.',
       ttsDesc: 'Read AI replies aloud with an AI-generated voice.',
       ttsMore:
-        'Add Doubao Text to speech, enter a Speech console API key, then select TTS 2.0 here. Change the voice in model settings.',
+        'Doubao TTS 2.0, Alibaba Qwen-Audio and Fish Audio are built in. A local Kokoro or CosyVoice server that speaks the OpenAI speech API works too — add the local text-to-speech entry under Add provider → Voice. Change the voice in model settings.',
       ttsMissing: 'Read aloud unavailable',
-      realtimeDesc: 'Choose a real-time voice model for voice conversations.',
+      realtimeDesc: 'Choose a real-time voice model for voice calls.',
       realtimeMore:
-        'Supports OpenAI gpt-realtime models and Doubao Seeduplex. Ordinary chat models do not apply.',
-      realtimeMissing: 'Voice conversation unavailable',
+        'Supports OpenAI gpt-realtime models and Doubao Seeduplex; ordinary chat models cannot be bound here. When unset and speech-to-text plus text-to-speech are configured, calls are answered by the chat model with slightly more delay.',
+      realtimeMissing: 'Voice call unavailable',
+      realtimeViaPipeline:
+        'Unset: calls are answered by the chat model through speech-to-text and text-to-speech, with slightly more delay.',
       stt: 'Speech to text',
       sttDesc:
         'Hold the voice hotkey, speak, and get text in the search box. Falls back to the realtime voice role when unset.',
       sttMore:
-        'Doubao STT 2.0 and Alibaba Qwen-Audio ASR are built in — transcription-only endpoints that never talk back. Dictation still works when this is empty: it falls back to the realtime voice role, but only OpenAI gpt-realtime can turn off the automatic reply there, so a Doubao realtime binding reports that voice is unavailable. This role bills by audio duration, far cheaper than transcribing through a chat model.',
+        'Doubao STT 2.0, Alibaba Qwen-Audio ASR and SiliconFlow SenseVoice are built in — transcription-only endpoints that never talk back. A local SenseVoice or Whisper server that speaks the OpenAI transcription API works too. Dictation still works when this is empty: it falls back to the realtime voice role, but only OpenAI gpt-realtime can turn off the automatic reply there, so a Doubao realtime binding reports that voice is unavailable. Cloud recognition bills by audio duration, far cheaper than transcribing through a chat model; local recognition is free.',
       sttMissing: 'Speech to text unavailable',
       model3dMissing: '3D generation unavailable',
       search: 'Web search',
       searchDesc: 'Choose a web search service. Uses the built-in browser if unconfigured.',
       searchMore:
-        'The built-in browser requires no setup. You can also use Jina or self-hosted SearXNG; charges depend on the service.',
+        'The built-in browser requires no setup. You can also use Jina, DeepSeek or self-hosted SearXNG; charges depend on the service.',
       searchMissing: 'Web search unavailable',
       judge: 'Structured judgement',
       judgeDesc:
@@ -719,7 +765,7 @@ export default {
         chat: 'Chat',
         visual: 'Image & Video',
         voice: 'Voice',
-        creative: 'Music & 3D',
+        creative: 'Audio & 3D',
         retrieval: 'Search & Tools'
       },
       access: {
@@ -736,6 +782,7 @@ export default {
         image: 'Image Generation',
         embedding: 'Embedding (knowledge search)',
         music: 'Music generation',
+        sfx: 'Sound effects',
         tts: 'Text to speech',
         stt: 'Speech to text (dictation)',
         realtime: 'Realtime voice',
@@ -768,6 +815,8 @@ export default {
       codeDesc: 'Your browser is open. Sign in, check that this code matches, then click Approve.',
       codeCopy: 'Click to copy',
       notOpened: "Browser didn't open? Visit:",
+      openLink: 'Open in browser',
+      copyLink: 'Copy link',
       tier: '{tier} · {interval}',
       intervalMonth: 'Monthly',
       intervalYear: 'Yearly',
@@ -864,6 +913,10 @@ export default {
           title: 'Box Plan authorization expired',
           desc: 'The key was revoked or deleted. Reconnect in Settings → Models.'
         },
+        line_busy: {
+          title: 'Lines are busy',
+          desc: "Retried once already, and failed calls don't use Credits. Try again later, or switch back to the default model."
+        },
         manage: 'Manage subscription',
         reconnect: 'Reconnect'
       },
@@ -882,7 +935,7 @@ export default {
     copy: 'Duplicate',
     pin: 'Pin',
     unpin: 'Unpin',
-    newChat: 'New AI Chat',
+    newChat: 'New chat',
     openInNewWindow: 'Open in New Window'
   },
   chatWindow: {
@@ -1438,10 +1491,10 @@ export default {
   },
   catalogLibrary: {
     switcher: {
-      badge: 'Server',
+      badge: 'Team',
       state: {
         online: 'Connected',
-        offline: 'Cannot reach the server',
+        offline: "Can't reach the team",
         signedOut: 'Sign in again',
         unknown: 'Not connected'
       },
@@ -1537,7 +1590,7 @@ export default {
       title: 'Sign in to {server} again'
     },
     view: {
-      signedOut: 'Your server library session has expired. Sign in again to continue.',
+      signedOut: "You've been signed out of the server library. Sign in again to continue.",
       offlineBanner:
         'Cannot reach the server. Showing pages you have already viewed; search and import are unavailable.',
       remove: 'Remove from list',
@@ -1615,7 +1668,7 @@ export default {
       'no-member-surface': 'This server has no account sign-in. Paste an identity token instead.',
       'missing-password': 'Enter the password.',
       'missing-token': 'Paste the identity token.',
-      'signed-out': 'Your session has expired. Sign in again.',
+      'signed-out': "You've been signed out. Sign in again.",
       unauthorized: 'The account, password or token is not right.',
       forbidden: 'You do not have permission.',
       'not-found': 'Not found, or you cannot see it.',
@@ -1689,7 +1742,7 @@ export default {
     language: 'Language',
     trayQuitTitle: 'Quit Unreal Box?',
     trayQuitContent:
-      '{count} session operation(s) are still unfinished — quitting will interrupt them.',
+      'The AI still has {count} operation(s) in progress — quitting will interrupt them.',
     trayQuitOk: 'Quit anyway',
     updateQuitTitle: 'Restart to install the update?',
     updateQuitOk: 'Restart and install anyway'
@@ -1840,6 +1893,14 @@ export default {
           create: 'New Project',
           createCollection: 'Create group',
           refresh: 'Refresh'
+        },
+        ualinkPrompt: {
+          title: 'Install the connection plugin for imported projects?',
+          content:
+            "The plugin goes into the project's Plugins folder; the engine is not modified. Without it, the AI cannot work with the project. You can remove it from the project's right-click menu, or turn off automatic installation in Settings → Plugin. This prompt appears only once.",
+          install: 'Install',
+          skip: 'Not now',
+          installed: 'Connection plugin installed'
         },
         ualink: {
           removeTitle: 'Remove UnrealAgentLink from this project?',
@@ -2261,7 +2322,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
      */
     selfCheck: {
       /** Not a button — the review fires this off; this just says where the answer is */
-      sent: 'Asked it to prove it ↓',
+      sent: 'Self-check requested ↓',
       prompt: {
         intro: '(Self-check) I ran the engine over the changes you just made.',
         foundHeader: 'The machine found {count} issue(s):',
@@ -2353,6 +2414,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
         blueprint_add_component: 'Add Blueprint component',
         blueprint_set_property: 'Change Blueprint property',
         blueprint_create_function: 'Create Blueprint function',
+        blueprint_create_event_graph: 'Create Blueprint event graph',
         blueprint_add_variable: 'Add Blueprint variable',
         blueprint_remove_variable: 'Remove Blueprint variable',
         blueprint_set_variable_meta: 'Change Blueprint variable settings',
@@ -2385,6 +2447,9 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
         ue_content_naming_audit: 'Audit asset naming',
         ue_content_dependencies: 'Inspect asset dependencies',
         ue_content_migrate: 'Migrate assets to another project',
+        ue_content_set_properties: 'Change asset settings',
+        mesh_optimize: 'Generate mesh LODs / collision',
+        ue_datatable_edit: 'Edit data table',
         ue_content_delete: 'Delete asset',
         ue_fixup_redirectors: 'Fix up redirectors',
         annotate_asset: 'Annotate asset',
@@ -2403,6 +2468,8 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
 
         ue_save: 'Save',
         ue_set_config: 'Change editor setting',
+        ue_input_add_mapping: 'Add input mapping',
+        sequence_rebind: 'Change sequence binding',
         ue_collect_garbage: 'Free memory',
         ue_playtest: 'Play in editor',
         ue_restart_editor: 'Restart editor',
@@ -2423,6 +2490,8 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
         widget_add_child: 'Add child widget',
         widget_make_variable: 'Expose widget as variable',
         widget_set_property: 'Change widget property',
+        widget_replace: 'Replace widget',
+        widget_remove: 'Remove widget',
 
         write_local_file: 'Write file',
         edit_local_file: 'Edit file',
@@ -2444,11 +2513,11 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       notApplied: 'Not sent',
       cancel: 'Take back to edit',
       // Failing to cancel is normal: the kernel may have just picked it up
-      cancelTooLate: 'Too late — this one already went to the model'
+      cancelTooLate: 'Cannot withdraw: this message has already been sent to the model'
     },
     // The option card the agent shows when it needs a decision from you
     askUser: {
-      title: 'Needs your call',
+      title: 'Make a choice',
       waiting: 'Waiting for you',
       other: 'Other (write your own)',
       otherPlaceholder: 'Describe what you want instead…',
@@ -2456,13 +2525,17 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       next: 'Next',
       back: 'Back',
       step: '{current} / {total}',
-      decline: 'You decide',
-      declineHint: 'Skip choosing — let the AI go with what it thinks is best',
+      decline: 'Let AI decide',
+      declineHint: 'Skip this question and let the AI choose the most suitable option',
+      multi: 'Pick any',
       cancel: 'Dismiss for now',
       answered: 'Answered',
-      declined: 'You let the AI decide',
+      declined: 'Left to the AI',
       cancelled: 'No answer',
-      skippedOne: 'Not answered'
+      skippedOne: 'Not answered',
+      delegatedOne: 'Left to the AI',
+      autoCountdown: 'Full access: continuing with the recommended option in {time}',
+      autoAnswered: 'Continued with the recommended option'
     },
     // Token usage under each reply
     tokenUsage: {
@@ -2545,15 +2618,14 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
         '3D generation mode enabled, supports uploading up to 5 images or entering description and send'
     },
     chat: {
-      unnamedSession: 'Unnamed Session',
       messageNotFound: 'Message not found',
       onlyRetryAI: 'Can only retry AI response',
       onlyEditUserMessage: 'Can only edit user message',
       stopBeforeResendFailed: 'The previous run has not stopped yet — try resending in a moment',
       userMessageNotFound: 'Cannot find corresponding user message',
-      clearConfirmTitle: 'Confirm Clear Session',
-      clearConfirmContent:
-        'This operation cannot be undone. Are you sure you want to clear all messages in the current session?',
+      clearConfirmTitle: 'Clear this chat?',
+      clearConfirmContent: 'This cannot be undone. Clear all messages in this chat?',
+      replyInterrupted: 'Reply interrupted',
       newMessage: 'New Message',
       emptyMessage: 'Message content cannot be empty',
       editMessage: 'Edit Message',
@@ -2563,23 +2635,25 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
     branch: {
       tooltip: 'Branch from here',
       titleSuffix: ' (branch)',
-      success: 'Branched from this reply — everything after it was left behind',
-      noAgentSession: 'Only Agent sessions can be branched',
+      success: 'Created a new chat from this reply. Later messages were not copied.',
+      successWhole:
+        'Branch created. The selected reply could not be found, so the entire chat was copied.',
+      noAgentSession: 'Branching is not available for this type of chat',
       busy: 'This turn has not settled yet — branch from an earlier message, or try again shortly',
-      missing: 'This session has no conversation history to copy yet',
-      failed: 'Failed to create the session branch'
+      missing: 'This chat has no history to copy yet',
+      failed: 'Failed to branch'
     },
     /**
-     * Side chat.
+     * Side question.
      *
      * The wording has to separate it from branching: a branch is for carrying on
-     * with the *work* in another direction and leaves a new session behind; a side
-     * chat is for understanding what is *going on* and leaves nothing behind.
+     * with the *work* in another direction and leaves a new chat behind; a side
+     * question is for understanding what is *going on* and leaves nothing behind.
      */
-    sideChat: {
-      open: 'Ask on the side (with context)',
-      noContext: 'This session has no context to hand over yet',
-      failed: 'Could not open the side chat'
+    sideQuestion: {
+      open: 'Ask a side question (with context)',
+      noContext: 'This chat has no context to hand over yet',
+      failed: 'Could not open the side question'
     },
     search: {
       notImplemented: 'Web search function not implemented yet'
@@ -2598,15 +2672,117 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       assistant: 'Assistant'
     },
     teamBoard: {
+      external: {
+        label: 'Driven by Claude Code',
+        hint: 'The brain is in Claude Code: Unreal Box cannot see which models the teammates use or what they spend. It keeps the board, mail, snapshots and acceptance record.',
+        endHint:
+          'Mark this team as ended. Unreal Box cannot stop Claude Code; if it is still running, stop it there.',
+        ended: 'Ended'
+      },
+      ui: {
+        quest: 'Quest',
+        crew: 'Crew',
+        loot: 'Deliverables',
+        lootHint: 'Click a scroll to open it',
+        noLoot: 'Nothing delivered yet',
+        planning: 'The producer is planning the work',
+        recruiting: 'The producer has not hired anyone yet',
+        people: '{n} people',
+        phase: {
+          planning: 'Planning',
+          working: 'In progress',
+          done: 'Round complete',
+          idle: 'Standing by'
+        },
+        alertStopped: '{n} stopped',
+        alertBlocked: '{n} blocked',
+        workingCount: '{n} working',
+        roundCount: '{done}/{total} delivered',
+        state: {
+          writing: 'Writing',
+          done: 'Delivered',
+          stopped: 'Stopped',
+          lost: 'Not delivered'
+        },
+        writing: 'Writing',
+        stopped: 'Stopped',
+        lost: 'Not delivered',
+        stoppedJob: '"{title}" stopped: {reason}',
+        stopsLine: '{n} stopped · {who}',
+        stopsLineReason: '{n} stopped · {who} · Reason: {reason}',
+        stopReason: 'Why it stopped: {reason}',
+        stopSteps: 'Last steps before stopping',
+        deliveredCount: '{n} delivered this round',
+        deliveredBy: '{name} · delivered {ago}',
+        earlier: 'Earlier deliverables ({n})',
+        earlierHide: 'Hide earlier deliverables',
+        expand: 'Show full text',
+        collapse: 'Show less',
+        roll: 'Roll up',
+        job: 'Current task',
+        reports: 'Deliverables',
+        thread: 'Messages',
+        threadCount: 'Messages ({n})',
+        noThread: 'No messages yet',
+        more: '{n} more',
+        less: 'Show less',
+        open: 'Show',
+        tasksOf: 'On the task board',
+        board: 'Task board',
+        boardCount: 'Task board ({n})',
+        log: 'Log',
+        logAll: 'Show all',
+        mailTo: '{from} → {to}',
+        editor: 'Editor',
+        logDelivered: '{name} delivered "{title}"',
+        logStopped: '{name} stopped: {reason}',
+        logCrashed: 'Editor crashed',
+        logCrashedDetail: 'Editor crashed: {detail}',
+        logRecovered: 'Editor recovered automatically',
+        logRecoverFailed: 'Editor could not recover automatically: {detail}',
+        shaken: 'The editor crashed while this member was working and has recovered',
+        now: 'Now'
+      },
       title: 'Team',
-      summary: '{members} members · {done}/{total} tasks marked done',
+      tab: 'Team tasks',
+      openTab: 'View team tasks in the side panel',
+      closeTab: 'Close team tasks',
+      closeReport: 'Close this delivery',
+      reportGone: 'This delivery is no longer in the team records',
       selfReportedHint:
         'Marked by the teammate, not checked by Unreal Box — the acceptance verdict is what counts',
       objective: 'Goal',
-      noMembers: 'The producer has not hired anyone yet',
+      latestRequest: 'Latest request: ',
+      latestRequestLabel: 'Latest request',
       noTasks: 'The task board is empty',
       evidence: 'Evidence: ',
-      mail: 'Notes',
+      readOnlyHint: 'Read-only: inspects the project without changing it',
+      steps: 'Recent steps',
+      stepTimes: '{n} times',
+      noSteps: 'No activity yet',
+      doneFold: '{n} completed',
+      updatedAgo: 'Updated {ago}',
+      doneAgo: 'Done {ago}',
+      sections: '{n} sections',
+      kindVerb: {
+        read: 'Inspecting project',
+        write: 'Editing project',
+        run: 'Running',
+        look: 'Viewing',
+        play: 'Playtesting',
+        talk: 'Messaging teammates'
+      },
+      statusLine: {
+        stopped: 'Stopped: {reason}',
+        blocked: 'Blocked: {reason}',
+        waiting: 'Waiting for a reply',
+        tool: '{verb}',
+        toolAt: '{verb} · {target}',
+        thinking: 'Thinking',
+        received: 'Task received, not started',
+        delivered: 'Delivered "{title}"',
+        idle: 'Idle'
+      },
       note: 'Note: ',
       blockedReason: 'Blocked on: ',
       old: 'Earlier',
@@ -2614,6 +2790,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       reopened: 'Reopened by you',
       reopen: 'Reopen',
       reopenHint: 'Move it back to To do; the producer will reassess it next round',
+      reopenJobHint: 'Hand it back to the producer; it decides next round whether to reassign it',
       reopenFailed: 'Could not reopen this task. Try again in a moment',
       end: 'End team mode',
       endHint:
@@ -2628,6 +2805,16 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
         days: '{n} days ago'
       },
       producer: 'Producer',
+      usage: {
+        label: '{total} tokens',
+        labelWithCost: '{total} tokens · {cost}',
+        open: 'Usage by member',
+        title: 'Team usage',
+        acceptor: 'Acceptance reviewer',
+        total: 'Total',
+        hint: 'Tokens the producer, teammates and acceptance reviewer sent to and received from models, counted the way providers bill',
+        partialCost: 'Some models have no price list; the amount covers only the priced part'
+      },
       fast: 'fast',
       readOnly: 'read-only',
       model: {
@@ -2635,18 +2822,69 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
         byUser: 'set by you',
         followProducer: 'same as producer',
         chatModel: 'chat model',
-        unavailable: "{model} isn't available right now; its work uses the producer's model",
-        change: 'Click to change the model. It applies from its next task',
+        unavailable:
+          "{model} is currently unavailable; this teammate's tasks use the producer's model",
+        change: "Click to change the model. Applies from this teammate's next task",
         changeFailed: "Couldn't change the model. Try again later",
-        checking: 'Checking {model}: is it reachable, and can it call tools…',
+        checking: 'Checking {model} for connectivity and tool calling…',
         checkupFailed: "{model} didn't pass the check, so the model wasn't changed: {reason}",
         checkupNoTools:
-          "Asked twice to call a tool, it didn't. A model like that can't work as a teammate"
+          'The model did not call a tool after two requests and cannot be used as a teammate'
       },
-      receipt: {
-        read: 'read',
-        delivered: 'delivered',
-        queued: 'in inbox'
+      dismiss: {
+        action: 'Dismiss',
+        title: 'Dismiss {name}',
+        lead: '{name} will leave the team. Their memory is archived, not deleted.',
+        handover:
+          'Their {n} unfinished tasks will have no owner until the producer reassigns them.',
+        facts: '{done} tasks handed back, {stopped} stopped before finishing',
+        reasonLabel: 'Reason',
+        reasonPlaceholder:
+          'Say what fell short. The reason goes on record and the producer sees it next turn',
+        busyHint: '{name} is working on a task. You can dismiss them once it is handed back',
+        busy: '{name} is working on a task. Dismiss them after it is handed back or this turn ends',
+        failed: "Couldn't dismiss this teammate. Try again later",
+        records: '{n} dismissed',
+        byUser: 'Dismissed by you',
+        byProducer: 'Dismissed by the producer',
+        grounds: {
+          quality: 'Work fell short',
+          unfinished: 'Tasks repeatedly unfinished',
+          redundant: 'Role no longer needed',
+          user_request: 'At your request',
+          user: 'Your decision'
+        },
+        evidence: 'Evidence',
+        handedTo: 'Unfinished tasks passed to {name}: {tasks}',
+        unassigned: 'Unfinished tasks left without an owner: {tasks}',
+        memoryArchived: 'Memory archived'
+      },
+      office: {
+        aria: 'Team office: {summary}',
+        noTasksFor: 'No tasks assigned to {name}',
+        styleHint: 'Switch art style',
+        style: { v1: 'Minimal', v2: 'Pixel' },
+        status: {
+          think: 'Thinking',
+          wait: 'Waiting for a reply',
+          out: 'Stopped: {reason}',
+          board: 'Planning',
+          awaiting: 'Waiting for {name} to deliver'
+        },
+        idle: {
+          idle: 'Idle',
+          coffee: 'Idle · making coffee',
+          water: 'Idle · getting water',
+          plant: 'Idle · watering the plant',
+          window: 'Idle · looking outside',
+          sofa: 'Idle · reading on the sofa',
+          desk: 'Idle · standing by at the desk',
+          stretch: 'Idle · stretching',
+          board: 'Idle · reading the board',
+          pace: 'Idle · pacing',
+          chat: 'Idle · chatting with {name}',
+          peek: 'Checking on {name}'
+        }
       },
       verdict: {
         pass: 'Accepted',
@@ -2701,12 +2939,12 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
     },
     topNav: {
       agentMode: 'Agent Mode',
-      clearSession: 'Clear Session',
+      clearChat: 'Clear chat',
       exportImage: 'Export Image',
-      exportImageEmpty: 'This conversation has no content to export',
-      exportImagePreparing: 'Generating conversation image…',
-      exportImageSuccess: 'Conversation image exported',
-      exportImageFailed: 'Failed to export conversation image. Please try again.',
+      exportImageEmpty: 'This chat has no content to export',
+      exportImagePreparing: 'Exporting chat as image…',
+      exportImageSuccess: 'Chat image exported',
+      exportImageFailed: 'Failed to export chat image. Please try again.',
       exportJSON: 'Export JSON',
       exportMarkdown: 'Export Markdown'
     },
@@ -2754,7 +2992,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       resultImageAlt: 'Screenshot produced by the tool',
       resultImageHint: 'Click to view full size',
       /** Images the agent looked at. Collapsed by default — a turn can read a dozen */
-      peekImageShow: 'Show what it looked at ({count})',
+      peekImageShow: 'Show images viewed by the AI ({count})',
       peekImageHide: 'Hide images',
       /** Subtask (`task` tool) lanes. Parallel runs get one card each */
       subtask: {
@@ -2769,6 +3007,17 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
         noSteps: 'Not started yet'
       },
       tools: {
+        team_board: 'Update task board',
+        team_status: 'Check team status',
+        team_send: 'Assign task',
+        team_message: 'Send message',
+        team_deliver: 'Submit delivery',
+        team_hire: 'Add teammate',
+        team_dismiss: 'Dismiss teammate',
+        team_snapshot: 'Save project snapshot',
+        ue_list: 'List items',
+        ue_project_asset_ranking: 'Rank assets by size',
+        ue_find_heavy_assets: 'Find heavy assets',
         generate_image: 'Generate Image',
         search_assets: 'Search Assets',
         generate_3d_model: 'Generate 3D Model',
@@ -2776,9 +3025,10 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
         prepare_task_video: 'Preparing video materials',
         read_task_video_context: 'Reading task history',
         generate_task_music: 'Creating background music',
+        generate_sound_effect: 'Generating sound effects',
         generate_speech: 'Synthesizing speech',
         render_task_video: 'Producing task video',
-        analyze_video: 'Watching video',
+        analyze_video: 'Analyzing video',
         open_folder: 'Open Folder',
         aigc: 'AIGC Content Generation',
         asset_library_manager: 'Asset Library Manager',
@@ -2818,6 +3068,8 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
         ue_content_search: 'Search project assets',
         ue_content_describe: 'Inspect asset',
         ue_inspect_components: 'Inspect components',
+        ue_light_census: 'Light census',
+        ue_datatable_describe: 'Read data table',
         ue_message_log: 'Read message log',
         ue_get_crash_logs: 'Read crash logs',
         ue_editor_health: 'Editor health check',
@@ -2826,15 +3078,18 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
         ue_undo_history: 'Undo history',
         ue_inject_input: 'Simulate input',
         ue_input_map: 'Read input mappings',
+        ue_input_add_mapping: 'Add input mapping',
         blueprint_describe: 'Inspect blueprint',
         blueprint_get_graph: 'Read blueprint graph',
         blueprint_search_nodes: 'Search blueprint nodes',
+        blueprint_find_usages: 'Find in all Blueprints',
         material_describe: 'Inspect material',
         material_get_graph: 'Read material graph',
         material_graph_slice: 'Read material slice',
         material_search_nodes: 'Search material nodes',
         material_get_referencers: 'Find material referencers',
         mesh_describe: 'Inspect mesh',
+        mesh_optimize: 'Generate mesh LODs / collision',
         widget_get_hierarchy: 'Read widget hierarchy',
         widget_preview: 'Preview widget',
         sequence_describe: 'Inspect sequence',
@@ -2842,6 +3097,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
         cpp_list_modules: 'List C++ modules',
         cpp_add_class: 'Add C++ class',
         cpp_compile: 'Compile C++',
+        cpp_full_rebuild: 'Full C++ rebuild',
         anim_preview: 'Preview animation'
       },
       /** Step groups in the main chat: the one-line summary between replies, and each step inside */
@@ -2897,7 +3153,6 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       feedbackFailed: 'Tool call completed, but failed to generate feedback.',
       generatingFeedback: 'Generating feedback...',
       noContent: '(AI returned no text content)',
-      unnamedSession: 'Unnamed Session',
       authFailed: 'Authentication failed, please login again',
       agentError: 'Agent Error',
       errorPrefix: 'Error',
@@ -2909,8 +3164,10 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       // No session id, no IPC channel name: "change direction" is just typing
       // into the input box
       sessionBusy:
-        'This conversation still has a run in progress. Wait for it to finish, or just type what you want changed.',
+        'This chat still has a run in progress. Wait for it to finish, or just type what you want changed.',
       resume: 'Try again',
+      resumeProgress: 'Resuming from where it stopped…',
+      resumeFailed: "Couldn't resume: {reason}",
       autoResume:
         'Lost the connection to the model. Picking up again in {seconds}s (attempt {attempt}/{max}). Finished steps will not be redone.',
       modelRetry:
@@ -2942,7 +3199,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       serviceUnavailableDesc:
         'The AI service is currently experiencing issues and is being recovered. Please retry later. If the problem persists, please contact support.',
       // Token refresh related
-      tokenRefreshedRetry: 'Session restored, please retry your action',
+      tokenRefreshedRetry: 'Signed back in. Please retry.',
       // Network error related
       networkError: 'Network connection error',
       networkErrorTitle: 'Network Connection Failed',
@@ -2974,7 +3231,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       resizing: 'Release to show the page',
       closeFailed: 'Could not save the closed browser state. Please try again.',
       restoreFailed:
-        'Could not restore the browser page. Check your connection and reopen the conversation.',
+        'Could not restore the browser page. Check your connection and reopen the chat.',
       title: 'Agent browser',
       hint: 'Loading the page…'
     },
@@ -2983,7 +3240,10 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       actionType: 'Operation Type',
       confirm: 'Confirm',
       reject: 'Reject',
-      allowForSession: 'Allow for Session',
+      allowForChat: 'Allow for this chat',
+      allowForever: 'Always allow',
+      allowForeverHint:
+        'Stops asking for this operation in every chat. You can remove it in Settings → AI Assistant.',
       whatIsThis: 'What is this?',
       queued: '{count} more waiting',
       // Named by risk. Everything non-browser used to collapse into "Other
@@ -3010,7 +3270,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
     },
     chatFlow: {
       readStreamFailed: 'Failed to read response stream',
-      unnamedSession: 'Unnamed Session',
+      unnamedChat: 'Untitled chat',
       imageGenTitle: '🧩 Image Gen',
       modelGenTitle: '✨ Model Gen',
       imageChatTitle: 'Image Chat',
@@ -3102,7 +3362,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
     // Menu items
     menu: {
       screenRecorder: 'Recordings',
-      miniChat: 'MiniChat',
+      miniWindow: 'Mini window',
       voice: 'Voice',
       general: 'General',
       appearance: 'Appearance',
@@ -3110,6 +3370,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       ai: 'AI Assistant',
       personalization: 'Personalization',
       models: 'Models',
+      team: 'Team',
       mcp: 'MCP',
       skills: 'Skills',
       experience: 'Lessons learned',
@@ -3128,6 +3389,44 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
     // AI Settings
     models: {
       title: 'Models'
+    },
+    team: {
+      title: 'Team',
+      description: 'Check results and task history of each model in team mode',
+      empty: 'After you use /team, check results and task history for each model appear here.',
+      note: 'Only models that were checked or took on tasks are listed. Reopened means a task you reopened on the task board.',
+      col: {
+        model: 'Model',
+        checkup: 'Check',
+        tasks: 'Tasks',
+        reopened: 'Reopened',
+        unfinished: 'Unfinished',
+        lastUsed: 'Last used',
+        role: 'Role',
+        avgTime: 'Avg. time'
+      },
+      passed: 'Passed',
+      failed: 'Failed',
+      notChecked: 'Not checked',
+      notCheckedHint: 'Not checked yet',
+      removed: 'Removed',
+      removedHint:
+        'This model was removed from model settings. Its history is kept, and it no longer joins teams.',
+      reachOk: 'Reachable',
+      reachFail: 'Unreachable: {reason}',
+      toolsOk: 'Tool calls OK',
+      toolsFail: 'Tool calls failed: no tool was called after two requests',
+      visionOk: 'Vision OK',
+      visionFail: 'Vision failed',
+      checkedAt: 'checked {when}',
+      recheck: 'Check again',
+      checking: 'Checking…',
+      recheckFailed: 'Check failed. Try again later.',
+      uncategorized: 'Uncategorized',
+      noTasks: 'No tasks yet',
+      underMinute: 'Under 1 min',
+      minutes: '{n} min',
+      hours: '{n} h'
     },
     ai: {
       title: 'AI Assistant',
@@ -3156,10 +3455,21 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       archivedChats: 'Archived chats',
       archivedChatsDesc: 'View, restore, or delete archived chats.',
       autoRetitle: 'Auto-generate new titles',
-      autoRetitleDesc: 'Rename the chat after every reply, based on the whole conversation.',
+      autoRetitleDesc: 'Rename the chat after every reply, based on its full history.',
       persistentAutoResume: 'Auto-resume on failure',
       persistentAutoResumeDesc:
         'When your gateway is unstable, pick up from where it stopped every 60s. Gives up after 30 minutes of failures. Failed attempts are left out of the chat.',
+      assetReadonlyLock: 'Make assets read-only while editing',
+      assetReadonlyLockDesc:
+        'While the AI edits an asset, its .uasset file is set to read-only so a save in the editor cannot overwrite the changes. Those assets cannot be saved in the editor until the AI finishes.',
+      browserAllowLocalNetwork: 'Allow browser access to local network',
+      browserAllowLocalNetworkDesc:
+        'Lets the Agent browser open this computer and local network addresses (such as localhost or 192.168.x.x), for example a local dev server. Links on web pages can reach these addresses too.',
+      alwaysAllowedTools: 'Always allowed operations',
+      alwaysAllowedToolsDesc:
+        'These operations no longer ask for confirmation in any chat. Read-only chats are not affected.',
+      alwaysAllowedRemove: 'Remove',
+      alwaysAllowedRemoveLabel: 'Stop always allowing "{name}"',
       goalMaxRounds: 'Goal mode round limit',
       goalMaxRoundsDesc:
         'With /goal, a failed review sends the work back for another round. After this many rounds it stops and hands back to you. Each round adds a review that may compile Blueprints or run PIE. Applies from your next message. 1–50.',
@@ -3199,7 +3509,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       description: 'Work background and communication preferences.',
       // Standing instructions
       instructionsTitle: 'Instructions for the assistant',
-      instructionsDesc: 'Persistent preferences applied to all conversations.',
+      instructionsDesc: 'Persistent preferences applied to all chats.',
       instructionsPlaceholder:
         'For example:\nI am a level designer at a game studio, mostly open-world layout and optimisation.\nI do not write C++. I can read blueprints but do not assume fluency.\nLead with the conclusion; I will ask for the details when I want them.',
       openInstructionsFile: 'Open in the default text editor',
@@ -3302,7 +3612,49 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       deleteTitle: 'Delete "{name}"?',
       deleteContent: 'The whole skill folder goes. There is no undo.',
       deletedGone: '"{name}" deleted',
-      deletedRestored: 'Your copy is gone; "{name}" is back to the original'
+      deletedRestored: 'Your copy is gone; "{name}" is back to the original',
+      // Shared skills (uebox.ai shared library)
+      sharedBadge: 'Shared · v{version}',
+      browseShared: 'Browse shared skills',
+      share: 'Share',
+      shareTitle: 'Share "{name}"',
+      shareNote:
+        'Publishes the skill to the shared library on the UE Box website so other users can install it. Sharing it again from the same account updates it.',
+      shareFiles: 'Files to submit',
+      shareSkipped:
+        'These files do not meet the sharing requirements and will not be submitted: {list}',
+      shareAccount: 'Author',
+      shareAsAccount: 'Published as UE Box account "{account}".',
+      shareNeedAccount:
+        'Sharing needs a UE Box account. Click Connect account to open the authorization page in your browser, then sign in and click Allow.',
+      shareConnect: 'Connect account',
+      shareConnectCode: 'Make sure the web page shows this code:',
+      shareConnectFailed: 'Could not connect: {reason}',
+      shareSubmit: 'Publish',
+      shareLoadFailed: 'Cannot share: {reason}',
+      shareFailed: 'Publishing failed: {reason}',
+      sharePending:
+        'Submitted. A new account’s first skill is reviewed by an administrator before it goes public.',
+      sharePublished: 'Published (version {version}).',
+      shareView: 'View on website',
+      // Install confirmation
+      installTitle: 'Install shared skill',
+      installFrom: {
+        link: 'This install request came from a web page.',
+        tool: 'This install request came from an agent or the command line.'
+      },
+      installMeta: 'By {author} · v{version} · Updated {date}',
+      installReview: 'Skills change how the agent behaves. Read the full text before installing.',
+      installConflict: {
+        update: 'Version {from} is installed. Installing updates it to version {to}.',
+        own: 'A custom skill with the same name exists and will be replaced.',
+        builtin:
+          'A built-in or plugin skill with the same name exists. This shared version will be used instead.'
+      },
+      installPage: 'View on website',
+      install: 'Install',
+      installed: 'Installed "{name}". It takes effect from the next task.',
+      installFailed: 'Install failed: {reason}'
     },
     // 经验库：做事时踩过又绕过去的坑（见 ProfileExperience.vue）
     experience: {
@@ -3340,8 +3692,18 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
         effectValue: 'Shown {shown}x, followed {adopted}x, worked {ok}x',
         lift: 'Success {without}% without it, {with}% with it',
         liftUnknown: 'Not enough comparison data yet',
+        retiredBecause: 'Retired because',
         source: 'Source',
         pin: 'Keep pinned, never auto-retire'
+      },
+      retireReason: {
+        capacity: 'The limit was reached and this one ranked lowest',
+        replaced: 'Superseded by a newer entry for the same API',
+        failed: 'The same error came back after following it',
+        ignored: 'Shown several times in a row without being followed',
+        'no-lift': 'Comparison showed no gain in success rate',
+        refuted: 'The editor shows the member does exist',
+        'script-bug': 'A bug in the script itself, not an engine rule'
       },
       deleteTitle: 'Delete this experience?',
       deleteContent:
@@ -3363,10 +3725,10 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       },
       metric: {
         uncached: 'Tokens',
-        turns: 'Conversation turns',
+        turns: 'Turns',
         changes: 'Changes'
       },
-      totalTurns: 'Conversation turns',
+      totalTurns: 'Turns',
       totalTurnsHint: 'One question counts as one turn',
       toolCallsTotal: 'Tool calls',
       uncachedTotal: 'Excluding cache',
@@ -3402,7 +3764,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       changesTargets: 'Assets touched',
       changesTargetsHint: 'Each asset is counted once, even if changed multiple times',
       changesPerTurn: 'Per turn',
-      changesPerTurnHint: 'Average completed changes per conversation turn',
+      changesPerTurnHint: 'Average completed changes per turn',
       changesNote:
         'Counts successful changes only. Script changes count as operations, but not as affected assets.',
       changesFailedNote: 'Another {count} changes failed. See operation records for details.',
@@ -3421,7 +3783,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       },
       projectsTitle: 'By project',
       colProject: 'Project',
-      colTurns: 'Conversation turns',
+      colTurns: 'Turns',
       colTokens: 'Tokens (uncached)',
       colChanges: 'Changes',
       noProject: 'No project',
@@ -3461,6 +3823,9 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       archiveImportAsk: 'Ask before importing an archive',
       archiveImportAskDesc:
         'When importing an archive into a UE project, ask whether to extract it or copy it as-is (when disabled, archives are always extracted)',
+      showAssetVersion: 'Show asset version',
+      showAssetVersionDesc:
+        'When hovering over an asset card, show the engine version it was saved with in the top-left corner.',
       crossVaultSearch: 'Cross-vault search',
       crossVaultSearchDesc:
         'Let the AI assistant search other vaults too when looking for assets. When off, it only searches the current vault.',
@@ -3521,7 +3886,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       assistantTitle: 'Voice assistant',
       generalTitle: 'General',
       autoPlay: 'Auto play',
-      autoPlayDesc: 'Read replies aloud automatically when generation finishes in AI chats.',
+      autoPlayDesc: 'Read replies aloud automatically when generation finishes.',
       briefingStyle: 'Narration style',
       briefingConcise: 'Brief',
       briefingDetailed: 'Detailed',
@@ -3540,12 +3905,12 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       autoHangup: 'End unanswered calls automatically',
       autoHangupDesc: 'End idle calls after three unanswered prompts.'
     },
-    miniChat: {
-      title: 'MiniChat',
+    miniWindow: {
+      title: 'Mini window',
       // The small window's own title bar (meta.title in router/modules/index.ts)
       windowTitle: 'AI Assistant',
-      persist: 'Save MiniChat history',
-      persistDesc: 'Save to conversation history when the window closes.',
+      persist: 'Save chats from the mini window',
+      persistDesc: 'Saved to your chats when the mini window closes.',
       opacity: 'Window opacity',
       opacityDesc: 'Lower values increase transparency.'
     },
@@ -3629,7 +3994,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       removeAllTitle: 'Delete all {count} files under the prefix?',
       cleanTitle: 'Delete files uploaded more than {days} days ago?',
       removeHint:
-        'They are removed from the bucket and cannot be recovered. Conversations that referenced them will no longer show them to the model.',
+        'They are removed from the bucket and cannot be recovered. Chats that referenced them will no longer show them to the model.',
       removeOk: 'Delete',
       removed: 'Deleted {count} files',
       removedPartly: 'Deleted {removed}; {failed} could not be deleted',
@@ -3684,7 +4049,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       bridgeUnknown: 'Reading bridge status…',
       connectedProjects: 'Connected projects',
       connectedProjectsDesc:
-        'The plugin connects on its own and retries every 5 seconds — there is nothing here for you to click. If a project is open and this stays at 0, that project most likely has no plugin installed.',
+        'The plugin connects automatically and retries every 5 seconds after a disconnect; no manual connection is needed. If a project is open but this stays at 0, the plugin is most likely not installed in that project.',
       injectionBehavior: 'Installation',
       resources: 'Resources',
       autoEnableUnrealAgentLink: 'Automatically install the connection plugin',
@@ -4155,7 +4520,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
     studio: {
       title: 'Studio',
       generating: 'Generating…',
-      noContent: 'Please add some sources or start a conversation first',
+      noContent: 'Please add some sources or start a chat first',
       noNotebookId: 'Notebook ID not set',
       providerOutOfCredit:
         'The model provider reported insufficient credit. Top up in that provider console, or pick a different model under Settings → Models.',
@@ -4540,10 +4905,29 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       backButton: 'Back'
     },
     scoreMessage: {
-      master: 'Unreal master! Epic will come recruiting',
-      good: 'Nice work! Keep it up',
-      keepGoing: 'Keep going, review the docs more',
-      encourage: "Don't worry, knowledge builds up bit by bit"
+      master: 'Excellent. You have a strong command of this topic',
+      good: 'Good result. Keep it up',
+      keepGoing: 'Room for improvement. Reviewing the docs is recommended',
+      encourage: 'Knowledge builds over time. Review your mistakes and try again'
+    }
+  },
+  externalTeams: {
+    title: 'External Teams',
+    intro:
+      'Teams where Claude Code is the brain and Unreal Box is the studio. The thinking runs on Claude Code; Unreal Box keeps the board, mail, snapshots and acceptance record.',
+    empty: 'No external teams yet',
+    emptyHint:
+      'Install the uebox-team plugin in Claude Code and ask it to build a game with an Unreal Box team. The team shows up here.',
+    members: '{n} people',
+    pick: 'Pick a team to see its board',
+    endedNotice: 'Marked as ended. If Claude Code is still running it, stop it in Claude Code.',
+    status: {
+      ended: 'Ended',
+      passed: 'Passed',
+      stale: 'Changed since check',
+      failed: 'Failed check',
+      blocked: 'Check blocked',
+      pending: 'Not checked'
     }
   },
   serverManagement: {
@@ -5704,16 +6088,16 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
     pathOnlyAttachment:
       '### File: {name}\n\nLocal path: {path}\n\nThis format was not pre-parsed. Open it with a file-reading tool if you need its contents.',
     voice: {
-      start: 'Start voice session',
+      start: 'Start voice call',
       cancelConnection: 'Cancel connection',
       connectionTimeout: 'Voice connection timed out. Retry or check your realtime model settings.',
       mute: 'Mute microphone',
       unmute: 'Unmute microphone',
       muted: 'Microphone muted. Background tasks continue.',
       retry: 'Retry connection',
-      boundConversation: 'Voice conversation: {name}',
+      boundCall: 'Voice call: {name}',
       interruptByVoice: 'Speak or click to interrupt',
-      stop: 'End voice session (background tasks continue)',
+      stop: 'End voice call (background tasks continue)',
       status: {
         connecting: 'Connecting voice…',
         listening: 'Listening — speak naturally',
@@ -5723,7 +6107,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       },
       unsupportedAudio:
         'The voice service returned an invalid audio format. Playback was stopped to prevent loud noise; please try again.',
-      asrFailed: "Didn't catch that — could you say it again?",
+      asrFailed: 'Speech not recognized. Please say it again',
       interrupt: 'Click to interrupt speech (tasks continue)',
       interruptHint: 'Assign a shortcut under Preferences → Shortcuts → Interrupt voice assistant',
       taskSessionTitle: 'Voice tasks',
@@ -5741,7 +6125,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
     },
     wikiPopover: {
       title: 'Select knowledge base',
-      hint: 'Type /wiki to filter, click to bind to the current session',
+      hint: 'Type /wiki to filter, click to bind to the current chat',
       empty: 'No matching knowledge base found',
       sourceCount: '{count} sources'
     },
@@ -5754,6 +6138,9 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       empty: 'No matching command or skill',
       groupCommands: 'Commands',
       groupSkills: 'Skills',
+      attach: 'Add files',
+      attachHint: 'Images, documents, spreadsheets, audio and video',
+      plusTooltip: 'Add files, commands and skills',
       source: {
         user: 'User',
         plugin: 'Plugin',
@@ -5761,11 +6148,11 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       }
     },
     slashCommands: {
-      goal: 'Goal mode — audits its own work and keeps going until it passes',
-      team: 'Team mode — one line in, it builds a team and works to a playable delivery',
-      teamArg: '<one line>',
+      goal: 'Goal mode — reviews the result automatically and continues until the goal is met',
+      team: 'Team mode — hand it a complex task; it assembles a team and works through to a playable build',
+      teamArg: '<complex team task>',
       image: 'Switch to image generation',
-      compact: 'Compact this session history to free up context',
+      compact: "Compact this chat's history to free up context",
       goalArg: '<objective>',
       wikiArg: '[keyword]',
       wiki: 'Bind a notebook; type /wiki clear to unbind'
@@ -5798,7 +6185,9 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       highDesc: 'High reasoning',
       xhighDesc: 'Extra high reasoning',
       maxDesc: 'Maximum reasoning',
-      clamped: '{model} has no {chosen} level — this run uses {actual} instead'
+      clamped: '{model} has no {chosen} level — this run uses {actual} instead',
+      fast: 'Fast',
+      fastDesc: 'Faster responses, uses about 2× quota'
     },
     approval: {
       readOnlyLabel: 'Read only',
@@ -5829,8 +6218,8 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       'Auto-compacts when full. You can also compact now: earlier turns become a summary, recent ones stay intact.',
     compactDone: 'Compacted: {before} → {after}',
     compactReason: {
-      busy: 'This conversation is busy. Please try compacting again shortly',
-      cancelled: 'Compaction cancelled. Your conversation has been preserved',
+      busy: 'This chat is busy. Please try compacting again shortly',
+      cancelled: 'Compaction cancelled. Your chat has been preserved',
       empty: 'This chat is empty',
       'too-short': 'This chat is still short — no need to compact yet',
       'already-compact': 'Already compacted — nothing more to compress',
@@ -5842,9 +6231,27 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
     steerAttachmentsOnly: 'Attached: {names}',
     steerImageCount: '{count} image(s)',
     steerFailed: 'Steering failed: {reason}',
+    steerTurnEndedRestored:
+      "This turn just finished, so the message wasn't added. It's back in the input box.",
+    steerTurnEndedQueued:
+      "This turn just finished, so the message wasn't added. It will be sent in queue order.",
+    steerProjectMismatchRestored:
+      'This message was sent from "{snapshotProject}", but the current turn is working in "{runProject}". It wasn\'t added and is back in the input box.',
+    steerProjectMismatchQueued:
+      'This message was sent from "{snapshotProject}", but the current turn is working in "{runProject}". It will run on "{snapshotProject}" after this turn finishes.',
+    steerNoProjectRestored:
+      'This message was sent from "{snapshotProject}", but the current turn isn\'t connected to a project. It wasn\'t added and is back in the input box.',
+    steerNoProjectQueued:
+      'This message was sent from "{snapshotProject}", but the current turn isn\'t connected to a project. It will run on "{snapshotProject}" after this turn finishes.',
+    steerOtherProject: 'another project',
     queueAction: 'Queue',
     queueCancel: 'Remove from queue',
-    queueSteerNow: 'Send now',
+    queueSteerNow: 'Steer now',
+    queueLabel: 'Sends after this turn',
+    queueEdit: 'Take back to edit',
+    queueMore: '{count} more',
+    queueCollapse: 'Collapse',
+    placeholderQueued: 'Anything you send now queues up too',
     /** Placeholder when the queued message is attachments only — the chip still needs a label */
     queueUntitled: '(attachments)',
     sourceType: {
@@ -5871,9 +6278,9 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       noWikiBound: 'No knowledge base is currently bound',
       compacted: 'Compacted: {before} messages → {after}, about {saved} tokens saved',
       compactFailed: {
-        busy: 'This conversation is busy. Please try compacting again shortly',
-        cancelled: 'Compaction cancelled. Your conversation has been preserved',
-        empty: 'Nothing to compact yet in this session',
+        busy: 'This chat is busy. Please try compacting again shortly',
+        cancelled: 'Compaction cancelled. Your chat has been preserved',
+        empty: 'Nothing to compact yet in this chat',
         'already-compact': 'Already compacted; doing it again only re-summarises the summary',
         'too-short': 'History is still too short to save anything',
         'summary-failed': 'Could not build the summary; history is unchanged',
@@ -6045,7 +6452,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
         'The open editor did not apply {plugins}; only the file was updated. Restart the editor before changing plugins there, or the change will be overwritten.',
       unavailableTitle: '{count} items are not on this machine',
       unavailableDesc:
-        'The box cannot enable these for you. Related Blueprints will not open until they are installed:',
+        'Unreal Box cannot enable these automatically. Related Blueprints will not open until they are installed:',
       fromProject: 'from "{project}"',
       projectCode: 'C++ code from "{project}"',
       projectCodeUnknown: 'C++ code from the original project',
@@ -7005,7 +7412,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
     },
     actions: {
       reject: 'Reject',
-      allowSession: 'Allow for this session',
+      allowForChat: 'Allow for this chat',
       confirm: 'Confirm'
     }
   },
@@ -7234,7 +7641,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       'These pins were connected to nodes outside the selection, so they are left dangling. You will need to wire them up in Unreal after adding the snippet.',
     noCanvasTitle: 'Why there is no node graph here',
     noCanvasHint:
-      'Snippets store Unreal clipboard text, which the library’s node renderer can actually read — but that renderer is an editor: drag a node and the content changes, and a snippet has nowhere to save those edits, so it would look editable and then lose your work. It needs a real read-only mode first. To understand what this snippet does, ask the assistant on the right — it has the whole thing.',
+      'Snippets store Unreal clipboard text, which the library’s node renderer can actually read — but that renderer is an editor: drag a node and the content changes, and a snippet has nowhere to save those edits, so it would look editable and then lose your work. It needs a real read-only mode first. To understand what this snippet does, ask the assistant on the right, which has the full snippet content.',
     applyPrompt:
       'Add the blueprint library snippet “{name}” (entry_id: {id}) to the current project. ' +
       'Confirm the entry with library_search first, ask me which blueprint and which empty graph to write into, then use blueprint_library_apply.',
@@ -7364,16 +7771,16 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
     },
     dictation: {
       starting: 'Opening the microphone…',
-      listening: 'Listening — sends itself when you stop',
+      listening: 'Listening. Sends automatically when you stop speaking',
       finishing: 'Transcribing…',
       holding: 'Release to send',
-      unheard: "Didn't catch that, say it again",
-      unavailable: 'Voice is unavailable right now, just type',
-      busy: 'The voice assistant is on a call — type for now',
+      unheard: 'Speech not recognized. Please try again',
+      unavailable: 'Voice input is unavailable. Use the keyboard instead',
+      busy: 'The voice assistant is in a call. Use the keyboard instead',
       vendorUnsupported:
         'This voice model can only converse. Bind a Speech to text model in Settings → Models to dictate.',
       micIconLabel: 'Voice input active',
-      autoSubmit: 'Sending in {seconds}s — edit to hold it'
+      autoSubmit: 'Sending in {seconds}s. Edit the text to delay'
     }
   },
   globalAudioPlayer: {
@@ -7521,7 +7928,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       abandon: 'Abandon this import',
       abandonConfirmTitle: 'Abandon this import?',
       abandonConfirmContent:
-        'The server cancels this session and deletes the staged files it holds. Nothing that was uploaded counts — you will have to import again. This cannot be undone.',
+        'The server cancels this import and deletes the staged files it holds. Nothing that was uploaded counts — you will have to import again. This cannot be undone.',
       abandonDone: 'Import abandoned; staged files on the server were cleaned up',
       abandonStagingLeft:
         'The local prompt is cleared, but the staged files on the server could not be removed and need deleting by hand: {error}',
@@ -7534,15 +7941,24 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       continueSummary: '{files} file(s) and {thumbnails} thumbnail(s) uploaded',
       continueSummaryDone: 'All content uploaded',
       continueFailed: 'Failed to resume import: {error}',
-      sessionExpired: 'Your session has expired; please sign in again',
+      importGone:
+        'The server no longer has this import (it may have timed out and been cleaned up). Import it again.',
       resumeFailed: 'Failed to resume import: {error}',
       resumeNotFoundTitle: 'Cannot resume import',
-      resumeNotFoundContent: 'No resumable import session found: {error}',
+      resumeNotFoundContent: 'No resumable import found: {error}',
+      errors: {
+        reportMissingImportId: "This report has no server import ID, so it can't be resumed.",
+        notResumable:
+          'This import can no longer be resumed on the server (server status: {status}).',
+        cancelNotConfirmed:
+          'The server did not confirm cancelling this import (server status: {status}).',
+        serverImportFailed: 'This import failed on the server (server status: {status}).'
+      },
       selectErrorJson: 'Please select an import error report JSON file',
       singleErrorJson: 'Only one error report file can be selected at a time',
       selectResumeReportFailed: 'Failed to select the error report',
       stages: {
-        createSession: 'Creating import session',
+        createSession: 'Starting import',
         preflight: 'Pre-flight check',
         uploadMetadata: 'Uploading metadata',
         uploadFiles: 'Uploading files',
@@ -7612,7 +8028,14 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       done: 'Sync complete',
       failed: 'Sync failed',
       doneContent: 'Full sync finished: {assets} asset(s), {folders} folder(s)',
-      failedContent: 'Network vault sync failed. Try again later.'
+      failedContent: 'Network vault sync failed. Try again later.',
+      // Sync progress (the main process only sends the phase code)
+      phase: {
+        preparing: 'Preparing to sync',
+        folders: 'Syncing folders ({current}/{total})',
+        assets: 'Syncing assets ({current}/{total})',
+        sweep: 'Checking local assets'
+      }
     },
     scan: {
       done: 'Scan complete'
@@ -7790,9 +8213,10 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
     copyFailed: 'Copy failed',
     andMore: '...and {count} more, see the log',
     retry: 'Retry import',
-    retrySucceeded: 'Everything imported this time',
+    retrySucceeded: 'All items imported',
     retrying: 'Retrying import...',
-    retryPartial: 'The .uasset half is complete; external files need the project open to retry',
+    retryPartial:
+      'The .uasset files are complete; external files (FBX, textures, etc.) can be retried only while the project is open',
     retryStillFailing: 'Still incomplete; details updated',
     close: 'Close'
   },
@@ -7822,7 +8246,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
             'Review {subject} for performance and robustness issues: per-frame cost, null references, anything that can be simplified.'
         },
         apply: {
-          title: 'Put it in my project',
+          title: 'Apply to current project',
           desc: 'Write into an empty graph, compile and save',
           prompt:
             'Put {subject} into my current project. Tell me which blueprint and which graph first, then do it once I confirm.'
@@ -8130,7 +8554,7 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
   miniChatWindow: {
     sendButton: 'Send',
     /**
-     * Banner shown when this window carries the main conversation's context.
+     * Banner shown when this window carries the main chat's context.
      *
      * It has to say three things: how much was carried over, that it is a
      * snapshot, and that this window cannot change the project.
@@ -8139,16 +8563,15 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
       live: 'Carrying {count} message(s) of context (snapshot — the main chat is still running)',
       snapshot: 'Carrying {count} message(s) of context',
       readOnly: 'Read-only',
-      empty: 'Ask away — it can see every step the main conversation took'
+      empty: 'Enter a question. The AI can see every step of the main chat'
     },
     emptyState: {
-      agent: 'Type a message to start an Agent conversation'
+      agent: 'Type a message to start a chat'
     },
     placeholder: {
       agent: 'Give the Agent a task...'
     },
     imageCountPreview: '[{count} image(s)]',
-    defaultSessionTitle: 'Quick chat',
     maxImagesWarning: 'You can upload up to {max} images',
     imageSizeExceeded: '{name} exceeds 20 MB',
     imageUploadFailed: 'Image upload failed',
@@ -8252,5 +8675,458 @@ Places to start: whether this .uproject can be read at all and which EngineAssoc
   },
   deleteVaultModal: {
     systemNotDeletable: 'The system vault cannot be deleted'
+  },
+  /**
+   * Team projects (version control and asset collaboration). The Chinese copy follows the UI/UX
+   * design word for word; the English mirrors it with the same short, result-first wording.
+   */
+  teamProject: {
+    badge: 'Team',
+    rowWithCompany: '{project} · {company}',
+    state: {
+      online: 'Connected',
+      offline: "Can't reach the team",
+      signedOut: 'Sign in again'
+    },
+    menu: {
+      signIn: 'Sign in again',
+      copyInvite: 'Copy invite link',
+      remove: 'Remove from list'
+    },
+    inviteCopied: 'Invite link copied',
+    remove: {
+      title: 'Remove {name} from the list?',
+      body: 'Only removes it from Unreal Box. The project on your computer and your check-outs stay as they are.',
+      action: 'Remove'
+    },
+    cancel: 'Cancel',
+    retry: 'Retry',
+    listSep: ', ',
+    nameSep: ', ',
+    pathsMore: '{name} and {n} more',
+    join: {
+      cardTitle: 'Join a team',
+      cardDesc: "Sign in with your work account to open the team's projects and asset libraries",
+      title: 'Join a team',
+      link: 'Invite link',
+      linkPlaceholder: 'Paste the link your admin sent you',
+      account: 'Work account',
+      password: 'Password',
+      signIn: 'Sign in',
+      signingIn: 'Signing in…',
+      errors: {
+        credentials: 'Wrong account or password',
+        unreachable: "Can't reach the team. Check the network, or ask IT",
+        disabled: 'Your account is disabled. Ask IT',
+        badLink: "This link doesn't open. Ask your admin for a new one"
+      },
+      noProjects: "You haven't been added to any project yet",
+      sendAccount: 'Send your account to IT: {account}',
+      copyAccount: 'Copy account',
+      accountCopied: 'Account copied'
+    },
+    banner: {
+      offline: "Can't reach the team (since {time}). You're seeing it as it was then.",
+      viewingOld: 'Viewing {name} (#{number}), read-only.',
+      viewingNumber: 'Viewing #{number}, read-only.',
+      backToLatest: 'Back to latest',
+      frozen: 'Frozen: {note} · submits wait for an admin',
+      waiting: ' · {n} waiting',
+      unfreeze: 'Unfreeze',
+      notLocal: "This project isn't on your computer yet.",
+      syncToLocal: 'Sync to this computer',
+      ready: 'Done.',
+      openInUe: 'Open in UE'
+    },
+    sync: {
+      title: 'Sync {name} to this computer',
+      placeAt: 'Put it in',
+      choose: 'Choose a location',
+      size: 'About {size} · {free} left on {drive}',
+      free: '{free} left on {drive}',
+      notEnough: 'Not enough room on {drive}: {need} short.',
+      sizeHere: 'About {size} · {free} left',
+      freeHere: '{free} left',
+      notEnoughHere: 'Not enough room: {need} short.',
+      haveIt: 'Already have this project on your computer?',
+      pickIt: 'Choose it',
+      existing:
+        "Only downloads what differs. Files that differ from the team's are replaced, and yours are kept aside first.",
+      start: 'Start',
+      done: 'Done.'
+    },
+    putIn: {
+      empty: 'The project is still empty.',
+      emptyWait: 'The project is still empty. Waiting for an admin to put it in.',
+      action: 'Put in a project from this computer',
+      title: 'Put in {name}',
+      from: 'From',
+      pick: 'Choose the folder with the .uproject',
+      hint: "UE's own Saved, Intermediate and DerivedDataCache aren't uploaded.",
+      notProject: 'There is no .uproject in this folder.',
+      start: 'Start',
+      done: 'Done. Submitted as #{n}.',
+      doneNoNumber: 'Done.'
+    },
+    shortcuts: {
+      activity: 'Activity',
+      checkouts: 'Checked out',
+      inbox: 'Waiting on you'
+    },
+    outsource: {
+      title: 'Outsourcing',
+      reference: 'Reference',
+      delivery: 'Delivery',
+      deliveryN: 'Delivery {n}',
+      sendTo: 'Send to outsourcer',
+      deliverEmpty: 'Drag the assets to deliver here',
+      deliverEmptyHint: 'Keep the paths the same as in Reference so references stay intact',
+      deliverTitle: 'Deliver to {name}',
+      deliverGroup: '{folder}: {n}',
+      deliverMessage: 'Note',
+      deliverDefault: '{folder} ({n})',
+      deliver: 'Deliver',
+      state: {
+        uploading: 'Uploading {p}%',
+        waiting: 'Waiting for an admin',
+        done: 'Approved {a} · Returned {r}'
+      },
+      toolbar: 'Delivery {n} · {count} items',
+      approve: 'Approve',
+      approveAll: 'Approve all',
+      reject: 'Return',
+      missingRef: 'Missing reference: {name}',
+      rejectedTag: 'Returned',
+      rejectedDetail: 'Returned: {reason} · {who}',
+      skipped: 'Skipped {n}: {parts}.',
+      skippedMissing: '{n} missing references',
+      skippedHeld: '{n} checked out by {who}',
+      approvedDone: 'Approved {n}, submitted as #{number}.',
+      approvedDoneNoNumber: 'Approved {n}.',
+      fromCompany: 'From {company} · delivery {n}',
+      sentBy: '{who} · {time}',
+      approveEmpty: 'Everything in this batch is handled.'
+    },
+    tree: {
+      restricted: 'Only {people} can submit; other people’s submits wait for them',
+      sync: 'Sync to this computer',
+      unsync: "Don't sync to this computer",
+      pending: 'This folder has {n} changes not submitted yet. Submit them in UE first.'
+    },
+    reasons: {
+      cloudDrives: 'Cloud drives feed local libraries. Team project files are submitted from UE.',
+      import: 'To add files, put them in the project on your computer and submit in UE',
+      offline: "Can't reach the team"
+    },
+    grid: {
+      edited: 'Changed by {who} · {time}'
+    },
+    person: {
+      checkedOut: '{who} has it checked out ({duration})',
+      checkedOutState: '{who} has it checked out ({duration}, {state})',
+      youCheckedOut: 'You have it checked out ({duration})',
+      online: 'online',
+      notToday: 'not online today',
+      disabled: ' (disabled)'
+    },
+    duration: {
+      minutes: '{n} min',
+      hours: '{n} h',
+      days: '{n} days'
+    },
+    time: {
+      yesterday: 'Yesterday {time}',
+      weekday: '{day} {time}',
+      date: '{m}/{d}',
+      fullDate: '{m}/{d}/{y}',
+      days: {
+        0: 'Sun',
+        1: 'Mon',
+        2: 'Tue',
+        3: 'Wed',
+        4: 'Thu',
+        5: 'Fri',
+        6: 'Sat'
+      }
+    },
+    history: {
+      title: 'History',
+      askDone: 'Ask if done',
+      takeBack: 'Take back',
+      cancelCheckout: 'Cancel check-out',
+      checkout: 'Check out',
+      hoverVersion: '#{number} · {who} · {date}',
+      viewThis: 'View this version',
+      compareLatest: 'Compare with latest',
+      restore: 'Go back to this version',
+      restoreInUe: 'Go back to this version in UE',
+      heldBy: '{who} has it checked out',
+      offline: 'Connect to see history.',
+      none: 'Not submitted yet.',
+      restored:
+        '{name} now looks like #{n} (on your computer). Check it, then submit so others get it.',
+      compareStart: 'From',
+      compareEnd: 'To',
+      diffInUe: 'See the differences in UE',
+      openInUe: 'Open in UE',
+      moved: 'Moved to {path}',
+      latest: 'Latest',
+      back: 'Back'
+    },
+    ask: {
+      askedOnline: "Asked {who}. You'll hear back when they answer.",
+      askedOffline: "Asked {who}. They haven't been online today.",
+      requestTakeBack: 'Ask an admin to take it back',
+      escalated: 'Told the admins ({admins}).',
+      stillEditing: 'Still working',
+      askedRecently: 'Asked ({ago} ago)'
+    },
+    folder: {
+      whoCanSubmit: 'Who can submit',
+      all: 'All members',
+      only: '{people} (others wait for them)',
+      modeInherit: 'Same as parent ({what})',
+      modeAll: 'All members',
+      modeOnly: 'Only these people',
+      pickPeople: 'Choose people',
+      othersWait: 'Other people’s submits wait for them',
+      save: 'Save',
+      saved: 'In effect. UE sees it right away.',
+      checksTitle: 'Checks before submitting',
+      rules: {
+        'name-prefix': 'Names start with a type prefix',
+        'texture-power-of-two': 'Texture sides are powers of two',
+        'texture-max-size': 'Textures are at most {max}',
+        'no-broken-references': 'No broken references',
+        'file-max-size': 'Each file is at most {size}'
+      },
+      levels: {
+        off: 'Off',
+        warn: 'Warn',
+        block: 'Block',
+        inherit: 'Same as parent ({level})'
+      },
+      checksFoot: 'Checked when submitting in UE and when outsourcers deliver.',
+      prefixTypes: {
+        Texture2D: 'Texture',
+        Material: 'Material',
+        MaterialInstanceConstant: 'Material instance',
+        StaticMesh: 'Static mesh',
+        SkeletalMesh: 'Skeletal mesh',
+        Blueprint: 'Blueprint',
+        NiagaraSystem: 'Niagara'
+      },
+      addPrefix: 'Add a row',
+      maxSide: 'Texture side limit',
+      maxFile: 'File size limit (GB)'
+    },
+    activity: {
+      summary: '{period}: {n} submits',
+      periods: {
+        week: 'This week',
+        lastWeek: 'Last week',
+        month: 'This month'
+      },
+      freeze: 'Freeze',
+      longCheckouts: 'Checked out over 3 days: ',
+      longItem: '{who} {label} ({duration})',
+      longMore: 'and {n} more',
+      who: 'Who',
+      everyone: 'Everyone',
+      folder: 'Folder',
+      allFolders: 'All folders',
+      onlyMilestones: 'Milestones only',
+      compare: 'Compare',
+      today: 'Today',
+      yesterday: 'Yesterday',
+      empty: 'No one submitted in this period.',
+      error: "Couldn't load activity.",
+      offline: "Can't reach the team. This is the activity before {time}.",
+      searchPlaceholder: 'Submit number, note, person or file name',
+      loadMore: 'Earlier'
+    },
+    card: {
+      added: 'Added {n}',
+      modified: 'Changed {n}',
+      deleted: 'Deleted {n}',
+      actionAdded: 'Added',
+      actionModified: 'Changed',
+      actionDeleted: 'Deleted',
+      actionMoved: 'Changed',
+      waitingAdmins: 'Waiting for an admin',
+      waitingPeople: 'Waiting for {people}',
+      rejected: 'Returned: {reason} · {who}',
+      built: 'In build {machine}',
+      builtHover: 'The {machine} build of {time} includes it',
+      approve: 'Approve',
+      reject: 'Return',
+      copyLink: 'Copy link',
+      compareFrom: 'Compare from here',
+      comparePrevMilestone: 'Compare with previous milestone',
+      setMilestone: 'Set as milestone',
+      rename: 'Rename',
+      removeMilestone: 'Remove milestone',
+      milestoneBy: 'Set by {who} on {date}',
+      submitNo: 'Submit number {n}',
+      copied: 'Copied #{n}',
+      approved: '#{n} approved.',
+      removedMilestone: 'Removed {name}. #{n} is unchanged.',
+      linkCopied: 'Link copied',
+      more: '+{n}',
+      ofpa: '{map} · {n} actors',
+      filesFolded: '{folder}: {n}'
+    },
+    dialogs: {
+      milestoneTitle: 'Set #{n} as a milestone?',
+      milestoneName: 'Name',
+      milestonePlaceholder: 'For example: M3 review build',
+      setMilestone: 'Set as milestone',
+      renameTitle: 'Rename',
+      rename: 'Rename',
+      nameTaken: 'That name is already used.',
+      freezeTitle: 'Freeze {name}?',
+      freezeBody:
+        "While frozen, everyone's submits except admins and build machines wait for an admin.",
+      freezeNote: 'Note (everyone sees it)',
+      freezePlaceholder: 'For example: M3 review, unfreezes Friday 18:00',
+      freeze: 'Freeze',
+      unfreezeTitle: 'Unfreeze {name}?',
+      unfreezeBody:
+        'After unfreezing, submits land directly. The {n} waiting still need approving or returning.',
+      unfreeze: 'Unfreeze',
+      unfrozen: 'Unfrozen.',
+      rejectTitle: 'Return #{n}?',
+      rejectAssetsTitle: 'Return {n} assets?',
+      reason: 'Reason (they will see it)',
+      reject: 'Return',
+      takeBackTitle: "Take back {who}'s check-out?",
+      takeBackAllTitle: "Take back {who}'s {n} check-outs?",
+      takeBackBody:
+        'Their unsubmitted changes stay on their computer. Nothing is lost. Others can check it out afterwards.',
+      takeBackReason: 'Say why (optional)',
+      takeBack: 'Take back',
+      takenBack: 'Taken back. {who} will be told.',
+      sendTitle: 'Send to {company}?',
+      sendNote: 'What changed (they will see it)',
+      send: 'Send',
+      sent: 'Sent to {company}.',
+      cancelCheckoutTitle: 'Cancel check-out of {name}?',
+      cancelCheckoutBody:
+        "You changed it. Changes you don't keep are saved on your computer first; you can get them back from history.",
+      keepChanges: 'Keep changes',
+      discardChanges: 'Discard changes',
+      notAllowed: "Your role can't do this.",
+      failed: "That didn't work. Try again."
+    },
+    compare: {
+      title: 'Compare',
+      from: 'From',
+      to: 'to',
+      latest: 'Latest',
+      earlier: 'Earlier',
+      byNumber: 'By submit number…',
+      byNumberPlaceholder: '#1496',
+      recent: 'Recent submits',
+      summary: '{submits} submits',
+      milestoneTitle: '{from} → {to}: {n} submits',
+      files: 'Files',
+      submits: 'Submits',
+      fileRow: '{action} · #{n} {who}',
+      stuck: 'Still no idea what caused it?',
+      bisect: 'Find which submit broke it',
+      swapped: 'Put in order.',
+      noSuch: 'There is no submit #{n}.',
+      empty: 'Nothing changed between these two.',
+      incomplete: "A submit in this range is too large; its files aren't listed one by one."
+    },
+    bisect: {
+      title: 'Find which submit broke it',
+      startLine: '#{good} is good · #{bad} is bad · {n} submits between, about {rounds} rounds',
+      start: 'Start',
+      tryThis: 'Try this: #{n}',
+      copyNumber: 'Copy number',
+      inUe: 'In UE: Sync ▾ → By submit number…',
+      buildCmd: 'Build machine command',
+      copy: 'Copy',
+      copied: 'Copied',
+      good: 'Good',
+      bad: 'Bad',
+      skip: 'Skip',
+      undo: 'Back',
+      stop: 'Stop looking',
+      progress: 'Round {round} · about {left} left',
+      found: 'It was #{n}: {who} · {message}',
+      ambiguous: "Narrowed to #{from}–#{to}; can't tell which one.",
+      copyLink: 'Copy link'
+    },
+    checkouts: {
+      groupTitle: '{who} · {n}',
+      oldest: 'oldest {duration}',
+      takeBackAll: 'Take back all',
+      empty: 'Nobody has anything checked out.',
+      mapCard: '{map} · {n} pieces'
+    },
+    inbox: {
+      approvals: 'Waiting for your approval',
+      takeBack: 'Asked to take back',
+      deliveryRow: '{company} · delivery {n} · {count} items · {time}',
+      goSee: 'Open',
+      takeBackRow: '{asker} wants {label} · {holder}',
+      allDone: 'All handled.'
+    },
+    deleted: {
+      subtitle: 'Deleted by {who} · {time} · #{n}',
+      restore: 'Restore',
+      restoreInUe: 'Restore in UE',
+      empty: 'Nothing was deleted in the last 30 days.',
+      restored: '{name} is back on your computer. Submit in UE so others get it.'
+    },
+    check: {
+      setBy: ' (set by {who})',
+      namePrefix: '{name} should start with {prefix}.',
+      powerOfTwo: "{name}'s sides aren't powers of two.",
+      maxSize: '{name} is {value}; the limit is {max}{setBy}.',
+      brokenRefs: 'Missing references: {refs}',
+      fileSize: '{name} is larger than {max}.'
+    },
+    notify: {
+      askReceived: '{who} wants to change {name}. Are you done with it?',
+      askSubmitted: '{who} submitted {name}.',
+      askReleased: '{who} cancelled the check-out; {name} is checked out to you.',
+      askStill: '{who}: still working, about {eta}.',
+      eta: {
+        '30m': '30 minutes',
+        '1h': '1 hour',
+        today: 'end of today',
+        tomorrow: 'tomorrow'
+      },
+      inbox: '{n} thing waiting on you.',
+      takenBack:
+        '{who} took back your check-out of {name}. Your changes are still on your computer.',
+      takenBackReason:
+        '{who} took back your check-out of {name}: {reason}. Your changes are still on your computer.',
+      assigned: '{name} is checked out to you.',
+      approved: '#{n} approved. Check-out cancelled.',
+      rejected:
+        '#{n} returned by {who}: {reason}. Your changes are still on your computer; fix and submit again.',
+      conflict:
+        "#{n} doesn't merge with someone else's change. Your changes are still on your computer; fix and submit again.",
+      freezeStarted: 'Frozen: {note}. Submits from now on wait for an admin.',
+      freezeEnded: 'Unfrozen.',
+      bisectDone: 'Found it: #{n}.',
+      deliveryDecided: 'Delivery {n}: approved {a}, returned {r}.',
+      syncDone: 'Done.'
+    },
+    versions: {
+      latest: 'Latest',
+      mainline: 'Mainline'
+    },
+    jobs: {
+      sync: 'Sync {name} to this computer',
+      'put-in': 'Put in {name}',
+      deliver: 'Delivery {name} · uploading',
+      approve: 'Approve delivery {name}',
+      reference: 'Send to {name}'
+    }
   }
 }

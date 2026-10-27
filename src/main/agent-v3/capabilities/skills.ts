@@ -33,6 +33,7 @@ import { mkdir, readFile, rm, writeFile } from 'fs/promises'
 import { app } from 'electron'
 import { z } from 'zod'
 import { SKILL_CREATOR_NAME } from '../../../shared/skillLearning'
+import type { SharedSkillOrigin } from '../../../shared/share'
 
 import {
   discoverSkills,
@@ -336,7 +337,7 @@ export async function writeSkillDocument(
   if (declared !== name) {
     return {
       success: false,
-      error: `frontmatter 里写的是 name: ${declared}，和你正在编辑的「${name}」对不上。改名请另存一个新技能。`
+      error: `frontmatter 中的 name 为 ${declared}，与当前编辑的「${name}」不一致。如需改名，请另存为新技能。`
     }
   }
 
@@ -428,6 +429,8 @@ export interface SkillSummary {
   source: SkillSource
   /** 用户有没有把它关掉。关掉的仍然要列出来 —— 否则没法再打开 */
   enabled: boolean
+  /** 从官网共享库装的：技能页显示「来自共享 · 第 N 版」 */
+  shared?: SharedSkillOrigin
 }
 
 /**
@@ -438,14 +441,19 @@ export interface SkillSummary {
  */
 export function listSkillSummaries(
   skills: SkillMetadata[],
-  disabled: ReadonlySet<string> = new Set()
+  disabled: ReadonlySet<string> = new Set(),
+  shared: ReadonlyMap<string, SharedSkillOrigin> = new Map()
 ): SkillSummary[] {
-  return skills.map((skill) => ({
-    name: skill.name,
-    description: firstSentence(skill.description),
-    source: skill.source ?? 'builtin',
-    enabled: !disabled.has(skill.name)
-  }))
+  return skills.map((skill) => {
+    const origin = shared.get(skill.name)
+    return {
+      name: skill.name,
+      description: firstSentence(skill.description),
+      source: skill.source ?? 'builtin',
+      enabled: !disabled.has(skill.name),
+      ...(origin ? { shared: origin } : {})
+    }
+  })
 }
 
 /**
@@ -647,7 +655,6 @@ export function createSkillTools(
         // 正文里的工具名同样要重写 —— 否则模型会照着技能的指示
         // 去调 blueprint.add_node，而注册的是 blueprint_add_node
         text: content + nudge + (loaded?.text ? `\n\n${loaded.text}` : ''),
-        ...(loaded?.addedToolNames ? { addedToolNames: loaded.addedToolNames } : {}),
         details: {
           skillName: result.name,
           skillDirectory: result.skillDirectory,
@@ -680,7 +687,6 @@ export function createSkillTools(
       const loaded = loadTools?.(content)
       return {
         text: content + (loaded?.text ? `\n\n${loaded.text}` : ''),
-        ...(loaded?.addedToolNames ? { addedToolNames: loaded.addedToolNames } : {}),
         details: {
           skillDirectory: result.skillDirectory,
           relativePath: result.relativePath,

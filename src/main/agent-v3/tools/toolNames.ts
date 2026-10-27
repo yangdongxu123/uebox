@@ -81,6 +81,8 @@ const CROSS_REFERENCE_RENAMES: Readonly<Record<string, string>> = Object.freeze(
   'widget.preview': 'widget_preview',
   'widget.make_variable': 'widget_make_variable',
   'widget.set_property': 'widget_set_property',
+  'widget.replace': 'widget_replace',
+  'widget.remove': 'widget_remove',
   // 2026-09-11 两合一（见 registry.ts 的 ue_insights_trace）。旧名还会出现在
   // 历史会话和第三方 skill 里，指过去才不会让模型去调一个不存在的工具。
   // 注意这两个键**没有点号**：rewriteCrossReferences 对键做整词替换，不依赖点号。
@@ -115,7 +117,7 @@ export const BROWSER_TOOL_NAMES = [
 export const ASK_USER_TOOL_NAME = 'ask_user'
 
 /**
- * 换会话归属那个工具的名字。同上，放在零依赖模块里给注册表补名单和风险表用。
+ * 换对话归属那个工具的名字。同上，放在零依赖模块里给注册表补名单和风险表用。
  *
  * 它和 `ask_user` / `voice_report` 一样是在 `resolveTools` 里现造的（要宿主给的
  * 通道），进不了 `REGISTRATIONS`。但它是这批现造工具里**唯一一个 `mutating`**，

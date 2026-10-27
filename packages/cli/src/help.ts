@@ -43,6 +43,10 @@ const ZH = `虚幻盒子 CLI —— 从终端调用虚幻引擎能力
   tools show <name>         某个工具的完整描述和参数定义
   tools call <name>         调用一个工具
   viewport screenshot       把视口画面存成 PNG 文件
+  skills add <技能>         从官网共享库安装技能，盒子里确认后才装
+  team list / team status [id]  列出外部团队 / 看某个团队的交付闸
+  team use <id>             把当前目录绑到这个外部团队
+  team gate / team round    收尾检查 / 新一轮清零；Claude Code hook 里加 --hook
 
 示例：
   uebox ask "列出当前关卡里所有点光源和它们的强度"
@@ -63,6 +67,7 @@ const ZH = `虚幻盒子 CLI —— 从终端调用虚幻引擎能力
   --json                    stdout 只输出一个 JSON 对象；诊断走 stderr
   --project <path>          目标工程，.uproject 文件或其所在目录都行
   --allow-write             允许这条命令改动工程
+  --model <id>              ask 用哪个模型，盒子里配了多个模型时才能选
   --search <text>           tools list 按名字或描述筛选
   --args <JSON>             tools call 的参数
   --args-file <path>        从文件读参数；写 - 表示从标准输入读
@@ -70,6 +75,7 @@ const ZH = `虚幻盒子 CLI —— 从终端调用虚幻引擎能力
   --output <path>           截图存到哪，只接受 .png，相对路径按当前目录算
   --world auto|editor       截图拍哪个世界，默认 auto：PIE 在跑就拍游戏
   --overwrite               截图允许覆盖已存在的文件
+  --hook                    team gate/round、team guard 按 hook 约定读写
   --config <path>           盒子的配置文件，装在别处时用；或设 UEBOX_HOST_CONFIG
   --timeout <seconds>       整条命令的期限，默认 120
   --lang zh-CN|en-US        帮助与提示用哪种语言
@@ -77,7 +83,7 @@ const ZH = `虚幻盒子 CLI —— 从终端调用虚幻引擎能力
   -v, --version             看版本号
 
 ask：
-  用的是盒子里配置的模型，费用记在那个模型的账上。子任务只碰引擎、
+  默认用盒子里配置的模型，费用记在实际用的模型上。子任务只碰引擎、
   素材库和工程库；shell、本地文件、浏览器、第三方 MCP 一律不给。
   不加 --allow-write 时它只能查，不能改。进度打在 stderr 上；
   --timeout 对它算的是多久没有任何进度，不是总时长。
@@ -125,6 +131,9 @@ Commands:
   tools show <name>         Full description and input schema for one tool
   tools call <name>         Call one tool
   viewport screenshot       Save the viewport image to a PNG file
+  skills add <skill>        Install a shared skill; confirm it in UE Box first
+  team list / team status [id] / team use <id>  List, inspect, bind cwd
+  team gate / team round    Finish check / new round; add --hook in hooks
 
 Examples:
   uebox ask "list every point light in the level with its intensity"
@@ -145,6 +154,7 @@ Options (before or after the command):
   --json                    Emit one JSON object on stdout; diagnostics stderr
   --project <path>          Target project; .uproject or its directory
   --allow-write             Let this command change the project
+  --model <id>              ask: which of the box's models to run on
   --search <text>           tools list: filter by name or description
   --args <JSON>             tools call: arguments
   --args-file <path>        Read arguments from a file; - means stdin
@@ -152,6 +162,7 @@ Options (before or after the command):
   --output <path>           Screenshot file, .png only, relative to cwd
   --world auto|editor       Which world to capture; auto captures PIE if running
   --overwrite               Let the screenshot replace an existing file
+  --hook                    team gate/round, team guard: Claude Code hook format
   --config <path>           The box's config file if installed elsewhere;
                             or set UEBOX_HOST_CONFIG
   --timeout <seconds>       Deadline for the whole command, default 120
@@ -160,11 +171,10 @@ Options (before or after the command):
   -v, --version             Show the version
 
 ask:
-  Runs on the model configured in the box, billed to that model. The subtask
-  only touches the engine and the asset and project libraries; shell, local
-  files, browser and third-party MCP are never given. Without --allow-write it
-  can look but not change. Progress goes to stderr; for ask, --timeout means
-  how long without any progress, not total time.
+  Default model unless --model picks another. The subtask only touches the
+  engine and the asset and project libraries; no shell, local files, browser
+  or third-party MCP. Without --allow-write it can look, not change. Progress
+  goes to stderr; --timeout means time without progress, not total time.
 
 Writes:
   Without --allow-write only read-only tools are called. With it, anything the
@@ -178,8 +188,7 @@ The target project is: --project, else the nearest .uproject above the current
 directory, else the one online project if there is exactly one. A project from
 the first two that is not connected fails the command.
 
-Screenshot brightness is only reliable when the scene uses manual exposure;
-check data.exposure, and lock it before judging exposure.
+Screenshot brightness is reliable only with manual exposure; see data.exposure.
 
 Exit codes:
   0     ok

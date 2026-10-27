@@ -56,11 +56,20 @@
           <AppButton
             v-if="pendingAction.allowAlways !== false"
             variant="default"
-            class="btn-allow-session"
-            @click="handleAllowForSession"
+            class="btn-allow-chat"
+            @click="handleAllowForChat"
           >
             <template #icon><PhShieldCheck /></template>
-            {{ t('assistant.sensitiveAction.allowForSession') }}
+            {{ t('assistant.sensitiveAction.allowForChat') }}
+          </AppButton>
+          <AppButton
+            v-if="pendingAction.allowForever"
+            variant="default"
+            class="btn-allow-forever"
+            :title="t('assistant.sensitiveAction.allowForeverHint')"
+            @click="handleAllowForever"
+          >
+            {{ t('assistant.sensitiveAction.allowForever') }}
           </AppButton>
           <AppButton variant="primary" class="btn-confirm" @click="handleConfirm">
             <template #icon><PhCheck /></template>
@@ -156,9 +165,14 @@ function handleConfirm(): void {
   reply('approve')
 }
 
-/** 「本次会话都允许」。V3 的 'always' 语义就是「本会话内该工具不再询问」，正好对上 */
-function handleAllowForSession(): void {
+/** 「本对话内都允许」。V3 的 'always' 语义是「本 session 内该工具不再询问」，对用户就是这条对话 */
+function handleAllowForChat(): void {
   reply('always')
+}
+
+/** 「以后都允许」：存进应用设置，所有对话都不再问。在「偏好设置 → AI」里移除 */
+function handleAllowForever(): void {
+  reply('forever')
 }
 
 function handleReject(): void {
@@ -260,10 +274,17 @@ Please explain what this operation means and does.`
 </script>
 
 <style scoped lang="less">
+/*
+ * 底色跟输入框一样用中性面，不用整块警示黄。
+ *
+ * 原来底、描边、标题、确认键全是 warning 色，再加一颗绿色的「本对话内均允许」，
+ * 一张卡上三套颜色互相抢；而且它每次跑活都会弹，天天看的东西整块刷黄只会让人麻木。
+ * 警示只留给左上角那个图标 —— 一处点色就够把「这是要你拍板的」说清楚。
+ */
 .sensitive-action-confirm {
-  background: var(--color-warning-bg);
-  border: 1px solid var(--color-warning-border);
-  border-radius: 8px;
+  background: var(--color-bg-surface-hover);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 16px;
   padding: 12px 16px;
   margin: 8px 0;
   width: 100%;
@@ -337,7 +358,7 @@ Please explain what this operation means and does.`
 
 .header-title {
   font-weight: 600;
-  color: var(--color-warning-text);
+  color: var(--color-text-primary);
   font-size: 14px;
 }
 
@@ -345,10 +366,10 @@ Please explain what this operation means and does.`
   display: flex;
   align-items: center;
   gap: 4px;
-  background: var(--color-warning-bg);
+  border: 1px solid var(--color-border-subtle);
   padding: 2px 8px;
   border-radius: 12px;
-  color: var(--color-warning-text);
+  color: var(--color-text-secondary);
   font-size: 12px;
   white-space: nowrap;
 }
@@ -410,8 +431,9 @@ Please explain what this operation means and does.`
 }
 
 .action-details {
-  background: var(--color-bg-surface-hover);
-  border-radius: 4px;
+  /* 卡片自己已经是 surface-hover，命令块再用它就糊成一片；压回页面底色才看得出边界 */
+  background: var(--color-bg-page);
+  border-radius: 8px;
   padding: 8px 10px;
   /*
    * `max-height` 而不是 `height`：写死 300px 的话，一条两行的命令也要顶着
@@ -476,27 +498,22 @@ Please explain what this operation means and does.`
   }
 }
 
-.btn-allow-session {
-  background: var(--color-success-bg);
-  border-color: var(--color-success-border);
-  color: var(--color-success-text);
+/* 放行几档都是同一类选择，跟「拒绝」一个样子；主次只靠最右那颗实心的确认键 */
+.btn-allow-chat,
+.btn-allow-forever {
+  background: var(--color-bg-surface-hover);
+  border-color: var(--color-border);
+  color: var(--color-text-primary);
 
   &:hover {
-    background: var(--color-success-bg);
-    border-color: var(--color-success-border);
-    color: var(--color-success-text);
+    background: var(--color-bg-surface-hover);
+    border-color: var(--color-border);
+    color: var(--color-text-primary);
   }
 }
 
+/* 确认键用全局的主按钮样式（和发送键同一套），不再单独刷成橙色 */
 .btn-confirm {
-  background: var(--color-warning-solid);
-  border: none;
-  color: var(--color-warning-on-solid);
   font-weight: 500;
-
-  &:hover {
-    background: var(--color-warning-solid-hover);
-    color: var(--color-warning-on-solid);
-  }
 }
 </style>

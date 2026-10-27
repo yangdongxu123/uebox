@@ -9,7 +9,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createModels } from '@earendil-works/pi-ai'
+import { createModels, getCurrentSystemPrompt, getCurrentTools } from '@earendil-works/pi-ai'
 import {
   fauxAssistantMessage,
   fauxProvider,
@@ -104,8 +104,8 @@ beforeEach(() => {
   ])
   const streamFn: StreamFn = (model, context, options) => {
     requests.push({
-      system: context.systemPrompt ?? '',
-      tools: (context.tools ?? []).map((tool) => tool.name)
+      system: getCurrentSystemPrompt(context.messages),
+      tools: getCurrentTools(context.messages).map((tool) => tool.name)
     })
     return models.streamSimple(model, context, options)
   }
@@ -172,11 +172,14 @@ describe('工作室模式装配', () => {
     await agent.prompt('做一个塔防游戏')
     expect(agent.state.errorMessage).toBeUndefined()
 
-    // 制作人：四个团队工具在手，系统提示词里有交付标准和工作区
+    // 制作人：四个团队工具在手，系统提示词里有交付标准和工作区；
+    // 只协调不动手，写工具和 `task` 都收走（producerTools）
     const producer = requests[0]!
     expect(producer.tools).toEqual(
-      expect.arrayContaining(['team_hire', 'team_send', 'team_board', 'team_deliver', 'task'])
+      expect.arrayContaining(['team_hire', 'team_send', 'team_board', 'team_deliver'])
     )
+    expect(producer.tools).not.toContain('task')
+    expect(producer.tools).not.toContain('write_state')
     expect(producer.system).toContain('<team_mode>')
     expect(producer.system).toContain(join(root, 's1', 'ws'))
 

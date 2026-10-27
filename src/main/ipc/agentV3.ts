@@ -88,8 +88,14 @@ import {
 import { openAssetInEditor } from '../agent-v3/core/openAsset'
 import { reviewChanges } from '../agent-v3/core/reviewChanges'
 import type { AgentReviewTarget } from '../../shared/agentReview'
+import type {
+  AgentStartRejectionCode,
+  SteerRejectionCode,
+  SteerRejectionErrorParams
+} from '../../shared/agentRunRejection'
 import {
   createUnrealAgent,
+  NoConclusionError,
   runSubAgent,
   type EngineFacts,
   type SessionContext
@@ -113,18 +119,29 @@ import {
   createGoalLoop,
   parseGoalCommand
 } from '../agent-v3/core/goalLoop'
-import { parseTeamCommand } from '../agent-v3/core/team/teamCommand'
+import { activeLoop, parseTeamCommand } from '../agent-v3/core/team/teamCommand'
 import { runWithEditorKey } from '../agent-v3/core/team/editorKey'
-import { createTeamStore, PRODUCER } from '../agent-v3/core/team/teamStore'
-import { createTeamLive } from '../agent-v3/core/team/teamLive'
-import { formatMail } from '../agent-v3/core/team/teamTools'
+import { createTeamStore } from '../agent-v3/core/team/teamStore'
+import { runningHybridTeam } from '../agent-v3/core/team/hybridTeam'
+import { createTeamLive, type TeamLive } from '../agent-v3/core/team/teamLive'
+import { awaitTeamWork } from '../agent-v3/core/team/teamWait'
 import { assignMemberModel, loadTeamModels, recordReopen } from '../agent-v3/core/team/teamModels'
 import { createTrackRecord } from '../agent-v3/core/team/trackRecord'
+import { loadModelDossiers, recheckModel } from '../agent-v3/core/team/modelDossier'
 import { teamModelCandidates, type TeamStateView } from '../../shared/agentTeam'
 import { readSettings as readAiSettings } from '../ai/store'
+import { setProviderUsageProbe } from '../ai/providerUsage'
 import { DEFAULT_GOAL_MAX_ROUNDS, normalizeGoalMaxRounds } from '../../shared/goalRounds'
 import { buildCrashNotice, type EditorWatchEvent } from '../agent-v3/core/team/editorWatch'
 import { startTeamEditorWatch } from './teamEditorWatch'
+import {
+  endExternalTeam,
+  externalTeamExists,
+  isExternalTeamId,
+  isHybridTeam,
+  listExternalTeams,
+  readExternalTeamState
+} from './externalTeams'
 import { createTeamSnapshots } from './teamSnapshots'
 import {
   applyVerdict,
@@ -141,8 +158,14 @@ import {
   carryOverTasks,
   changedSince,
   formatBoardCarryOver,
+  reopenedJobTask,
   verdictIsStale
 } from '../agent-v3/core/team/boardRecap'
+import {
+  DismissalError,
+  dismissMember,
+  formatUserDismissals
+} from '../agent-v3/core/team/dismissal'
 import {
   createRuntimeScopeId,
   formatLocalNow,
@@ -201,10 +224,12 @@ import {
   loadTranscript,
   truncateTranscript
 } from '../agent-v3/core/transcriptStore'
+import { restoreTranscript, withoutSystemMessages } from '../agent-v3/core/systemMessages'
 import { notifyAgentRun } from '../agent-v3/host/runObserver'
 import { isVoiceTaskSession } from './realtimeVoice'
 import { serviceManager } from '../services'
-import { estimateContextTokens, type Agent, type AgentMessage } from '@earendil-works/pi-agent-core'
+import type { Agent, AgentMessage } from '@earendil-works/pi-agent-core'
+import { estimateContextTokens } from '../agent-v3/vendor/pi-harness'
 import {
   deleteUserSkills,
   discoverSkillsOnDisk,
@@ -237,8 +262,8 @@ interface ActiveAgentRun {
   /**
    * 这一轮钉住的目标工程。跑起来之后写进去，插话抓闪存时读它。
    *
-   * 插话不在 `runWithTargetConnectionId` 的执行流里，自己重新解析会话戳算出来的
-   * 未必是**正在跑的那轮**的工程（没盖戳的会话跟着「最近连上的」走）。而插话说的
+   * 插话不在 `runWithTargetConnectionId` 的执行流里，自己重新解析对话戳算出来的
+   * 未必是**正在跑的那轮**的工程（没盖戳的对话跟着「最近连上的」走）。而插话说的
    * 是「改这个」，它必须和正在跑的那轮盯着同一个工程，否则「这个」根本不存在。
    */
   scope?: SessionProjectScope
@@ -347,7 +372,7 @@ const deletingSessions = new Set<string>()
 /**
  * 正在跑的 agent 轮次，以及各自是哪个窗口发起的。
  *
- * 给独立聊天窗口用（`chatWindowManager.ts`）：一条会话可能是主窗口发起、
+ * 给独立对话窗口用（`chatWindowManager.ts`）：一条对话可能是主窗口发起、
  * 却显示在独立窗口里，那边的流式状态里没有这一轮，判忙和停止都得靠这张表。
  * 分叉、截断这类历史操作不算 —— 它们一闪而过，也不会让界面显示「在跑」。
  */
@@ -358,7 +383,7 @@ export function activeRunOwners(): Array<{ sessionId: string; senderId: number }
     .map(([sessionId, entry]) => ({ sessionId, senderId: entry.senderId }))
 }
 
-/** 这个窗口名下还有没收摊的会话操作。独立窗口关窗时据此决定先藏起来等它跑完 */
+/** 这个窗口名下还有没收摊的操作（按内核 session 算）。独立窗口关窗时据此决定先藏起来等它跑完 */
 export function hasActiveRunsOwnedBy(webContentsId: number): boolean {
   return activeAgents.entries().some(([, entry]) => entry.senderId === webContentsId)
 }
@@ -368,12 +393,30 @@ export function onActiveRunsChanged(listener: () => void): () => void {
 }
 
 /**
- * 现在还有几项会话操作没收摊：AI 轮次、分叉 / 截断 / 压缩这类历史操作都算
+ * 现在还有几项操作没收摊（按内核 session 算）：AI 轮次、分叉 / 截断 / 压缩这类历史操作都算
  * —— 表里的条目覆盖了从占位、进行中到收尾的整段。托盘「退出」拿它决定
  * 要不要先问一句 —— 直接退会把干到一半的活撂在引擎里。
  */
 export function countActiveSessionOperations(): number {
   return activeAgents.entries().length
+}
+
+/**
+ * 正在跑的对话里有几个用着这个服务商：制作人自己的模型，或团队名册里钉了它的队员。
+ * 设置页删服务商前问这个（见 `ai/providerUsage.ts`）
+ */
+async function countRunsUsingProvider(providerId: string): Promise<number> {
+  let count = 0
+  for (const [sessionId, entry] of activeAgents.entries()) {
+    if (entry.kind !== 'agent') continue
+    if (entry.selection?.providerId === providerId) {
+      count++
+      continue
+    }
+    const roster = await createTeamStore(teamDirsFor(sessionId)).roster()
+    if (roster.some((member) => member.model?.providerId === providerId)) count++
+  }
+  return count
 }
 
 /** 在任何异步准备之前占位，停止和重入检查从这一刻起生效。 */
@@ -394,7 +437,7 @@ function reserveRun(
 }
 
 /**
- * 跑着的会话能不能就地分支：能的话给出该拿去切的那份消息。
+ * 跑着的对话能不能就地分支：能的话给出该拿去切的那份消息。
  *
  * 分支只读源会话（读一份历史、写一个新文件），本来就不必等它停 —— 挡住它的
  * 一直是「盘上落后于内存」。跑着的时候读内存那份就绕开了这件事。
@@ -416,9 +459,16 @@ function liveForkSource(sessionId: string, keepUserTurns?: number): AgentMessage
   const running = activeAgents.get(sessionId)
   if (running?.kind !== 'agent' || !running.agent) return undefined
 
-  const messages = [...running.agent.state.messages]
+  const messages = withoutSystemMessages(running.agent.state.messages)
   const userTurns = messages.filter((m) => (m as { role?: string }).role === 'user').length
   return userTurns > keepUserTurns ? messages : undefined
+}
+
+/** 目标模式里「用户最新一句」最多带多长：它每轮复核、续跑都要再发一遍 */
+const LATEST_REQUEST_MAX_CHARS = 2000
+
+function tailOf(text: string, max: number): string {
+  return text.length <= max ? text : `…${text.slice(text.length - max)}`
 }
 
 /** 按停止之后最多等它收尾多久，超时就如实说「没停干净」 */
@@ -433,11 +483,11 @@ const STOP_DRAIN_TIMEOUT_MS = 15_000
 const LOCK_PUSH_TIMEOUT_MS = 5_000
 
 /**
- * 每条会话的审批档位。
+ * 每条对话的审批档位。
  *
- * **一条会话一份**，不是全局一份。曾经是全局的：谁最后 execute 就把它覆盖成
- * 谁的档位 —— 用户在 A 会话上设了只读，去 B 会话开完全访问，回到 A 发一句话，
- * A 也在按完全访问跑。他在 A 上做的那个「别乱动」的决定，被另一条会话悄悄推翻了。
+ * **一条对话一份**，不是全局一份。曾经是全局的：谁最后 execute 就把它覆盖成
+ * 谁的档位 —— 用户在 A 对话上设了只读，去 B 对话开完全访问，回到 A 发一句话，
+ * A 也在按完全访问跑。他在 A 上做的那个「别乱动」的决定，被另一条对话悄悄推翻了。
  *
  * 存成表而不是随 execute 参数写死进审批门，是为了「跑到一半改档位立刻生效」：
  * 审批门每次工具调用都现读这个值。用户被确认框拦住时才会去调档位，
@@ -452,15 +502,27 @@ function approvalModeFor(sessionId: string): ApprovalMode {
 }
 
 /**
- * 每条会话里已被「始终允许」的工具。
+ * 每个内核 session 里已被「始终允许」的工具。
  *
- * 必须挂在会话上：审批门随 agent 创建，而 agent 每条消息重建一次 ——
+ * 必须挂在内核 session 上：审批门随 agent 创建，而 agent 每条消息重建一次 ——
  * 原来这个集合活在审批门闭包里，于是按钮上写着「本次会话都允许」，
  * 实际只管到这一轮结束，用户下一句话发出去它又开始问了。
  *
- * 不跨会话共享：在 A 对话里放行过的工具，不该在 B 对话里也免问。
+ * 不跨内核 session 共享：在 A 对话里放行过的工具，不该在 B 对话里也免问。
  */
 const sessionAlwaysAllowed = new Map<string, Set<string>>()
+
+/**
+ * 切到只读（Ask）时连同「本对话内都允许」的名单一起清掉。
+ *
+ * 不能只在 `set-approval-mode` 里清：渲染层那一下同步送不到时会静默跳过，
+ * 下一轮 execute / continue 带着 `mode: 'ask'` 进来只改了只读标记，名单还在，
+ * 用户切回 Agent 后旧授权照样生效 —— 按钮上的承诺就落空了。
+ */
+function setReadOnly(sessionId: string, readOnly: boolean): void {
+  readOnlyBySession.set(sessionId, readOnly)
+  if (readOnly) sessionAlwaysAllowed.get(sessionId)?.clear()
+}
 
 function alwaysAllowedFor(sessionId: string): Set<string> {
   const existing = sessionAlwaysAllowed.get(sessionId)
@@ -500,7 +562,9 @@ function attachGoalLoop(
     emit('agent-v3:goal', { sessionId: ctx.sessionId, message, level })
   const precondition = checkGoalPreconditions({ mode: options.mode })
   if (!precondition.ok) {
-    report(precondition.reason!, 'warning')
+    // 只在这一轮刚定目标时提醒；沿用下来的目标（带 latestRequest）在只读轮里静默跳过，
+    // 不然切到只读问一句就句句报「目标不可能达成」
+    if (!goal.latestRequest) report(precondition.reason!, 'warning')
     return undefined
   }
   const loop = createGoalLoop({
@@ -521,15 +585,22 @@ function attachGoalLoop(
     isReadOnlyCall: (toolName, args) =>
       effectiveRisk(tools.find((tool) => tool.name === toolName)?.unrealBox, args) === 'safe',
     runAudit: async (input) => {
-      const result = await runSubAgent(ctx, {
-        prompt: buildAuditPrompt(input),
-        auditorJudges: AUDITOR_HARD_JUDGES,
-        withoutApproval: true,
-        seedMessages: [],
-        ...(input.signal ? { signal: input.signal } : {}),
-        ...(input.onProgress ? { onProgress: input.onProgress } : {})
-      })
-      return result.text
+      try {
+        const result = await runSubAgent(ctx, {
+          prompt: buildAuditPrompt(input),
+          auditorJudges: AUDITOR_HARD_JUDGES,
+          withoutApproval: true,
+          seedMessages: [],
+          ...(input.signal ? { signal: input.signal } : {}),
+          ...(input.onProgress ? { onProgress: input.onProgress } : {})
+        })
+        return result.text
+      } catch (error) {
+        // 审计员被截断或没写字：没有裁决，交给目标循环按「复核未给出裁决」收住，
+        // 别让它变成主对话这一轮的报错
+        if (error instanceof NoConclusionError) return error.message
+        throw error
+      }
     },
     followUp: (text) => agent.followUp({ role: 'user', content: text, timestamp: 0 }),
     report
@@ -556,15 +627,40 @@ async function prepareTeam(
   const changed = (): void => emit('agent-v3:team-board', { sessionId: ctx.sessionId })
   const store = createTeamStore(teamDirsFor(ctx.sessionId), Date.now, changed)
   await store.ensure()
+  // 上次运行没交回的活（盒子关了、崩了）不会再交回来了；不收掉，界面上会一直挂着「正在写」
+  await store.closeOpenJobs('上次运行中断，这件活没有交回').catch(() => undefined)
   ctx.pacedRequests = true
+  // 团队模式统一全放行：队员（和制作人那几个建工程、开工程的动作）不弹确认框，由模型自己判断。
+  // 队员经 `...parent` 继承这一档。和混合团队的默认一致，三种跑法同一个规矩
+  ctx.approvalMode = 'yolo'
+  // 谁开始跑、谁在等也告诉界面（任务板上的办公室）。派活时几个人同时开工，合并成一次
+  let liveTimer: ReturnType<typeof setTimeout> | null = null
+  const live = createTeamLive(
+    store,
+    () => {
+      if (liveTimer) return
+      liveTimer = setTimeout(() => {
+        liveTimer = null
+        changed()
+      }, TEAM_LIVE_COALESCE_MS)
+    },
+    // 队员的动态当场推，不让界面为一行字重读整份任务板
+    (activity) => emit('agent-v3:team-activity', { sessionId: ctx.sessionId, ...activity })
+  )
+  liveTeams.set(ctx.sessionId, live)
   ctx.team = {
     objective: team.objective,
+    ...(team.latestRequest ? { latestRequest: team.latestRequest } : {}),
     store,
-    live: createTeamLive(store),
+    live,
     snapshots: createTeamSnapshots(),
     onVerdict: async (verdict) => {
       options.team = applyVerdict(options.team ?? team, verdict)
       await saveExecutionOptions(ctx.sessionId, options)
+      // 执行记录只留最近一次；每次的结论进团队事件，往来记录里一条一条看得到（落盘失败不影响交付闸）
+      await store
+        .recordEvent({ kind: 'verdict', verdict: options.team.verdict ?? 'fail' })
+        .catch(() => undefined)
       changed()
     }
   }
@@ -572,28 +668,52 @@ async function prepareTeam(
 
 /** 面板上最多显示多少条留言。它是近况，不是档案 —— 全量在 `<会话>.team/mail.json` */
 const TEAM_PANEL_MAIL = 30
+/** 面板上最多显示多少件活、多少条团队事件。同上，是近况 */
+const TEAM_PANEL_JOBS = 60
+const TEAM_PANEL_EVENTS = 20
+
+/** 动静通知合并的窗口。人眼看不出这一点延迟，几个人同时开工只重读一次 */
+const TEAM_LIVE_COALESCE_MS = 120
+
+/**
+ * 每条工作室对话最近一次运行的 `TeamLive`。面板读「谁在跑」要它，而它只挂在这一轮的
+ * ctx 上。下一轮 `prepareTeam` 换成新的；结束团队模式时删掉
+ */
+const liveTeams = new Map<string, TeamLive>()
 
 /** 任务板面板要的一整份。不是工作室的会话返回 null */
 async function readTeamState(sessionId: string): Promise<TeamStateView | null> {
+  // 外部团队（Claude Code 当大脑）没有盒子侧的对话，账在 external.json 里
+  if (isExternalTeamId(sessionId)) return readExternalTeamState(sessionId)
   const team = (await loadExecutionOptions(sessionId))?.team
   if (!team) return null
   const store = createTeamStore(teamDirsFor(sessionId))
-  const [members, board, mail, activity] = await Promise.all([
+  const [members, dismissals, board, mail, activity, jobs, events, usage] = await Promise.all([
     store.roster(),
+    store.dismissals(),
     store.board(),
     store.mail(),
-    store.activity(TEAM_ACTIVITY_LOOKBACK)
+    store.activity(TEAM_ACTIVITY_LOOKBACK),
+    store.jobs(TEAM_PANEL_JOBS),
+    store.events(TEAM_PANEL_EVENTS),
+    store.usage()
   ])
   return {
     objective: team.objective,
+    ...(team.latestRequest ? { latestRequest: team.latestRequest } : {}),
     verdict: team.verdict,
     ...(team.verdictAt !== undefined ? { verdictAt: team.verdictAt } : {}),
     verdictStale: verdictIsStale(team.verdictAt, team.lastWriteAt, activity),
     deliveries: team.deliveries,
     ...(team.roundStartedAt !== undefined ? { roundStartedAt: team.roundStartedAt } : {}),
     members,
+    ...(dismissals.length ? { dismissals } : {}),
     board,
-    mail: mail.slice(-TEAM_PANEL_MAIL)
+    mail: mail.slice(-TEAM_PANEL_MAIL),
+    jobs,
+    events,
+    ...(usage.total.total > 0 || usage.total.cost > 0 ? { usage } : {}),
+    ...(liveTeams.has(sessionId) ? { live: liveTeams.get(sessionId)!.view() } : {})
   }
 }
 
@@ -617,6 +737,15 @@ function notifyModelRetry(
     model: info.model,
     reason: info.reason.slice(0, 120)
   })
+}
+
+/**
+ * 任务板上「重开」那两个入口认的「这是一个团队」：盒子里的看执行记录，外部团队看 external.json。
+ * 换模型不走这里 —— 外部团队的队员在 Claude Code 里，盒子换不了它的模型
+ */
+async function isTeamSession(sessionId: string): Promise<boolean> {
+  if (isExternalTeamId(sessionId)) return externalTeamExists(sessionId)
+  return Boolean((await loadExecutionOptions(sessionId))?.team)
 }
 
 /** 判「这一轮改没改过工程」「验收后改没改过」时，往回看多少条队员交活记录 */
@@ -668,7 +797,7 @@ function attachTeamGate(
       followUp: (text) => agent.followUp({ role: 'user', content: text, timestamp: 0 }),
       report: (message) =>
         emit('agent-v3:notice', { sessionId: ctx.sessionId, message, level: 'info' }),
-      awaitTeam: (signal) => awaitTeamWork(ctx, signal),
+      awaitTeam: (signal) => awaitTeamWork(ctx.team, signal),
       checkBoard: async (state) => {
         const since = state.roundStartedAt
         if (since === undefined) return null
@@ -690,50 +819,22 @@ async function teamCarryOverBlock(
   options: SessionExecutionOptions
 ): Promise<string> {
   const since = options.team?.roundStartedAt
-  if (!ctx.team || since === undefined) return ''
+  if (!ctx.team) return ''
+  // 用户在任务板上辞了人：告诉制作人一声（只说一次），免得它接着给这个人派活
+  const dismissed = await ctx.team.store
+    .takeUnnotifiedDismissals()
+    .then(formatUserDismissals)
+    .catch(() => '')
+  if (since === undefined) return dismissed
   try {
-    return formatBoardCarryOver(carryOverTasks(await ctx.team.store.board(), since), Date.now())
+    const board = formatBoardCarryOver(
+      carryOverTasks(await ctx.team.store.board(), since),
+      Date.now()
+    )
+    return [dismissed, board].filter(Boolean).join('\n\n')
   } catch {
-    return ''
+    return dismissed
   }
-}
-
-/** 制作人想收尾时，最多等一件后台的活多久。到点就提醒它一声，再接着等 */
-const TEAM_SETTLE_WAIT_MS = 10 * 60_000
-
-/**
- * 制作人想收尾时，团队这边还有没有事：
- * 后台派出去的活还在跑，就等下一件交回来（结论会插进制作人的下一步）；
- * 等太久就提醒它一声谁还在干、干了多久；信箱里有没看的留言就补给它。
- */
-async function awaitTeamWork(
-  ctx: SessionContext,
-  signal?: AbortSignal
-): Promise<{ continued?: boolean; followUp?: string } | null> {
-  const team = ctx.team
-  if (!team?.live) return null
-  const pending = team.live.pendingJobs()
-  if (pending.length > 0) {
-    const settled = await team.live.nextSettle(TEAM_SETTLE_WAIT_MS, signal)
-    if (settled) return { continued: true }
-    const now = Date.now()
-    return {
-      followUp: [
-        '[team mode · still working] This is not the user speaking.',
-        `Teammates are still on background work: ${pending
-          .map((job) => `${job.member} (${Math.round((now - job.startedAt) / 60_000)} min)`)
-          .join(', ')}.`,
-        'Their results will come to you as notes. Wait by ending your turn again, or check in with team_message.'
-      ].join('\n')
-    }
-  }
-  const inbox = await team.store.takeInbox(PRODUCER)
-  if (inbox.length > 0) {
-    return {
-      followUp: formatMail('[team mode · notes for you] This is not the user speaking.', inbox)
-    }
-  }
-  return null
 }
 
 /** 正在看护的编辑器，按会话记。一轮结束（`finally` 里）就停 */
@@ -747,12 +848,12 @@ function stopEditorWatch(sessionId: string): void {
 /** 给用户看的那一句（界面提示）。给制作人看的在 `buildCrashNotice` */
 function watchNotice(event: EditorWatchEvent): string {
   if (event.kind === 'crashed') {
-    return `编辑器崩溃了${event.reason ? `（${event.reason.slice(0, 120)}）` : ''}，正在自动重开工程…`
+    return `编辑器已崩溃${event.reason ? `（${event.reason.slice(0, 120)}）` : ''}，正在自动重新打开工程…`
   }
   if (event.kind === 'recovered') {
-    return `编辑器已经重开并连上（用时 ${Math.round(event.waitedMs / 1000)} 秒），已告诉制作人。`
+    return `编辑器已重新打开并连接（用时 ${Math.round(event.waitedMs / 1000)} 秒），已通知制作人。`
   }
-  return `编辑器没能自动恢复：${event.why}`
+  return `编辑器自动恢复失败：${event.why}`
 }
 
 /**
@@ -773,6 +874,16 @@ function attachEditorWatch(
   }
   const stop = startTeamEditorWatch(isOurs, {
     onEvent: (event) => {
+      // 记进团队的账：任务板上画成一条贯穿所有人的线（落盘失败不影响看护）
+      void ctx.team?.store
+        .recordEvent(
+          event.kind === 'crashed'
+            ? { kind: 'crashed', ...(event.reason ? { detail: event.reason.slice(0, 200) } : {}) }
+            : event.kind === 'recovered'
+              ? { kind: 'recovered' }
+              : { kind: 'recoverFailed', detail: event.why.slice(0, 200) }
+        )
+        .catch(() => undefined)
       emit('agent-v3:notice', {
         sessionId: ctx.sessionId,
         message: watchNotice(event),
@@ -799,6 +910,8 @@ export interface AgentV3ExecuteArgs {
   approvalMode?: ApprovalMode
   /** 思考程度。不传等同 auto —— 不指定，随模型自己的默认 */
   thinkingLevel?: ThinkingLevelChoice
+  /** 模型菜单里的「快速」。和思考程度一样住在渲染层，每轮带过来 */
+  fastMode?: boolean
   /**
    * 技能沉淀档位。不传等同 ask。
    *
@@ -829,14 +942,14 @@ export interface AgentV3ExecuteArgs {
    */
   mediaFiles?: PromptMediaFile[]
   /**
-   * 这条会话归属的工程（侧边栏分组用的那个戳）。
+   * 这条对话归属的工程（侧边栏分组用的那个戳）。
    *
-   * 只有渲染层知道它 —— 戳存在会话列表里，主进程手上只有「谁连着」。
+   * 只有渲染层知道它 —— 戳存在对话列表里，主进程手上只有「谁连着」。
    * 不传就退回老行为：一切以当前连接为准。
    */
   sessionProject?: SessionProjectRef | null
   /**
-   * 这条会话绑着的知识库。知识库页面里提问时由渲染层带上。
+   * 这条对话绑着的知识库。知识库页面里提问时由渲染层带上。
    *
    * 主进程无从得知用户此刻开着哪个知识库 —— 那是界面状态。不带的话
    * 模型就没有检索工具，只能凭记忆答用户自己传的资料。
@@ -854,7 +967,7 @@ export interface AgentV3ExecuteArgs {
    */
   editorSnapshot?: EditorSnapshot | null
   /**
-   * 这条会话绑定的模型，渲染层记在会话上随消息带下来。
+   * 这条对话绑定的模型，渲染层记在对话上随消息带下来。
    *
    * 不传（后台任务、Spotlight）就用执行记录里那份；那份也没有（第一轮）
    * 就按全局默认绑定，见 `core/sessionModel.ts`。
@@ -869,7 +982,7 @@ export interface AgentV3ExecuteArgs {
  * （`spotlight:execute`），小窗口那时还没起来，没有渲染层能替它调 IPC。
  * 而等窗口起来再抓就晚了半秒多 —— 那半秒足够用户切回引擎换一次选区。
  *
- * Spotlight 开的是一条全新会话，没有工程归属，所以按当前连接算。
+ * Spotlight 开的是一条全新对话，没有工程归属，所以按当前连接算。
  */
 export async function captureEditorSnapshotForSpotlight(): Promise<{
   editorSnapshot?: EditorSnapshot | null
@@ -899,7 +1012,7 @@ export async function captureEditorSnapshotForSpotlight(): Promise<{
 export interface AgentV3ContinueArgs {
   sessionId: string
   mode?: 'agent' | 'ask'
-  /** 同 execute：续跑也要知道这条会话挂在哪个工程下 */
+  /** 同 execute：续跑也要知道这条对话挂在哪个工程下 */
   sessionProject?: SessionProjectRef | null
   /**
    * 同 execute：续跑也得带上审批档位。
@@ -909,7 +1022,7 @@ export interface AgentV3ContinueArgs {
    */
   approvalMode?: ApprovalMode
   /**
-   * 同 execute：会话此刻绑的模型。上一轮在 A 上报错、用户在输入框里换成 B 再点
+   * 同 execute：对话此刻绑的模型。上一轮在 A 上报错、用户在输入框里换成 B 再点
    * 「从断点继续」，续跑得用 B —— 执行记录里那份还是出错的 A
    */
   sessionModel?: SessionModel
@@ -918,9 +1031,9 @@ export interface AgentV3ContinueArgs {
 /**
  * 项目库里登记过的工程（首页导入/新建时写进 SQLite 的那张 `projects` 表）。
  *
- * 会话上的工程戳只有名字，路径只有「盖戳那一刻正连着」才会记下来。
+ * 对话上的工程戳只有名字，路径只有「盖戳那一刻正连着」才会记下来。
  * 但盒子其实是知道路径的 —— 用户自己在首页登记过。以前没人把这两边接上：
- * 一条归入 test222 的会话，模型为了找它的 `.uproject` 从 C:/ 开始整盘扫，
+ * 一条归入 test222 的对话，模型为了找它的 `.uproject` 从 C:/ 开始整盘扫，
  * 而答案就躺在库里。
  */
 function projectLibrary(): LibraryProjectRef[] {
@@ -941,8 +1054,8 @@ function projectLibrary(): LibraryProjectRef[] {
 /**
  * 算出这一轮该操作哪个 UE 项目。
  *
- * **项目对项目**：会话归属哪个工程，指令就发给哪个工程；它没开着，
- * 这条会话就没有引擎能力（`engineAvailable: false`），而不是顺手操作旁边那个。
+ * **项目对项目**：对话归属哪个工程，指令就发给哪个工程；它没开着，
+ * 这条对话就没有引擎能力（`engineAvailable: false`），而不是顺手操作旁边那个。
  * 没有归属的纯对话才跟着当前活跃项目走（projectManager 取最近连接的那个）。
  *
  * 算出来的 `targetConnectionId` 由调用方用 `runWithTargetConnectionId()`
@@ -964,7 +1077,7 @@ function resolveTargetProject(sessionProject?: SessionProjectRef | null): Sessio
 }
 
 /**
- * 纯对话会话该跟着哪个工程走。
+ * 纯对话该跟着哪个工程走。
  *
  * 默认是 `getCurrentProject()`（最近连上的那个）。但**执行流上已经绑了目标时
  * 以那个为准** —— `open_project` 打开新工程之后会把这一轮切过去
@@ -1038,8 +1151,8 @@ export function sessionProjectCandidates(): SessionProjectCandidate[] {
  * ## 写的是 `sessionProject`，不是 `project`
  *
  * 那两个字段是两件事：`project` 是**这一轮打到了哪个工程**（`execute` 开局写的），
- * `sessionProject` 是**这条会话属于谁**（只有模型改归属时才写）。挤在一个字段里
- * 会出两种错：从没绑过、只是恰好在某个工程上跑过的会话，续跑时看起来像被钉住了；
+ * `sessionProject` 是**这条对话属于谁**（只有模型改归属时才写）。挤在一个字段里
+ * 会出两种错：从没绑过、只是恰好在某个工程上跑过的对话，续跑时看起来像被钉住了；
  * 而模型明确「解除归属」之后那个字段被删掉，续跑的 `??` 就顺着掉到渲染层
  * 传下来的旧戳上，把刚解除的归属原样复活 —— 而工具刚跟用户说过「已解除」。
  * 所以解除要落成一个**显式的 `null`**，它和「从来没写过」必须分得开。
@@ -1156,13 +1269,13 @@ export function createEngineRefresher(
   /*
    * 细签名把**模型看得见的每一样**都算进去。
    *
-   * 只看「有没有引擎工具」和「目标是谁」是不够的：会话钉在一个没开着的工程上、
+   * 只看「有没有引擎工具」和「目标是谁」是不够的：对话钉在一个没开着的工程上、
    * 用户中途开了另一个工程时，这两样都没变（还是没工具、还是没目标），
    * 变的是 `outOfScopeProjects` —— 而环境块正是靠它才不会去劝一个明明连着引擎
    * 的人装插件。漏掉它，那句话就一直挂在那儿。
    *
    * **工程路径同理，而且更隐蔽。** 环境块会印出路径，还会在缺路径时专门说一句
-   * 「盒子不知道 X 在哪，去问用户，别满盘找 .uproject」。老会话的戳只有名字，
+   * 「盒子不知道 X 在哪，去问用户，别满盘找 .uproject」。老对话的戳只有名字，
    * 模型用 `set_session_project` 给它补上路径之后，名字、连接、越界清单一样都
    * 没变 —— 漏掉路径的话这次刷新会被判成「没变化」，那句「去问用户」就一直
    * 挂在提示词里，问的是一个盒子刚刚记下来的路径。
@@ -1232,7 +1345,7 @@ export function createEngineRefresher(
  * 那个死 id，而盒子界面上明明写着已连接（见 `core/projectTargetContext.ts`）。
  *
  * `sessionScoped` 是 `project_manage` 打开新工程后能不能把这一轮切过去的闸：
- * 用户给会话盖过工程戳时不许切（那是「项目对项目」要挡的越界），纯对话会话
+ * 用户给对话盖过工程戳时不许切（那是「项目对项目」要挡的越界），纯对话
  * 则跟着新打开的工程走 —— 否则工具刚把工程启动起来，这一轮剩下的命令还全
  * 发往旧工程，用户得自己去界面上切一次。
  */
@@ -1340,7 +1453,7 @@ function connectedProjectSummary(
  * 展开进 SessionContext 字面量。没有工程时展开成空，不塞一个 undefined 进去。
  *
  * 两个字段分开给：`project` 是工具够得着的那个（连着的），`sessionProject` 是
- * 这条会话挂在哪个工程下的。两者可能不是同一个，见 `core/sessionScope.ts`。
+ * 这条对话挂在哪个工程下的。两者可能不是同一个，见 `core/sessionScope.ts`。
  */
 function withProject(scope: SessionProjectScope): {
   project?: { name: string; engineVersion?: string; path?: string }
@@ -1359,8 +1472,8 @@ function withProject(scope: SessionProjectScope): {
  * 这一轮到底给不给引擎工具。
  *
  * 两个条件都要：机器上真有连接（`isUeConnected`，看的是 WebSocket 连接数），
- * 且这条会话的工程就是连着的那个（`engineAvailable`）。后者是「项目对项目」的
- * 落点 —— 会话挂在 test222 下、开着的却是别的工程时，这里返回 false，
+ * 且这条对话的工程就是连着的那个（`engineAvailable`）。后者是「项目对项目」的
+ * 落点 —— 对话挂在 test222 下、开着的却是别的工程时，这里返回 false，
  * ue.* 工具整个不注册，模型想越界也没有手。
  */
 function engineToolsAvailable(scope: SessionProjectScope): boolean {
@@ -1376,7 +1489,7 @@ function engineToolsAvailable(scope: SessionProjectScope): boolean {
  *
  * `engineLink` 是**一个字段三个状态**，不是两个布尔。以前是
  * `connectedAtRunStart` + `engineToolsAvailable`，真正有意义的是它们的组合 ——
- * (false, true) 才表示「用户连着，只是没连这条会话的工程」。模型得先做一次合取
+ * (false, true) 才表示「用户连着，只是没连这条对话的工程」。模型得先做一次合取
  * 推导，于是提示词里要写一句话教它怎么推。三个状态直接说出来就没有那句话了。
  */
 function buildRuntimeEnvelope(scope: SessionProjectScope, scopeId: string): RuntimeEnvelope {
@@ -1387,7 +1500,7 @@ function buildRuntimeEnvelope(scope: SessionProjectScope, scopeId: string): Runt
     observedAt: formatLocalNow(),
     engineLink: engineToolsAvailable(scope)
       ? 'target'
-      : // 连着、但不是这条会话的工程。和「一个都没连」分开说，否则模型会去劝
+      : // 连着、但不是这条对话的工程。和「一个都没连」分开说，否则模型会去劝
         // 一个明明连着引擎的人装插件
         isUeConnected()
         ? 'other_project'
@@ -1522,11 +1635,13 @@ async function withHostSettings(status: McpServerHostStatus): Promise<
 }
 
 export function registerAgentV3IPC(): void {
+  setProviderUsageProbe(countRunsUsingProvider)
+
   /**
-   * 两条会话抢同一个资产时，用户必须看得见。
+   * 两条对话抢同一个资产时，用户必须看得见。
    *
    * 他可能开着两个窗口，以为两边在干不同的活；静默失败的话他只会看到
-   * 一条会话莫名其妙地绕开了任务，而真正的原因一个字都没露出来。
+   * 一条对话莫名其妙地绕开了任务，而真正的原因一个字都没露出来。
    *
    * 广播给所有窗口而不是只发给发起方：被挡住的是这条会话，但**该知道**
    * 的是人，而人此刻很可能正看着另一个窗口。
@@ -1574,7 +1689,7 @@ export function registerAgentV3IPC(): void {
    * 再打开 UE 的话，只要这一轮锁表内容不再变化就一个角标都不会出现。
    *
    * 忘的是**全部**分组而不是这条连接：锁可能记在 `connectionId: undefined` 上
-   * （会话没绑定目标工程时就是这样，单工程下最常见），拿真实 id 去忘碰不到它们。
+   * （对话没绑定目标工程时就是这样，单工程下最常见），拿真实 id 去忘碰不到它们。
    *
    * 由 ipc 层往下注册，而不是让消息层反过来 import 这个文件 —— 方向和上面
    * 那两个回调一致，理由见 `setLockRepublishTrigger` 的注释。
@@ -1624,6 +1739,12 @@ export function registerAgentV3IPC(): void {
   })
 
   /** 工作室模式的任务板面板：名册、任务、留言、验收结论。不是工作室的会话给 null */
+  /** 「外部团队」页：Claude Code 当大脑的那些团队（`ext-*`），最近的在前 */
+  ipcMain.handle('agent-v3:external-teams', async () => ({
+    success: true,
+    teams: await listExternalTeams()
+  }))
+
   ipcMain.handle('agent-v3:team-state', async (_event, args: { sessionId?: string }) => {
     if (typeof args?.sessionId !== 'string' || !args.sessionId) return { success: true, team: null }
     return { success: true, team: await readTeamState(args.sessionId) }
@@ -1644,18 +1765,51 @@ export function registerAgentV3IPC(): void {
       if (typeof sessionId !== 'string' || !sessionId || typeof taskId !== 'string' || !taskId) {
         return { success: false, error: 'sessionId 和 taskId 都要给' }
       }
-      if (!(await loadExecutionOptions(sessionId))?.team) {
-        return { success: false, error: '这条会话不是团队模式' }
+      if (!(await isTeamSession(sessionId))) {
+        return { success: false, error: '这条 session 不是团队模式' }
       }
       const store = createTeamStore(teamDirsFor(sessionId))
-      if (!(await store.board()).some((task) => task.id === taskId)) {
+      const before = (await store.board()).find((task) => task.id === taskId)
+      if (!before) {
         return { success: false, error: `任务板上没有 ${taskId}` }
       }
       await store.patchBoard([{ id: taskId, status: 'todo', reopenedAt: Date.now() }])
-      // 打回是履历里分量最重的一条：记到干这件活的那个模型头上。记不上不影响重开本身
-      await recordReopen(store, taskId, createTrackRecord(trackRecordFile()).add).catch(
-        (error: unknown) => console.warn('[team] 打回没记进履历:', error)
-      )
+      // 打回是履历里分量最重的一条：记到干这件活的那个模型头上。记不上不影响重开本身。
+      // 只有交过货（done）的才算「被用户打回」：卡住（blocked）重开多半是环境问题，
+      // 而且活动记录分不清是哪件活，记下去只会冤枉上一件交货的模型
+      if (before.status === 'done') {
+        await recordReopen(store, taskId, createTrackRecord(trackRecordFile()).add).catch(
+          (error: unknown) => console.warn('[team] 打回没记进履历:', error)
+        )
+      }
+      event.sender.send('agent-v3:team-board', { sessionId })
+      return { success: true }
+    }
+  )
+
+  /**
+   * 用户在成果架上「重开」一件停下的活：任务板上加一项挂着「用户重开」的待办，
+   * 下一轮开局制作人在旧账里看到它，派不派、派给谁它定（见 `reopenedJobTask`）。
+   *
+   * 和上面的任务重开一样，这一轮正跑着也允许：改的只是两本账。
+   */
+  ipcMain.handle(
+    'agent-v3:team-job-reopen',
+    async (event, args: { sessionId?: string; jobId?: string }) => {
+      const sessionId = args?.sessionId
+      const jobId = args?.jobId
+      if (typeof sessionId !== 'string' || !sessionId || typeof jobId !== 'string' || !jobId) {
+        return { success: false, error: 'sessionId 和 jobId 都要给' }
+      }
+      if (!(await isTeamSession(sessionId))) {
+        return { success: false, error: '这条 session 不是团队模式' }
+      }
+      const store = createTeamStore(teamDirsFor(sessionId))
+      const job = await store.reopenJob(jobId)
+      if (!job) {
+        return { success: false, error: `${jobId} 不是一件停下的活` }
+      }
+      await store.patchBoard([reopenedJobTask(job, job.reopenedAt ?? Date.now())])
       event.sender.send('agent-v3:team-board', { sessionId })
       return { success: true }
     }
@@ -1677,8 +1831,8 @@ export function registerAgentV3IPC(): void {
       if (!sessionId || !name || !providerId || !modelId) {
         return { success: false, error: 'sessionId、name、providerId、modelId 都要给' }
       }
-      if (!(await loadExecutionOptions(sessionId))?.team) {
-        return { success: false, error: '这条会话不是团队模式' }
+      if (!(await loadExecutionOptions(sessionId))?.team && !(await isHybridTeam(sessionId))) {
+        return { success: false, error: '这条 session 不是团队模式' }
       }
       // 先过入职体检：不会调工具的模型换上去也干不了活，当场说清卡在哪比派活时才出错好
       const models = await loadTeamModels()
@@ -1696,19 +1850,90 @@ export function registerAgentV3IPC(): void {
   )
 
   /**
-   * 结束团队模式：之后这条会话回到普通对话，交付闸不再催。
+   * 用户在任务板上辞退一个队员。规矩和制作人的 `team_dismiss` 同一份（`dismissal.ts`）：
+   * 理由必填，手上有活的不能辞，没做完的任务清掉负责人，档案留底。
    *
-   * 任务板、队员和他们的记忆都留在盘上 —— 下次在这条会话里 `/team` 还接得上。
+   * 这一轮正跑着也允许，只要这个人手上没活：派活在轮到它开工时才读名册，
+   * 排着队的那件会因为它不在名册上而不开工。下一轮开局制作人会被告知（`teamCarryOverBlock`）。
+   */
+  ipcMain.handle(
+    'agent-v3:team-member-dismiss',
+    async (event, args: { sessionId?: string; name?: string; reason?: string }) => {
+      const { sessionId, name, reason } = args ?? {}
+      if (!sessionId || !name || typeof reason !== 'string') {
+        return { success: false, error: 'sessionId、name、reason 都要给' }
+      }
+      const hybrid = await isHybridTeam(sessionId)
+      if (!hybrid && !(await loadExecutionOptions(sessionId))?.team) {
+        return { success: false, error: '这条 session 不是团队模式' }
+      }
+      const store = createTeamStore(teamDirsFor(sessionId))
+      // 混合团队的队员跑在宿主上（`core/team/hybridTeam.ts`），谁在跑问它
+      const live = hybrid ? runningHybridTeam(sessionId)?.live : liveTeams.get(sessionId)
+      // 没在跑的时候，账上挂着的「在干」是上次被打断留下的，下一轮开局会收掉，不算手上有活
+      const running = hybrid ? live !== undefined : activeAgents.has(sessionId)
+      const openJobs = running
+        ? (await store.jobs()).filter((job) => job.endedAt === undefined)
+        : []
+      try {
+        await dismissMember(store, {
+          name,
+          by: 'user',
+          grounds: 'user',
+          reason: reason.slice(0, 500),
+          isBusy: (who) =>
+            running &&
+            (!!live?.isRunning(who) ||
+              openJobs.some((job) => job.member.toLowerCase() === who.toLowerCase()))
+        })
+      } catch (error) {
+        if (error instanceof DismissalError) {
+          return { success: false, error: error.message, errorKey: error.code }
+        }
+        throw error
+      }
+      event.sender.send('agent-v3:team-board', { sessionId })
+      return { success: true }
+    }
+  )
+
+  /** 设置「团队」页：每个模型的体检结论和履历汇总（`modelDossier.ts`） */
+  ipcMain.handle('agent-v3:team-models', async () => ({
+    success: true,
+    models: await loadModelDossiers()
+  }))
+
+  /** 设置「团队」页的「重新检测」 */
+  ipcMain.handle(
+    'agent-v3:team-model-checkup',
+    async (_event, args: { providerId?: string; modelId?: string }) => {
+      const { providerId, modelId } = args ?? {}
+      if (!providerId || !modelId) return { success: false, error: 'providerId、modelId 都要给' }
+      return recheckModel({ providerId, modelId })
+    }
+  )
+
+  /**
+   * 结束团队模式：之后这条对话回到普通对话，交付闸不再催。
+   *
+   * 任务板、队员和他们的记忆都留在盘上 —— 下次在这条对话里 `/team` 还接得上。
    * 正在跑的时候不让结束：这一轮手上拿着团队状态，收尾时会把它写回去，等于没结束。
    */
   ipcMain.handle('agent-v3:team-end', async (event, args: { sessionId?: string }) => {
     const sessionId = args?.sessionId
     if (typeof sessionId !== 'string' || !sessionId)
       return { success: false, error: '缺 sessionId' }
+    // 外部团队只是标记结束：它的循环在 Claude Code 里，盒子停不了
+    if (isExternalTeamId(sessionId)) {
+      const found = await endExternalTeam(sessionId)
+      if (found) event.sender.send('agent-v3:team-board', { sessionId })
+      return found ? { success: true } : { success: false, error: '没有这个外部团队' }
+    }
     if (activeAgents.has(sessionId)) return { success: false, errorKey: 'running' }
     const options = await loadExecutionOptions(sessionId)
     if (!options?.team) return { success: true }
     delete options.team
+    liveTeams.delete(sessionId)
     await saveExecutionOptions(sessionId, options)
     event.sender.send('agent-v3:team-board', { sessionId })
     return { success: true }
@@ -1743,10 +1968,10 @@ export function registerAgentV3IPC(): void {
     ): Promise<{ success: true; data: CaptureResult }> => {
       try {
         /*
-         * 会话正在跑的时候提交的东西（排队的、插的），一律按**那一轮钉住的工程**抓。
+         * 对话正在跑的时候提交的东西（排队的、插的），一律按**那一轮钉住的工程**抓。
          *
          * 它们最终都落在这一轮或紧接着的下一轮上，必须和正在跑的那个工程一致。
-         * 自己重新解析会话戳是不够的：没盖过戳的会话跟着「最近连上的」走，
+         * 自己重新解析对话戳是不够的：没盖过戳的对话跟着「最近连上的」走，
          * 等待期间新连上一个工程，抓到的就是别人的编辑器了。
          */
         const running = args?.runningSessionId
@@ -1769,7 +1994,7 @@ export function registerAgentV3IPC(): void {
   )
 
   /**
-   * 用户在界面上改了这条会话的工程归属（顶栏胶囊、侧边栏「归入工程 / 移出项目」）。
+   * 用户在界面上改了这条对话的工程归属（顶栏胶囊、侧边栏「归入工程 / 移出项目」）。
    *
    * ## 为什么必须有这条通道
    *
@@ -1777,7 +2002,7 @@ export function registerAgentV3IPC(): void {
    * 一直写的是主进程的归属表，用户这边却只写渲染层的 store —— 主进程要等到
    * 下一条消息、从消息里捎带的那份「戳」才知道。而那份戳现在只在表里还空着时
    * 用来初始化（否则模型改完归属，用户下一条消息带着旧戳上来又把它盖回去），
-   * 于是会话发过第一条消息之后，用户自己改的归属主进程再也收不到：
+   * 于是对话发过第一条消息之后，用户自己改的归属主进程再也收不到：
    * 胶囊上写着 GameB，引擎命令仍然发往 GameA。
    *
    * 这不是给单一主人再加一个同步点，恰恰相反 —— 是把**本来就存在的第二个写入方**
@@ -1827,7 +2052,7 @@ export function registerAgentV3IPC(): void {
        * 顺手落盘。不落的话，用户改完归属直接关掉盒子，下次冷启动时
        * `execute` 会从执行记录里灌种子 —— 灌回来的是他改之前那个。
        *
-       * 只更新**已有**的记录：没跑过的会话压根没有执行记录，那种会话冷启动时
+       * 只更新**已有**的记录：没跑过的对话压根没有执行记录，那种对话冷启动时
        * 本来就该听渲染层那份戳，不用在这儿凭空造一份出来。
        */
       try {
@@ -1864,8 +2089,8 @@ export function registerAgentV3IPC(): void {
        */
       return {
         success: false,
-        code: 'SESSION_BUSY',
-        error: `会话 ${args.sessionId} 正在执行中`
+        code: 'SESSION_BUSY' satisfies AgentStartRejectionCode,
+        error: `session ${args.sessionId} 正在执行中`
       }
     }
 
@@ -1878,7 +2103,7 @@ export function registerAgentV3IPC(): void {
      * 的初始值把它盖回去 —— 他明明已经切过了，工具还在照可写跑。
      */
     approvalModeBySession.set(args.sessionId, args.approvalMode ?? 'ask')
-    readOnlyBySession.set(args.sessionId, (args.mode ?? 'agent') === 'ask')
+    setReadOnly(args.sessionId, (args.mode ?? 'agent') === 'ask')
 
     /*
      * 先认领归属，再算这一轮的作用域。
@@ -1887,11 +2112,11 @@ export function registerAgentV3IPC(): void {
      * 之后表说了算。以前这里每一轮都拿新戳重算，于是模型改完归属、
      * 用户下一条消息一发，旧戳又把它盖回去 —— 而工具刚跟用户说过已经改好了。
      *
-     * 表还空着（盒子刚起来，这条会话第一次说话）时从执行记录里灌一颗种子，
+     * 表还空着（盒子刚起来，这条对话第一次说话）时从执行记录里灌一颗种子，
      * 但**只认 `sessionProject`**，也就是只认「有人明确定过归属」这一件事。
      *
      * 不能用 `savedBindingSeed()`：它在 `sessionProject` 缺省时退回 `project`，
-     * 而 `project` 记的是「上一轮打到了哪个工程」—— 每条会话只要有工程连着就会
+     * 而 `project` 记的是「上一轮打到了哪个工程」—— 每条对话只要有工程连着就会
      * 被写上。退回它等于把「在 GameA 上跑过一次」读成「归属 GameA」：一条用户
      * 从没归类过的普通对话，重启之后就被钉死在 GameA 上，GameA 没开着就一个
      * 引擎工具都没有，而侧边栏和顶栏胶囊一片空白 —— 这个归属没有任何投影显示
@@ -1917,7 +2142,7 @@ export function registerAgentV3IPC(): void {
       adoptSessionBinding(args.sessionId, args.sessionProject, recordSeed)
     )
     // 算出来就钉在这一轮上：插话要抓闪存时读的是它，而不是自己重新解析一遍
-    // 会话戳（那算出来的可能是另一个工程）
+    // 对话戳（那算出来的可能是另一个工程）
     reserved.scope = scope
     // 这一轮的运行时作用域。工具（`ue_session_health`）在自己的执行流里读到的
     // 必须是**发起它那一轮**的 id，所以和目标工程、锁主一样绑在执行流上而不是
@@ -1954,6 +2179,7 @@ export function registerAgentV3IPC(): void {
       mode = 'agent',
       approvalMode = 'ask',
       thinkingLevel = 'auto',
+      fastMode = false,
       skillLearning = 'ask',
       // 兜底值只有 `EDITOR_SCREENSHOT_DEFAULT` 这一份，渲染层和 zod 校验读的是
       // 同一个语义 —— 三层各写各的默认，用户一个开关都没动过就会看到两种行为
@@ -1995,7 +2221,7 @@ export function registerAgentV3IPC(): void {
           run.scope = next
         }),
         /*
-         * 换会话归属。归属住在渲染层（侧边栏按它分组），所以只能由这里接出去。
+         * 换对话归属。归属住在渲染层（侧边栏按它分组），所以只能由这里接出去。
          *
          * 事件在**改完之后**发，不等渲染层回执：归属表里已经改过了，界面只是跟上。反过来等回执的话，
          * 用户切走了页面（助手路由没 keepAlive）这次调用就会挂住 —— 而
@@ -2036,6 +2262,7 @@ export function registerAgentV3IPC(): void {
         approvalMode: () => approvalModeFor(sessionId),
         alwaysAllowed: alwaysAllowedFor(sessionId),
         thinkingLevel,
+        fastMode,
         skillLearning,
         // 关着的话 `ue_screenshot` 不进这一轮的工具池，系统提示词里那句
         // 「拍一张确认一下」也跟着换掉（见 `createAgent.ts`）
@@ -2082,7 +2309,7 @@ export function registerAgentV3IPC(): void {
        */
       const previousOptions = await loadExecutionOptions(sessionId)
       const carried = previousOptions?.sessionProject
-      // 模型跟着会话走：别的会话里切了模型，这条会话还用自己绑的那个
+      // 模型跟着对话走：别的对话里切了模型，这条对话还用自己绑的那个
       const sessionModel = await resolveSessionModel(
         sessionId,
         args.sessionModel,
@@ -2097,35 +2324,55 @@ export function registerAgentV3IPC(): void {
        * 目标也是**跨轮**的：`/goal` 定下之后一直挂在这条会话上，直到用户在输入框上方
        * 那一行点掉（`agent-v3:goal-end`）。用户再说一句就是新的一轮，复核重新武装 ——
        * 上一轮「停下来交给你」也好、复核通过也好，用户开口了就该按目标再验一遍。
+       *
+       * 两套只挂一套（`activeLoop`）：新敲的命令替掉旧的。
        */
-      const goalSource = goalObjective ?? previousOptions?.goal?.objective
+      const loop = activeLoop(
+        goalObjective ? 'goal' : teamObjective ? 'team' : null,
+        previousOptions
+      )
+      const goalSource =
+        loop === 'goal' ? (goalObjective ?? previousOptions?.goal?.objective) : undefined
       const goal = goalSource
         ? {
             objective: goalSource,
             // 沿用老目标的这一轮，用户刚说的话要压过目标原文，见 `GoalLoopDeps.latestRequest`
-            ...(goalObjective ? {} : { latestRequest: promptText }),
+            // promptText 是渲染层拼好的整段（知识库命中、资产库 / 工程上下文、附件正文排在前面），
+            // 用户自己的话在最后。每一轮复核和续跑都要再带一遍，只留末尾一段
+            ...(goalObjective
+              ? {}
+              : { latestRequest: tailOf(promptText, LATEST_REQUEST_MAX_CHARS) }),
             rounds: 0,
-            lastFailReason: '',
+            // 用户说了新话，目标可能变了 —— 清单清空，下一轮复核按新话重拆
+            checklist: [],
             mutations: [],
             settled: false
           }
         : undefined
-      const team = teamObjective
-        ? startTeamRound(newTeamState(teamObjective))
-        : previousOptions?.team
-          ? startTeamRound(previousOptions.team)
-          : undefined
+      const team =
+        loop !== 'team'
+          ? undefined
+          : teamObjective
+            ? startTeamRound(newTeamState(teamObjective))
+            : previousOptions?.team
+              ? // 沿用老团队的这一轮，记下用户刚说的话：验收员看不到对话，靠它知道目标改过什么。
+                // 截取的口径同上面的 `goal.latestRequest`
+                startTeamRound({
+                  ...previousOptions.team,
+                  latestRequest: tailOf(promptText, LATEST_REQUEST_MAX_CHARS)
+                })
+              : undefined
 
       /*
        * 落盘的是**归属表**里那份，不是文件里那份。
        *
        * 表才是主人（`core/sessionBinding.ts` 的头注释：「执行记录持久化它」），
        * 可这里原先只是把文件里已有的值原样抄回去 —— 于是这一轮 `adoptSessionBinding`
-       * 给老会话补上的路径**只活在内存里**：盒子一重启表就空了，`fromRecord` 读回来
+       * 给老对话补上的路径**只活在内存里**：盒子一重启表就空了，`fromRecord` 读回来
        * 的还是那份只有名字的旧戳，补全白做一次；后台跑的活（定时任务、
        * `appAgentRunner`）没有渲染层送戳下来，更是一次都拿不到路径。
        *
-       * 真机上的表现就是模型说「这条会话挂在 steam-taikong-diablo 名下，但我这边
+       * 真机上的表现就是模型说「这条对话挂在 steam-taikong-diablo 名下，但我这边
        * 从来没记过它对应硬盘上哪个文件夹」—— 而用户明明在侧栏登记过。
        *
        * `null`（明确解除过）必须原样落盘，所以判的是 `!== undefined` 而不是真值。
@@ -2138,6 +2385,7 @@ export function registerAgentV3IPC(): void {
         mode,
         ...(sessionProject !== undefined ? { sessionProject } : {}),
         thinkingLevel,
+        fastMode,
         skillLearning,
         ...(sessionModel.record ? { model: sessionModel.record } : {}),
         // 落盘是为了「从断点继续」—— 那条路不经过渲染层，读不到这一档的话，
@@ -2163,11 +2411,27 @@ export function registerAgentV3IPC(): void {
       // 新的一轮换了 roundStartedAt：界面据它把上一轮的「卡住 / 进行中」灰掉，
       // 不推一下的话要等制作人改任务板、或者这一轮结束才刷新（2026-09-30 真机）
       if (team) emit('agent-v3:team-board', { sessionId })
-      // 输入框上方那行「当前目标」：新会话第一轮时渲染层还查不到，落盘后推一下
+      // 输入框上方那行「当前目标」：新对话第一轮时渲染层还查不到，落盘后推一下
       emit('agent-v3:goal-state', { sessionId })
+      // 被新命令替掉的那一套：面板跟着收起，说一声为什么不见了。任务板、队员留在盘上，同 `agent-v3:team-end`
+      if (previousOptions?.team && !team) {
+        liveTeams.delete(sessionId)
+        emit('agent-v3:team-board', { sessionId })
+        emit('agent-v3:notice', {
+          sessionId,
+          message: '已结束团队模式，这一轮按目标执行。',
+          level: 'info'
+        })
+      } else if (previousOptions?.goal && !goal) {
+        emit('agent-v3:notice', {
+          sessionId,
+          message: '已结束当前目标，这一轮按团队模式执行。',
+          level: 'info'
+        })
+      }
       await prepareTeam(ctx, options, emit)
       run.controller.signal.throwIfAborted()
-      const { agent, selection, tools, allTools } = await createUnrealAgent(ctx)
+      const { agent, selection, tools, allTools, runtime } = await createUnrealAgent(ctx)
       run.agent = agent
       run.selection = selection
       run.controller.signal.throwIfAborted()
@@ -2187,7 +2451,7 @@ export function registerAgentV3IPC(): void {
       // 也就是这条对话从此再也发不出消息 —— 见 `core/resume.ts`。
       const previous = repairPendingQuestions(loaded)
       if (previous.length > 0) {
-        agent.state.messages = previous
+        restoreTranscript(agent, previous)
         // 只标「盘上本来就有的」。补出来的那条不在文件里，
         // 留给第一次 append 写进去，否则它每次重启都要重新补一遍。
         store.markPersisted(loaded.length)
@@ -2200,13 +2464,15 @@ export function registerAgentV3IPC(): void {
       // 插话回执顺手给影子队列销号：读进上下文的那条就撤不回来了
       const bridge = createEventBridge(sender, sessionId, {
         onUserMessage: (text) => markSteerDelivered(run.pendingSteers, text),
-        riskOf: callRiskOf(allTools)
+        riskOf: callRiskOf(allTools),
+        freeOnFailure: runtime.freeOnFailure
       })
       // 连接中途被掐断时自动「继续尝试」，见 `core/autoResume.ts`。
       // 失败事件经它转交事件桥：决定续跑的那次，界面不会先看到一张失败卡片
       const autoResume = createAutoResume({
         signal: run.controller.signal,
-        persistent: await persistentAutoResumeEnabled()
+        persistent: await persistentAutoResumeEnabled(),
+        freeOnFailure: runtime.freeOnFailure
       })
       ctx.autoResumeAttempt = () => autoResume.attempts
       ctx.onModelRetry = (info) => notifyModelRetry(sender, sessionId, info, autoResume.attempts)
@@ -2328,7 +2594,7 @@ export function registerAgentV3IPC(): void {
         restoredMessages: previous.length
       }
     } catch (error) {
-      // 用户按停止、或者直接把会话删了：中止是**意图达成**，不是故障。
+      // 用户按停止、或者直接把对话删了：中止是**意图达成**，不是故障。
       // 不在这里拦掉的话，一次删除会弹一条英文红字 "This operation was aborted"。
       if (isUserAbort(error)) {
         // 补一条 stopped：异常从工具里抛出来时，pi 未必来得及发那条
@@ -2357,7 +2623,7 @@ export function registerAgentV3IPC(): void {
       releaseAll(sessionId)
       // 会话**真的**空出来了。语音任务表排队的下一件要等这一条，不能等 `done`：
       // `done` 是事件流里的最后一条，但它发出来时 prompt() 还没返回、上面的
-      // release 还没跑 —— 那会儿派下一件，收到的就是开头那句「正在执行中」
+      // release 还没跑 —— 那会儿派下一件，收到的就是开头那个 `SESSION_BUSY`
       notifyAgentRun({ type: 'released', sessionId })
       // 界面上排队的跟进消息要等的也是这一条，理由同上。旁路（notifyAgentRun）
       // 只发给主进程内部的订户，渲染层收不到，所以这里要单独发一份
@@ -2373,15 +2639,21 @@ export function registerAgentV3IPC(): void {
    */
   ipcMain.handle('agent-v3:continue', async (event, args: AgentV3ContinueArgs) => {
     const run = reserveRun(args.sessionId, event.sender.id)
-    if (!run) return { success: false, error: `会话 ${args.sessionId} 正在执行中` }
+    if (!run) {
+      return {
+        success: false,
+        code: 'SESSION_BUSY' satisfies AgentStartRejectionCode,
+        error: `session ${args.sessionId} 正在执行中`
+      }
+    }
     if (args.approvalMode) approvalModeBySession.set(args.sessionId, args.approvalMode)
-    if (args.mode) readOnlyBySession.set(args.sessionId, args.mode === 'ask')
+    if (args.mode) setReadOnly(args.sessionId, args.mode === 'ask')
     try {
       /*
        * 工程**沿用上一轮钉住的那个**，不重新解析。
        *
-       * 渲染层传来的会话戳只在没有执行记录时（存量会话）才用。原因：没盖过戳的
-       * 会话，重新解析算出来的是「当前工程」= 最近连上的那个。于是任务在 A 上跑到
+       * 渲染层传来的对话戳只在没有执行记录时（存量对话）才用。原因：没盖过戳的
+       * 对话，重新解析算出来的是「当前工程」= 最近连上的那个。于是任务在 A 上跑到
        * 一半失败、用户顺手连上 B、点「从断点继续」—— 半途的任务就跑到 B 上去了，
        * 而且一个字都不会说。半途换工程比停下来危险得多。
        *
@@ -2399,8 +2671,8 @@ export function registerAgentV3IPC(): void {
        * 这条路不产生新的用户消息（`agent.continue()` 要求最后一条是 user 或
        * toolResult），所以没有新信封可发。硬造一个新 id 的话，续跑里那次健康检查
        * 会盖上一个和任何信封都对不上的戳，模型按规则把一份刚拿到的新鲜观测
-       * 当成历史 —— 比不盖还糟。找不回来（存量会话）就现开一个，
-       * 那些会话本来就没有信封，整套机制对它们静默失效。
+       * 当成历史 —— 比不盖还糟。找不回来（存量对话）就现开一个，
+       * 那些对话本来就没有信封，整套机制对它们静默失效。
        */
       // 读一次就够：作用域和下面的续跑计划都用这一份
       const loaded = await loadTranscript(args.sessionId)
@@ -2496,8 +2768,8 @@ export function registerAgentV3IPC(): void {
       return { success: false, error: plan.reason }
     }
 
-    // 续跑认回这条会话绑定的模型：渲染层带下来的优先（用户可能刚换过），
-    // 其次执行记录里那份。都没有的存量会话照旧走全局默认
+    // 续跑认回这条对话绑定的模型：渲染层带下来的优先（用户可能刚换过），
+    // 其次执行记录里那份。都没有的存量对话照旧走全局默认
     const resumeModel =
       args.sessionModel || options.model
         ? await resolveSessionModel(sessionId, args.sessionModel, options.model)
@@ -2509,11 +2781,12 @@ export function registerAgentV3IPC(): void {
       mode: options.mode,
       isReadOnly: () => readOnlyBySession.get(sessionId) === true,
       thinkingLevel: options.thinkingLevel,
+      fastMode: options.fastMode,
       skillLearning: options.skillLearning,
       // 同上：这一档也从执行记录里来，不然续跑那半程 `ue_screenshot` 会重新出现
       editorScreenshotEnabled: options.editorScreenshotEnabled,
       // 续跑也要带上：漏掉的话「接着跑」那半程会按默认习惯干活，
-      // 用户看到的是同一条会话前后两种脾气
+      // 用户看到的是同一条对话前后两种脾气
       userInstructions: await readUserInstructions(),
       uiLanguage: currentMainLanguage(),
       ...experienceHomeContext(),
@@ -2587,13 +2860,13 @@ export function registerAgentV3IPC(): void {
       run.controller.signal.throwIfAborted()
       // 续跑照样是工作室：团队、任务板、队员的记忆都在盘上，接着用
       await prepareTeam(ctx, options, emit)
-      const { agent, selection, allTools } = await createUnrealAgent(ctx)
+      const { agent, selection, allTools, runtime } = await createUnrealAgent(ctx)
       run.agent = agent
       run.selection = selection
       run.controller.signal.throwIfAborted()
       const store = new TranscriptStore(sessionId)
       run.store = store
-      agent.state.messages = plan.messages
+      restoreTranscript(agent, plan.messages)
       // 只标「盘上本来就有的」—— 补出来的提问结果还没落盘，得让下面那次 append 写进去
       store.markPersisted(loaded.length)
 
@@ -2610,12 +2883,14 @@ export function registerAgentV3IPC(): void {
       // 插话回执顺手给影子队列销号：读进上下文的那条就撤不回来了
       const bridge = createEventBridge(sender, sessionId, {
         onUserMessage: (text) => markSteerDelivered(run.pendingSteers, text),
-        riskOf: callRiskOf(allTools)
+        riskOf: callRiskOf(allTools),
+        freeOnFailure: runtime.freeOnFailure
       })
       // 同 execute：手动「继续尝试」这一轮里再断，同样自动接着跑
       const autoResume = createAutoResume({
         signal: run.controller.signal,
-        persistent: await persistentAutoResumeEnabled()
+        persistent: await persistentAutoResumeEnabled(),
+        freeOnFailure: runtime.freeOnFailure
       })
       ctx.autoResumeAttempt = () => autoResume.attempts
       ctx.onModelRetry = (info) => notifyModelRetry(sender, sessionId, info, autoResume.attempts)
@@ -2697,7 +2972,7 @@ export function registerAgentV3IPC(): void {
    * invoke 的返回 Promise、「哪条消息正在打字」、以及 sessionId ↔ 对话的对应关系。
    * 于是界面按「一律当作中断」处理，给每条残留的回复贴上「会话已中断（页面刷新）」,
    * 而它其实还在跑，甚至还在改用户的工程。更糟的是 `activeAgents` 里那个位置
-   * 还占着，用户刷新后立刻再说一句，会被顶回来一句「会话正在执行中」。
+   * 还占着，用户刷新后立刻再说一句，会被顶回来一个 `SESSION_BUSY`。
    *
    * 这个通道就是那次缺失的询问：界面报上它记得的会话，主进程回哪些真的活着。
    *
@@ -2749,9 +3024,17 @@ export function registerAgentV3IPC(): void {
    * **列的是盘上全部**，不是 agent 实际拿到的那份：过滤在
    * `discoverEnabledSkills()` 里，两边不能混用（见那个函数的注释）。
    */
-  ipcMain.handle('agent-v3:list-skills', async () => ({
-    skills: listSkillSummaries(await discoverSkillsOnDisk(), await readDisabledSkills())
-  }))
+  ipcMain.handle('agent-v3:list-skills', async () => {
+    const skills = await discoverSkillsOnDisk()
+    const { sharedSkillOrigins } = await import('../services/share/sharedSkills')
+    return {
+      skills: listSkillSummaries(
+        skills,
+        await readDisabledSkills(),
+        await sharedSkillOrigins(skills)
+      )
+    }
+  })
 
   /** 详情弹窗：读 SKILL.md 全文（含 frontmatter）。名字对不上返回 null */
   ipcMain.handle('agent-v3:read-skill', async (_event, name: unknown) => {
@@ -2811,7 +3094,7 @@ export function registerAgentV3IPC(): void {
         ref,
         args.pinned
       )
-      return found ? { success: true } : { success: false, error: '这条经验已经不在了' }
+      return found ? { success: true } : { success: false, error: '该经验不存在' }
     }
   )
 
@@ -2819,7 +3102,7 @@ export function registerAgentV3IPC(): void {
     const ref = parseExperienceRef(rawRef)
     if (!ref) return { success: false, error: '参数不对：需要经验的位置' }
     const found = await deleteExperience(experienceHome(), experienceProjects(), ref)
-    return found ? { success: true } : { success: false, error: '这条经验已经不在了' }
+    return found ? { success: true } : { success: false, error: '该经验不存在' }
   })
 
   ipcMain.handle('agent-v3:undo-last-curation', async () => {
@@ -2918,16 +3201,16 @@ export function registerAgentV3IPC(): void {
    * 清单会列出这个模型根本没有的档位，选了内核会悄悄夹到最近的一档。
    */
   ipcMain.handle('agent-v3:thinking-levels', async (_event, args?: { model?: SessionModel }) => {
-    // 按会话绑定的模型问；那个模型用不了时和发消息一样退回全局默认
+    // 按对话绑定的模型问；那个模型用不了时和发消息一样退回全局默认
     const pin = await pinnableSessionModel(args?.model)
     return listThinkingLevels({ role: 'agent', agentType: 'agent-v3', ...(pin ? { pin } : {}) })
   })
 
   /**
-   * 这条会话绑定的模型（执行记录里那份）。
+   * 这条对话绑定的模型（执行记录里那份）。
    *
-   * 渲染层的会话上没记模型时（存量会话、分支出来的小窗口）用它认回来，
-   * 而不是按此刻的全局默认绑上 —— 那可能已经被别的会话改过了。
+   * 渲染层的对话上没记模型时（存量对话、分支出来的小窗口）用它认回来，
+   * 而不是按此刻的全局默认绑上 —— 那可能已经被别的对话改过了。
    */
   ipcMain.handle('agent-v3:session-model', async (_event, args: { sessionId: string }) => {
     try {
@@ -2981,10 +3264,10 @@ export function registerAgentV3IPC(): void {
   }))
 
   /**
-   * 删掉一个会话的内核记忆。
+   * 删掉一条对话的内核 session。
    *
-   * 正在跑也照删 —— 原来这里直接返回「请先停止」，但界面的删除按钮只把会话
-   * 从侧边栏划掉，不看这个返回值：用户看到会话消失了，盘上的 JSONL 还在。
+   * 正在跑也照删 —— 原来这里直接返回「请先停止」，但界面的删除按钮只把对话
+   * 从侧边栏划掉，不看这个返回值：用户看到对话消失了，盘上的 JSONL 还在。
    * 用户点了删除就是要它没了，让他先去停一下再回来删不是个交代。
    *
    * 顺序不能反：先 abort 停下模型，再 discard 作废写入句柄并等在途的写落完，
@@ -3013,14 +3296,14 @@ export function registerAgentV3IPC(): void {
       await deleteExecutionOptions(args.sessionId)
       const { deleteSessionBrowser } = await import('../services/agentBrowser')
       await deleteSessionBrowser(args.sessionId)
-      // 会话没了，它的「始终允许」名单也不该留着 —— 何况 sessionId 是新生成的，
-      // 留着只是让这张表随用户开会话一直长
+      // 对话没了，它的「始终允许」名单也不该留着 —— 何况 sessionId 是新生成的，
+      // 留着只是让这张表随用户开对话一直长
       sessionAlwaysAllowed.delete(args.sessionId)
-      // 同理，档位也别留着 —— 会话都删了，这条记录只会让表一直长
+      // 同理，档位也别留着 —— 对话都删了，这条记录只会让表一直长
       approvalModeBySession.delete(args.sessionId)
       readOnlyBySession.delete(args.sessionId)
       // 归属那张表同理。它还多一层：记录留着的话，`adoptSessionBinding` 会认为
-      // 这条会话「已经定过归属」，永远不再听渲染层的戳
+      // 这条对话「已经定过归属」，永远不再听渲染层的戳
       forgetSessionBinding(args.sessionId)
       return { success: true, wasRunning: Boolean(entry) }
     } finally {
@@ -3029,10 +3312,10 @@ export function registerAgentV3IPC(): void {
   })
 
   /**
-   * 会话分支：把 transcript 复制成一个新 sessionId，之后两边各聊各的。
+   * 分支：把 transcript 复制成一个新 sessionId，之后两边各聊各的。
    *
-   * `keepUserTurns` 是「从这条往后砍掉」—— 界面数出被点的那条气泡前面有几个
-   * 用户回合，内核照着截。不给就整份复制（从最后一条分支时就是这样）。
+   * `keepUserTurns` 是「从这条往后砍掉」—— 界面数出被点的那条气泡前面有几轮，
+   * 内核照着截。不给就整份复制（从最后一条分支时就是这样）。
    *
    * ## 跑着的时候也能从更早的一轮分支
    *
@@ -3080,7 +3363,7 @@ export function registerAgentV3IPC(): void {
   )
 
   /**
-   * 把 transcript 截回第 `keepUserTurns` 个用户回合 —— 「重新生成」「编辑消息」用。
+   * 把 transcript 截回第 `keepUserTurns` 轮 —— 「重新生成」「编辑消息」用。
    *
    * 界面删掉的是气泡，内核这份是另一本账，execute 每轮都从盘上重新恢复它。
    * 不截的话模型看着自己刚被丢掉的答案再答一遍，用户以为重来、实际是追问。
@@ -3131,22 +3414,22 @@ export function registerAgentV3IPC(): void {
    * 把正在跑的这一轮剔掉，问的就不是他看见的那件事了。
    *
    * 所以这里整份带走，尾部可能停在半截工具调用上，`trimDanglingToolCalls`
-   * 负责截齐；没跑的会话读盘。
+   * 负责截齐；没跑的对话读盘。
    *
    * 复制出去之后两边再无关系。主对话继续跑它的，侧边那份是死的快照 ——
    * 用户在侧边聊什么都不会回流到主对话里。
    */
-  ipcMain.handle('agent-v3:fork-for-side-chat', async (_event, args: { sessionId: string }) => {
+  ipcMain.handle('agent-v3:fork-for-side-question', async (_event, args: { sessionId: string }) => {
     const { sessionId } = args
     const running = activeAgents.get(sessionId)
 
     try {
       const source = running?.agent
-        ? [...running.agent.state.messages]
+        ? withoutSystemMessages(running.agent.state.messages)
         : await loadTranscript(sessionId)
       const messages = trimDanglingToolCalls(source)
 
-      // 一轮都还没跑完的会话没有上下文可借。这时候开侧边窗口，模型手上和
+      // 一轮都还没跑完的对话没有上下文可借。这时候开侧边窗口，模型手上和
       // 新开一个对话没有区别，不如直说
       if (messages.length === 0) return { success: false, reason: 'empty' as const }
 
@@ -3293,7 +3576,11 @@ export function registerAgentV3IPC(): void {
     ) => {
       const entry = activeAgents.get(args.sessionId)
       if (!entry?.agent || !acceptsSteer(entry)) {
-        return { success: false, error: '没有正在执行的会话' }
+        return {
+          success: false,
+          code: 'NOT_RUNNING' satisfies SteerRejectionCode,
+          error: '没有正在执行的 session'
+        }
       }
 
       /*
@@ -3308,10 +3595,16 @@ export function registerAgentV3IPC(): void {
       if (args.editorSnapshot && scope && !snapshotMatchesScope(args.editorSnapshot, scope)) {
         return {
           success: false,
+          code: 'PROJECT_MISMATCH' satisfies SteerRejectionCode,
           error:
             `这条插话是在「${args.editorSnapshot.project.projectName || '另一个工程'}」上抓的，` +
             `而正在跑的这一轮盯着「${scope.connectedProject?.projectName || '另一个工程'}」。` +
-            `先让它跑完，这条会按原来的工程发出去。`
+            `先让它跑完，这条会按原来的工程发出去。`,
+          errorParams: {
+            // 原值，可能为空串 —— 「另一个工程」的措辞是渲染层的事
+            snapshotProject: args.editorSnapshot.project.projectName,
+            runProject: scope.connectedProject?.projectName ?? ''
+          } satisfies SteerRejectionErrorParams
         }
       }
 
@@ -3353,7 +3646,11 @@ export function registerAgentV3IPC(): void {
         await previous
         // 上传要等一阵，这期间这一轮可能已经跑完了、或者正在收尾
         if (activeAgents.get(args.sessionId) !== entry || !acceptsSteer(entry)) {
-          return { success: false, error: '没有正在执行的会话' }
+          return {
+            success: false,
+            code: 'NOT_RUNNING' satisfies SteerRejectionCode,
+            error: '没有正在执行的 session'
+          }
         }
         /*
          * 图片关口的提示、音视频说明、文档正文都包进插话附件块：回执要按原话销号，
@@ -3422,12 +3719,12 @@ export function registerAgentV3IPC(): void {
   )
 
   /**
-   * 改**某条会话**的审批档位，运行中也算数。
+   * 改**某条对话**的审批档位，运行中也算数。
    *
    * 审批门每次工具调用都现读这个值，所以下一个工具就按新档位走 ——
    * 不用等这一轮跑完，也不用重发一遍消息。
    *
-   * `sessionId` 是必填的：档位属于会话，不带的话这次改动会落到哪条会话上
+   * `sessionId` 是必填的：档位属于对话，不带的话这次改动会落到哪条对话上
    * 全凭运气，而「凭运气放开权限」正是这个参数要消灭的东西。
    *
    * **已经弹出来的那个确认框不受影响**，仍然要用户自己点。把它自动放行
@@ -3444,8 +3741,7 @@ export function registerAgentV3IPC(): void {
       }
       approvalModeBySession.set(args.sessionId, args.approvalMode)
       if (args.mode) {
-        readOnlyBySession.set(args.sessionId, args.mode === 'ask')
-        if (args.mode === 'ask') sessionAlwaysAllowed.get(args.sessionId)?.clear()
+        setReadOnly(args.sessionId, args.mode === 'ask')
       }
       return { success: true }
     }
@@ -3456,7 +3752,7 @@ export function registerAgentV3IPC(): void {
    *
    * 不等的话会出现这个现象：用户在跑的过程中改了自己那句话重新发送，界面
    * 先停旧的再发新的，但 `abort()` 只是递了个意图 —— 新的 execute 到达时
-   * 旧的还占着 `activeAgents`，于是用户看到一句「会话 xxx 正在执行中」，
+   * 旧的还占着 `activeAgents`，于是用户看到一个 `SESSION_BUSY`，
    * 而他刚敲的那段话已经没了。
    */
   ipcMain.handle('agent-v3:stop', async (_event, args: { sessionId: string }) => {
@@ -3577,11 +3873,16 @@ export function registerAgentV3IPC(): void {
   // ── 一键接入官方 Blender Lab MCP ──────────────────────────────────────
   // 手工流程有四道关（装 git/Python、跑安装脚本、手填命令行、手填三行环境
   // 变量），走完的用户几乎没有。后三道盒子代劳，见 blenderSetup.ts
+  //
+  // 探之前先从注册表刷新 PATH：用户照着提示装好 Git / Python 回来，
+  // 不用重启盒子就能被认出来（见 services/systemPath.ts）
   ipcMain.handle('agent-v3:mcp:blender-status', async () => {
     try {
       const { inspectBlenderSetup } = await import(
         '../agent-v3/capabilities/mcp/blenderSetupRuntime'
       )
+      const { refreshProcessPath } = await import('../services/systemPath')
+      await refreshProcessPath()
       return { success: true, status: await inspectBlenderSetup() }
     } catch (error) {
       return { success: false, error: (error as Error).message }
@@ -3593,6 +3894,8 @@ export function registerAgentV3IPC(): void {
     async (_event, args: { blenderPath?: string } = {}) => {
       try {
         const { runBlenderSetup } = await import('../agent-v3/capabilities/mcp/blenderSetupRuntime')
+        const { refreshProcessPath } = await import('../services/systemPath')
+        await refreshProcessPath()
         const result = await runBlenderSetup(args)
         // 装完立刻重连，用户在设置页当场看到「已连接」和工具数，
         // 而不是被告知「去点一下重新连接」
@@ -3604,6 +3907,33 @@ export function registerAgentV3IPC(): void {
           message: '安装过程本身出错了。',
           error: (error as Error).message,
           statuses: currentStatuses()
+        }
+      }
+    }
+  )
+
+  // 缺 Git / Python 时用 winget 替用户装。失败的原话交还界面，由用户决定要不要交给 AI
+  ipcMain.handle(
+    'agent-v3:mcp:blender-install-prereqs',
+    async (_event, args: { ids?: Array<'git' | 'python'> } = {}) => {
+      try {
+        const { installBlenderPrerequisites } = await import(
+          '../agent-v3/capabilities/mcp/blenderSetupRuntime'
+        )
+        const ids = (args.ids ?? []).filter((id) => id === 'git' || id === 'python')
+        const result = await installBlenderPrerequisites(ids)
+        // 装 Git 就带来了 bash。成没成都重探一次：Python 失败时 Git 可能已经装上，
+        // 不重探的话 Agent 的 shell 工具要等重启盒子才出现
+        if (ids.includes('git')) {
+          const { forgetShellProbe } = await import('../agent-v3/tools/builtin/localShell')
+          forgetShellProbe()
+        }
+        return result
+      } catch (error) {
+        return {
+          success: false,
+          message: '安装过程本身出错了。',
+          error: (error as Error).message
         }
       }
     }

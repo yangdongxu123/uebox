@@ -1,5 +1,5 @@
 /**
- * 实时语音会话的中性词汇表。
+ * 实时语音连接的中性词汇表。
  *
  * 两家（OpenAI Realtime、豆包 Seeduplex）各有一个适配器，共用这一份形状 ——
  * 上层（IPC、渲染层）不该知道当前连的是谁。
@@ -58,6 +58,16 @@ export type VoiceSessionEvent =
   /** 模型这一轮说完了。界面据此收掉「正在说」的状态 */
   | { type: 'turn-done' }
   /**
+   * 先停播、别扔（只有拼装通话发）。
+   *
+   * 它说话时有人出声，还不知道是插话还是咳嗽 —— 掐掉的话一声咳嗽就作废了整段回答。
+   * 渲染层把播放停在原地，后面到的音频照样排着；等 `output-release` 接着放，
+   * 或者等 `interrupted` 真掐。
+   */
+  | { type: 'output-hold' }
+  /** 刚才那不算插话，接着放 */
+  | { type: 'output-release' }
+  /**
    * 让渲染层**自己念**这段话（本机语音合成）。
    *
    * 豆包那边先试它自己的「打招呼」事件让它念，等不到音频才发这个当退路
@@ -107,7 +117,7 @@ export interface RealtimeToolDefinition {
   parameters: Record<string, unknown>
 }
 
-/** 已有普通对话在实时会话里的最小投影。富媒体不塞给语音模型，只保留文字。 */
+/** 已有普通对话在语音通话里的最小投影。富媒体不塞给语音模型，只保留文字。 */
 export interface RealtimeConversationMessage {
   role: 'user' | 'assistant'
   text: string
@@ -189,7 +199,7 @@ export interface VoiceSessionHandle {
    * 而听写本来也走不到豆包实时那条线（它关不掉自动应答）。
    */
   commitAudio?: () => void
-  /** 用户在语音会话底部直接键入的文字。 */
+  /** 通话中用户在底部输入框直接键入的文字。 */
   sendText: (text: string) => void
   /**
    * 主动播报。

@@ -49,12 +49,14 @@ export interface DisplayApproval {
   description: string
   details?: Record<string, unknown>
   /**
-   * 能不能「本次会话都允许」。
+   * 能不能「本对话内都允许」。
    *
    * 在网页上点击/输入这类工具是 false：批准一次不能代表批准下一次。
    * 主进程那边也拦着（见 `core/approval.ts`），界面只负责别把按钮摆出来。
    */
   allowAlways: boolean
+  /** 能不能「以后都允许」。条件比 allowAlways 严，见 `core/approval.ts` */
+  allowForever: boolean
 }
 
 export interface ApprovalDisplay {
@@ -152,7 +154,8 @@ export function useApprovalDisplay(): ApprovalDisplay {
       // 参数原样显示，绝不脱敏：用户批准的是「把这段文字发给这个网站」，
       // 看不到文字就是在盲批（见设计文档 §5.3）
       details: (request.args as Record<string, unknown>) ?? undefined,
-      allowAlways: request.allowAlways
+      allowAlways: request.allowAlways,
+      allowForever: request.allowAlways && request.allowForever === true
     }
   })
 

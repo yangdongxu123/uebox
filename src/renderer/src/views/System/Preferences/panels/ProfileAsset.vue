@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { secureStorage } from '@renderer/utils/secureStorage'
 import AppButton from '@renderer/components/AppButton.vue'
 /**
  * 资产库设置组件
@@ -20,6 +21,10 @@ import {
   readStoredNetworkVaultPreference,
   resolveNetworkVaultEnabled
 } from '@renderer/views/AssetManagement/utils/networkVaultAccess'
+import {
+  useShowAssetVersion,
+  writeShowAssetVersion
+} from '@renderer/views/AssetManagement/utils/assetVersionBadge'
 import AppSwitch from '@renderer/components/AppSwitch.vue'
 import { assetSemanticAPI } from '@renderer/api/assetSemantic'
 
@@ -56,6 +61,11 @@ watch(deleteConfirm, (val) => {
     )
   }
 })
+
+// ==============================
+// 卡片显示资产版本
+// ==============================
+const showAssetVersion = useShowAssetVersion()
 
 // 「显示依赖资产」搬去资产库的筛选栏了，在那里叫「只看主资产」。
 // 它筛的是资产列表，属于那个列表；放在这儿的后果是：想临时看一眼附带资产，
@@ -147,7 +157,7 @@ const SERVER_ADDR_KEY = 'assetManagement.serverAddress'
 const SERVER_API_KEY_KEY = 'assetManagement.serverApiKey'
 
 const serverAddress = ref(localStorage.getItem(SERVER_ADDR_KEY) || '')
-const serverApiKey = ref(localStorage.getItem(SERVER_API_KEY_KEY) || '')
+const serverApiKey = ref(secureStorage.getItem(SERVER_API_KEY_KEY) || '')
 const serverVersion = ref('')
 const serverUpdateStatus = ref<
   'idle' | 'checking' | 'available' | 'applying' | 'upToDate' | 'error'
@@ -167,9 +177,9 @@ watch(serverAddress, (val) => {
 // 持久化保存 API Key
 watch(serverApiKey, (val) => {
   if (val.trim()) {
-    localStorage.setItem(SERVER_API_KEY_KEY, val.trim())
+    secureStorage.setItem(SERVER_API_KEY_KEY, val.trim())
   } else {
-    localStorage.removeItem(SERVER_API_KEY_KEY)
+    secureStorage.removeItem(SERVER_API_KEY_KEY)
   }
 })
 
@@ -273,7 +283,7 @@ const handleApplyUpdate = async () => {
     if (data.success && data.data) {
       if (data.data.updatedFiles > 0) {
         serverUpdateStatus.value = 'upToDate'
-        serverUpdateMessage.value = `更新成功！已更新 ${data.data.updatedFiles} 个文件，服务器将自动重启`
+        serverUpdateMessage.value = `更新成功，已更新 ${data.data.updatedFiles} 个文件，服务器将自动重启`
         message.success(t('profile.asset.updateRestarting'))
       } else {
         serverUpdateStatus.value = 'upToDate'
@@ -565,6 +575,20 @@ onUnmounted(() => {
           </div>
           <div class="row-control">
             <AppSwitch v-model:checked="archiveImportAsk" />
+          </div>
+        </div>
+
+        <!-- Show Asset Version Row -->
+        <div class="setting-row">
+          <div class="row-icon">
+            <PhInfo />
+          </div>
+          <div class="row-content">
+            <div class="row-title">{{ $t('profile.asset.showAssetVersion') }}</div>
+            <div class="row-desc">{{ $t('profile.asset.showAssetVersionDesc') }}</div>
+          </div>
+          <div class="row-control">
+            <AppSwitch :checked="showAssetVersion" @update:checked="writeShowAssetVersion" />
           </div>
         </div>
       </div>

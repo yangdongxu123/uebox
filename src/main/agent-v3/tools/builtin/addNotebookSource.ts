@@ -10,6 +10,7 @@ import {
 import { indexNotebookRag } from '../../../sqliteDataBase/services/notebookRagService'
 import { readWebPageLocally } from '../../../services/webReader'
 import { checkNavigationUrl } from '../../../services/agentBrowser/urlPolicy'
+import { browserLocalNetworkAllowed } from './localNetworkSetting'
 import { defineTool, type UnrealAgentTool } from '../defineTool'
 import type { NotebookScope } from './notebookSources'
 
@@ -44,7 +45,7 @@ const input = z
       .string()
       .optional()
       .describe(
-        '未绑定知识库时存到哪个知识库：外部会话里已有同名的就存进去，否则按这个标题新建。不填就使用来源标题'
+        '未绑定知识库时存到哪个知识库：外部 MCP 调用（没有当前知识库）时，盒子里已有同名知识库就存进去，否则按这个标题新建。不填就使用来源标题'
       )
   })
   .describe('要么给 url，要么给 title + content')
@@ -103,7 +104,7 @@ export function createAddNotebookSourceTool(
         : '一个新知识库'
   const whereTo = byTitle
     ? '【放到哪里】用 notebookTitle 指定知识库标题：已有同名的就存进那一个，没有才新建。不填就按来源标题新建 —— 用户说了要放进哪个库时一定要填。'
-    : '【放到哪里】当前会话绑定了知识库就加到那里；没绑定就新建知识库，标题默认沿用来源标题，也可以传 notebookTitle。用户点名要加到某个已有知识库而当前没绑定时，先让他用 /wiki 选中，别新建一个同名副本。'
+    : '【放到哪里】当前对话绑定了知识库就加到那里；没绑定就新建知识库，标题默认沿用来源标题，也可以传 notebookTitle。用户点名要加到某个已有知识库而当前没绑定时，先让他用 /wiki 选中，别新建一个同名副本。'
 
   return defineTool({
     name: 'add_notebook_source',
@@ -133,7 +134,9 @@ ${whereTo}
       if (args.url) {
         // 和 web_read 共用同一套地址判据：本机、内网、危险协议一律不碰。
         // 少了这一层，这个工具就是一个能把内网页面存进知识库的探测器
-        const checked = checkNavigationUrl(args.url)
+        const checked = checkNavigationUrl(args.url, {
+          allowLocalNetwork: await browserLocalNetworkAllowed()
+        })
         if (!checked.ok) throw new Error(`[NAVIGATION_BLOCKED] ${checked.reason}`)
 
         const page = await readWebPageLocally(checked.url.toString())

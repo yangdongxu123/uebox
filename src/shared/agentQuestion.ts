@@ -31,14 +31,24 @@ export interface AgentQuestion {
  */
 export type AgentQuestionAction = 'accept' | 'decline' | 'cancel'
 
+/**
+ * `answers` 里某一问的值等于它，表示用户对**这一问**点了「你自己定」。
+ *
+ * 「你自己定」是逐问的：一次问三问，前两问选好了、第三问拿不准，点它只该放手
+ * 第三问。原来它是整张卡片的 `decline`，前两问的选择会被一起丢掉。
+ * 用一个占位值而不是并行数组：答案要走 IPC、存进消息历史、再画回只读卡片，
+ * 多一个字段就要多改一路，漏一处就是「选了没生效」。全部几问都放手才发 `decline`。
+ */
+export const DELEGATED_ANSWER = '\u0000delegate'
+
 /** 时间线上那张卡片的完整状态 */
 export interface AgentQuestionItem {
   toolCallId: string
   questions: AgentQuestion[]
   /**
-   * 这张卡片属于哪条 agent 会话。**只有渲染层填**。
+   * 这张卡片属于哪条内核 session。**只有渲染层填**。
    *
-   * 卡片渲染自消息里的 `agentProcess`，那份数据不带会话上下文 —— 用户点了
+   * 卡片渲染自消息里的 `agentProcess`，那份数据不带内核 session 上下文 —— 用户点了
    * 「提交」时手上必须有 sessionId 才能把答案送回去。存进条目里而不是靠组件
    * 层层往下传 props：这张卡片嵌在时间线的第三层，中间每一层都得为它加一个
    * 用不上的参数。
@@ -48,4 +58,19 @@ export interface AgentQuestionItem {
   action?: AgentQuestionAction
   /** 与 `questions` 同序，空串表示这一问没选 */
   answers?: string[]
+  /**
+   * 到这个时刻（epoch 毫秒）还没人答，就按推荐项继续。只有「全部权限」档下才有，
+   * 卡片据此画倒计时。没有这一项就是一直等，见 `questionChannel.ts`
+   */
+  autoAnswerAt?: number
+  /** 这次的回答是倒计时到点自动选的推荐项，不是用户点的 */
+  auto?: boolean
+}
+
+/**
+ * 倒计时到点时每一问选哪个：模型按约定把推荐项放在第一个（`ask_user` 的 schema 说明）。
+ * 主进程自动作答、界面预告「将选择 X」都用它，两边说的必须是同一个选项
+ */
+export function recommendedAnswers(questions: readonly AgentQuestion[]): string[] {
+  return questions.map((q) => q.options[0]?.label ?? '')
 }

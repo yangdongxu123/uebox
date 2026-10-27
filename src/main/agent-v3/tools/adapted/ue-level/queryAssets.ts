@@ -54,6 +54,35 @@ export const QueryAssetsParamsSchema = z.object({
   limit: z.number().optional().default(20).describe('返回结果数量限制')
 })
 
+/** 开了 Nanite 的那几个单列多少条：只是让模型知道它们在，不是要它去排 */
+const NANITE_SIDE_LIMIT = 5
+
+/**
+ * 按面数排时把 Nanite 拆出去。
+ *
+ * Nanite 按屏幕像素挑簇画，原始面数和帧开销基本脱钩。混在一张面数榜里，
+ * 开了 Nanite 的大网格会占满前几名、把真正按面数付钱的非 Nanite 网格挤出 limit，
+ * 报告头一句就叫用户去优化一个其实不贵的网格。
+ *
+ * 不拆的情况只有两种：按实例数 / 资源大小排；或者条件在**找问题网格**、拆了会把开 Nanite 的
+ * 那几个连同它们的发现一起踢出主榜。条件按插件（UAL_LevelCommands.cpp 的 Handle_QueryAssets）
+ * 实际怎么读来分：
+ * - nanite_enabled：给了就是它明确要的 Nanite 口径，不管真假都不拆
+ * - missing_collision / shadow_casting：插件默认 false，只有 true 才筛 —— true 不拆，false 等于没给
+ * - min_triangles / min_instances / class_filter：门槛或范围，不是在找毛病，照拆。
+ *   描述里自己的例子就是 { min_triangles: 100000 }，这时更该把 Nanite 拿出去
+ */
+export function shouldSplitByNanite(input: z.infer<typeof QueryAssetsParamsSchema>): boolean {
+  const triangleSort =
+    input.sort_by === undefined ||
+    input.sort_by === 'TotalTriangles' ||
+    input.sort_by === 'TriangleCount'
+  const c = input.conditions ?? {}
+  const huntingProblems =
+    c.nanite_enabled !== undefined || c.missing_collision === true || c.shadow_casting === true
+  return triangleSort && !huntingProblems
+}
+
 interface AssetStat {
   triangles?: number
   total_triangles?: number
@@ -101,6 +130,9 @@ export function createQueryAssetsTool(): V2Tool {
 - sort_by: TotalTriangles（默认）| TriangleCount | InstanceCount | ResourceSize
 - limit: 默认 20
 
+按面数排时主榜只排没开 Nanite 的，开了的另列 nanite_assets（见 ranking_note）。
+给了 nanite_enabled，或 missing_collision / shadow_casting 为 true 时不拆，按原样一张榜。
+
 【读结果时注意三件事】
 1. \`not_ranked_by_class\` 是**没进排行**的 Actor 类型计数（灯光、骨骼网格、贴花）。
    它们有开销，但没有和三角形可比的指标，所以只报数量不排名 ——
@@ -122,9 +154,10 @@ export function createQueryAssetsTool(): V2Tool {
           }
         }
 
+        const split = shouldSplitByNanite(input)
         const response = await wsService.callRequest<QueryAssetsResponse>(
           'level.query_assets',
-          input,
+          split ? { ...input, conditions: { ...input.conditions, nanite_enabled: false } } : input,
           getTargetConnectionId(),
           60000
         )
@@ -163,12 +196,40 @@ export function createQueryAssetsTool(): V2Tool {
             findings: classifyAsset(a.stats, a.suggestion, minTriangles, shares[index])
           }))
 
+          // 开了 Nanite 的单独查一次、单独列。查不到就不列，不影响主榜。
+          // 只要 Nanite 得用 nanite_only（nanite_enabled: true 只是「不排除」）。旧插件不认它、
+          // 会回整体前 N 名 —— 下面按 stats.nanite 再滤一遍兜底，结果对、只是可能偏少
+          let naniteAssets: AssetResult[] | undefined
+          if (split) {
+            const side = await wsService
+              .callRequest<QueryAssetsResponse>(
+                'level.query_assets',
+                {
+                  ...input,
+                  conditions: { ...input.conditions, nanite_only: true },
+                  limit: Math.min(NANITE_SIDE_LIMIT, input.limit ?? NANITE_SIDE_LIMIT)
+                },
+                getTargetConnectionId(),
+                60000
+              )
+              .catch(() => undefined)
+            naniteAssets = (side?.assets ?? []).filter((a) => a.stats?.nanite === true)
+          }
+
           return {
             success: true,
             data: {
               ...response,
               assets,
-              finding_counts: summarize(assets.flatMap((a) => a.findings))
+              finding_counts: summarize(assets.flatMap((a) => a.findings)),
+              ...(split
+                ? {
+                    ranking_note:
+                      '面数榜只排没开 Nanite 的网格：Nanite 的帧开销不跟面数走。' +
+                      '开了 Nanite 的面数最高几个列在 nanite_assets，要查它们看材质有没有遮罩、半透明或 WPO。',
+                    nanite_assets: naniteAssets
+                  }
+                : {})
             }
           }
         }

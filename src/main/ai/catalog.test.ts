@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 import type { CatalogEntry } from '../../shared/aiProvider'
 import { GENERATED_CATALOG as CATALOG } from './catalog.generated'
 import { CODEBUDDY_BASE_URL } from './codebuddy'
+import { ZCODE_BASE_URL } from './zcode'
 
 /**
  * 目录是 `scripts/sync-provider-catalog.mjs` 从 models.dev 生成的快照，
@@ -12,6 +13,19 @@ import { CODEBUDDY_BASE_URL } from './codebuddy'
  * 下拉框里选到一个 2024 年的模型才发现。
  */
 describe('内置 Provider 目录', () => {
+  it('ZCode 是独立订阅入口，使用账号登录和 Anthropic 套餐端点', () => {
+    const zcode = CATALOG.find((entry) => entry.id === 'zcode')!
+    expect(zcode).toMatchObject({
+      group: 'subscription',
+      kind: 'chat',
+      supportsOAuth: true,
+      requiresApiKey: true,
+      protocol: 'anthropic-messages',
+      baseUrl: ZCODE_BASE_URL
+    })
+    expect(zcode.models.map((model) => model.id)).toContain('GLM-5.2')
+    expect(zcode.models.every((model) => model.supportsTools)).toBe(true)
+  })
   it('阿里语音合成目录区分接口并预置匹配音色', () => {
     const audio = CATALOG.find((entry) => entry.id === 'alibaba-tts')!
     expect(CATALOG.find((entry) => entry.id === 'alibaba-qwen3-tts')).toBeUndefined()
@@ -196,11 +210,15 @@ describe('内置 Provider 目录', () => {
     expect(subscription).toMatchObject({ contextWindow: 272_000, maxOutputTokens: 128_000 })
   })
 
-  it('GPT-6 Sol / Luna 在 API 与订阅两边都列出最高两档', () => {
+  it('GPT-6.1 Sol / 6 Sol / 6 Luna 在 API 与订阅两边都列出最高两档', () => {
     for (const providerId of ['openai', 'chatgpt']) {
       const models = CATALOG.find((entry) => entry.id === providerId)!.models
-      for (const id of ['gpt-6-sol', 'gpt-6-luna']) {
-        expect(models.find((m) => m.id === id)?.thinkingLevelMap, `${providerId}/${id}`).toEqual({
+      for (const id of ['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna']) {
+        // 6.1 Sol 另有 off: null，见下面「最高思考档位」那组
+        expect(
+          models.find((m) => m.id === id)?.thinkingLevelMap,
+          `${providerId}/${id}`
+        ).toMatchObject({
           minimal: null,
           xhigh: 'xhigh',
           max: 'max'
@@ -349,13 +367,14 @@ describe('图片生成分组', () => {
   })
 
   /**
-   * 生图只有这两种协议走得通（见 imageGeneration.ts 的 PROTOCOLS_WITH_IMAGES）。
-   * 剩下三种是真的没有 —— Anthropic 没有生图模型，Codex 后端只接 responses，
+   * 生图只有这三种协议走得通（见 imageGeneration.ts 的 PROTOCOLS_WITH_IMAGES）。
+   * Codex 后端没有生图端点，靠的是生图工具（codex-images 适配器）。
+   * 剩下两种是真的没有 —— Anthropic 没有生图模型，
    * `google-generative-ai` 是对话协议（Nano Banana 走的是自己的 Interactions API，
    * 那条目录条目挂在 openai-completions 下，由适配器换端点）。
    */
-  it('协议只用走得通的那两种', () => {
-    const supported = ['openai-completions', 'openai-responses']
+  it('协议只用走得通的那三种', () => {
+    const supported = ['openai-completions', 'openai-responses', 'openai-codex-responses']
     const bad = imageEntries
       .filter((entry) => !supported.includes(entry.protocol))
       .map((entry) => `${entry.id} → ${entry.protocol}`)
@@ -376,7 +395,8 @@ describe('图片生成分组', () => {
       'grok-images',
       'siliconflow-images',
       'ark-images',
-      'gemini-images'
+      'gemini-images',
+      'codex-images'
     ]
     const bad: string[] = []
     for (const entry of imageEntries) {
@@ -588,8 +608,7 @@ describe('最高思考档位（xhigh / max）', () => {
   ): CatalogEntry['models'][number] | undefined =>
     CATALOG.find((entry) => entry.id === providerId)?.models.find((m) => m.id === modelId)
 
-  /** GPT-5.6 全系有 max，5.5 / 5.4 那两代到 xhigh 为止 —— 别按代际推广 */
-  it('OpenAI：5.6 有 max，5.5 / 5.4 只到 xhigh', () => {
+  it('OpenAI：5.6 有 max', () => {
     expect(modelIn('openai', 'gpt-5.6')?.thinkingLevelMap).toMatchObject({
       xhigh: 'xhigh',
       max: 'max'
@@ -598,23 +617,27 @@ describe('最高思考档位（xhigh / max）', () => {
       xhigh: 'xhigh',
       max: 'max'
     })
-    expect(modelIn('chatgpt', 'gpt-5.5')?.thinkingLevelMap).toMatchObject({
-      xhigh: 'xhigh',
-      max: null
-    })
-    expect(modelIn('chatgpt', 'gpt-5.4')?.thinkingLevelMap).toMatchObject({
-      xhigh: 'xhigh',
-      max: null
-    })
+  })
+
+  /** 不写 off: null，pi 没给档位时就发 effort: "none"，6.1 Sol 整轮 400 */
+  it('OpenAI：6.1 Sol 没有 none', () => {
+    for (const provider of ['openai', 'chatgpt']) {
+      expect(modelIn(provider, 'gpt-6.1-sol')?.thinkingLevelMap?.off, provider).toBeNull()
+    }
+  })
+
+  /** 订阅那边下线的型号留在清单里，用户选了就是一次看不懂的报错 */
+  it('Codex 订阅不再列出已下线的型号', () => {
+    for (const id of ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex-spark']) {
+      expect(modelIn('chatgpt', id), id).toBeUndefined()
+    }
   })
 
   /** GPT-5.6 这一代没有 `minimal`，写明不存在免得列出一档发过去就 400 的 */
-  it('OpenAI：5.6 / 5.5 / 5.4 都没有 minimal 这一档', () => {
+  it('OpenAI：5.6 没有 minimal 这一档', () => {
     for (const [provider, id] of [
       ['openai', 'gpt-5.6'],
-      ['chatgpt', 'gpt-5.6-luna'],
-      ['chatgpt', 'gpt-5.5'],
-      ['chatgpt', 'gpt-5.3-codex-spark']
+      ['chatgpt', 'gpt-5.6-luna']
     ] as const) {
       expect(modelIn(provider, id)?.thinkingLevelMap?.minimal, `${id} 的 minimal`).toBeNull()
     }

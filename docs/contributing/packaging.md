@@ -2,10 +2,9 @@
 
 中文：[packaging.zh-CN.md](packaging.zh-CN.md)
 
-You don't need this page for day-to-day work — `pnpm install`, `pnpm dev` and
-`pnpm verify` are enough, see the [README](../../README.en.md). Read this when you
-need to produce an installer, cut a release, or get stuck on the `better-sqlite3`
-ABI.
+Day-to-day work does not need this page: `pnpm install`, `pnpm dev`, `pnpm verify:changed` (on
+commit) and `pnpm verify` (before publishing) are enough, see the [README](../../README.en.md).
+Read this to produce an installer, cut a release, or get unstuck from the `better-sqlite3` ABI.
 
 ---
 
@@ -109,6 +108,19 @@ It uploads only the three files an update needs (installer, `.blockmap`, `latest
 before publishing it checks that all three came from the same build, that the version matches
 `package.json`, and that the source has been pushed. With `updateGithubRepo` unset it refuses
 to run — such a build never checks for updates in the first place.
+
+Website downloads and the mainland mirror:
+
+```bash
+node scripts/release-dl.mjs              # dry run
+node scripts/release-dl.mjs --publish    # actually upload
+```
+
+Uploads the installers to R2, and to a mainland S3-compatible bucket too when `MIRROR_*` is set
+(see `.env.example`). Besides the website's `dl/manifest.json`, each bucket gets a `dl/latest.yml`
+for in-app update checks: put `<public domain>/dl` in `package.json`'s `updateMirrors` and the app
+races it against GitHub and uses whichever answers first. `latest.yml` goes up last, so a failed
+upload never advertises a half-uploaded installer.
 
 ### Mac signing and notarization
 

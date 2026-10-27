@@ -1,6 +1,6 @@
 /** @vitest-environment node */
-import { describe, expect, it } from 'vitest'
-import type { CreatorPlanManifest } from '../../../shared/creatorPlan'
+import { describe, expect, it, vi } from 'vitest'
+import type { CreatorPlanManifest, CreatorPlanRoleChange } from '../../../shared/creatorPlan'
 import { normalizeSettings } from '../store'
 import type { AiProviderSettings, ProviderConfig } from '../types'
 import {
@@ -8,6 +8,7 @@ import {
   PLAN_PROVIDER_ID,
   PLAN_PROVIDER_IDS,
   applyPlan,
+  isFreeOnFailureModel,
   managedRoles,
   planProviders,
   planRoleChanges,
@@ -15,8 +16,13 @@ import {
   recordOriginals,
   refreshPlanModels,
   releaseDroppedRoles,
-  removePlan
+  removePlan,
+  syncPlanModels
 } from './apply'
+import { normalizePlanState } from './planState'
+
+// planState 读写盘要 app.getPath；这里只用它的归一化（读盘那一步），不碰磁盘
+vi.mock('electron', () => ({ app: { getPath: () => '' } }))
 
 const chatSpec = (model: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
   model,
@@ -146,7 +152,7 @@ describe('planProviders', () => {
 })
 
 describe('planProviders 非对话角色', () => {
-  it('清单标了 beta 的角色，显示名后面带「(Beta)」', () => {
+  it('旧清单（没有 models）标了 beta 的角色，标签是「Beta」', () => {
     const beta: CreatorPlanManifest = {
       ...fullManifest,
       roles: {
@@ -155,7 +161,7 @@ describe('planProviders 非对话角色', () => {
       }
     }
     const music = planProviders(beta, keyRef).find((p) => p.id === 'creator-plan-music')!
-    expect(music.models[0]!.displayName).toBe('Creator · Music (Beta)')
+    expect(music.models[0]).toMatchObject({ displayName: 'Creator · Music', badge: 'Beta' })
     const change = planRoleChanges({ version: 3, providers: [], roles: {} }, beta).find(
       (c) => c.role === 'music'
     )!
@@ -307,7 +313,6 @@ describe('applyPlan 非对话角色', () => {
     const changes = planRoleChanges(base, fullManifest)
     expect(changes.map((c) => c.role)).toEqual([
       'chat',
-      'agent',
       'vision',
       'summary',
       'embedding',
@@ -328,61 +333,64 @@ describe('applyPlan 非对话角色', () => {
 describe('planRoleChanges', () => {
   it('没绑的默认勾；用户自己配的默认不勾，并写明现在是什么', () => {
     const changes = planRoleChanges(base, manifest)
-    expect(changes.map((c) => c.role)).toEqual(['chat', 'agent', 'vision', 'summary'])
+    // Agent 已并进主模型（chat 那一格），不单列一行
+    expect(changes.map((c) => c.role)).toEqual(['chat', 'vision', 'summary'])
     const chat = changes.find((c) => c.role === 'chat')!
     expect(chat).toMatchObject({
+      model: 'uebox-agent',
       defaultSelected: false,
       managed: false,
       current: { providerId: 'my-gateway', modelId: 'gpt-x', providerName: 'My Gateway' }
     })
-    expect(changes.find((c) => c.role === 'agent')).toMatchObject({
+    expect(changes.find((c) => c.role === 'vision')).toMatchObject({
       defaultSelected: true,
       current: null
     })
   })
 
   it('套餐管着的角色默认勾，标成「套餐管理中」', () => {
-    const applied = applyPlan(base, manifest, keyRef, ['agent'])
-    const agent = planRoleChanges(applied, manifest).find((c) => c.role === 'agent')!
-    expect(agent).toMatchObject({ managed: true, defaultSelected: true })
+    const applied = normalizeSettings(applyPlan(base, manifest, keyRef, ['chat']))
+    const chat = planRoleChanges(applied, manifest).find((c) => c.role === 'chat')!
+    expect(chat).toMatchObject({ managed: true, defaultSelected: true })
   })
 })
 
 describe('applyPlan', () => {
   it('只换选中的角色，带上 source；用户自己的来源和绑定不动', () => {
-    const next = applyPlan(base, manifest, keyRef, ['agent', 'summary'])
+    const next = applyPlan(base, manifest, keyRef, ['vision', 'summary'])
     expect(next.roles).toEqual({
       chat: { providerId: 'my-gateway', modelId: 'gpt-x' },
-      agent: { providerId: PLAN_PROVIDER_ID, modelId: 'uebox-agent', source: 'plan' },
+      vision: { providerId: PLAN_PROVIDER_ID, modelId: 'uebox-vision', source: 'plan' },
       summary: { providerId: PLAN_PROVIDER_ID, modelId: 'uebox-fast', source: 'plan' }
     })
     expect(next.providers.map((p) => p.id)).toEqual(['my-gateway', PLAN_PROVIDER_ID])
-    expect(managedRoles(next)).toEqual(['agent', 'summary'])
+    expect(managedRoles(next)).toEqual(['vision', 'summary'])
   })
 
-  it('勾选了用户配过的角色：换成套餐', () => {
+  it('勾选了用户配过的主模型：换成套餐，用清单里 agent 那份（和 mergeMainModel 一致）', () => {
     const next = applyPlan(base, manifest, keyRef, ['chat'])
     expect(next.roles.chat).toEqual({
       providerId: PLAN_PROVIDER_ID,
-      modelId: 'uebox-chat',
+      modelId: 'uebox-agent',
       source: 'plan'
     })
+    expect(next.roles.agent).toBeUndefined()
   })
 
   it('重新导入时取消勾选：套餐不再管它，解绑', () => {
-    const first = applyPlan(base, manifest, keyRef, ['agent', 'summary'])
-    const second = applyPlan(first, manifest, keyRef, ['agent'])
+    const first = applyPlan(base, manifest, keyRef, ['vision', 'summary'])
+    const second = applyPlan(first, manifest, keyRef, ['vision'])
     expect(second.roles.summary).toBeUndefined()
-    expect(second.roles.agent?.source).toBe('plan')
+    expect(second.roles.vision?.source).toBe('plan')
   })
 
   it('清单里某个角色没了：套餐管着的那条解绑，用户手动改过的不动', () => {
-    const first = applyPlan(base, manifest, keyRef, ['agent', 'vision'])
+    const first = applyPlan(base, manifest, keyRef, ['summary', 'vision'])
     // 用户后来手动把 vision 改到自己的来源（渲染层改绑定不带 source）
     first.roles.vision = { providerId: 'my-gateway', modelId: 'gpt-x' }
-    const shrunk = { ...manifest, roles: { ...manifest.roles, agent: null, vision: null } }
-    const second = applyPlan(first, shrunk, keyRef, ['agent', 'vision'])
-    expect(second.roles.agent).toBeUndefined()
+    const shrunk = { ...manifest, roles: { ...manifest.roles, summary: null, vision: null } }
+    const second = applyPlan(first, shrunk, keyRef, ['summary', 'vision'])
+    expect(second.roles.summary).toBeUndefined()
     expect(second.roles.vision).toEqual({ providerId: 'my-gateway', modelId: 'gpt-x' })
   })
 
@@ -391,22 +399,20 @@ describe('applyPlan', () => {
     const first = applyPlan(base, manifest, keyRef, ['chat'], originals)
     const unticked = applyPlan(first, manifest, keyRef, [], originals)
     expect(unticked.roles.chat).toEqual({ providerId: 'my-gateway', modelId: 'gpt-x' })
-    const shrunk = { ...manifest, roles: { ...manifest.roles, chat: null } }
+    const shrunk = { ...manifest, roles: { ...manifest.roles, chat: null, agent: null } }
     const dropped = applyPlan(first, shrunk, keyRef, ['chat'], originals)
     expect(dropped.roles.chat).toEqual({ providerId: 'my-gateway', modelId: 'gpt-x' })
   })
 
   it('重复导入不会叠出两个套餐来源', () => {
-    const twice = applyPlan(applyPlan(base, manifest, keyRef, ['agent']), manifest, keyRef, [
-      'agent'
-    ])
+    const twice = applyPlan(applyPlan(base, manifest, keyRef, ['chat']), manifest, keyRef, ['chat'])
     expect(twice.providers.filter((p) => p.id === PLAN_PROVIDER_ID)).toHaveLength(1)
   })
 })
 
 describe('removePlan', () => {
   it('删掉套餐来源和它管着的角色，用户自己的留着', () => {
-    const applied = applyPlan(base, manifest, keyRef, ['agent', 'vision'])
+    const applied = applyPlan(base, manifest, keyRef, ['summary', 'vision'])
     const removed = removePlan(applied)
     expect(removed.providers.map((p) => p.id)).toEqual(['my-gateway'])
     expect(removed.roles).toEqual({ chat: { providerId: 'my-gateway', modelId: 'gpt-x' } })
@@ -420,9 +426,9 @@ describe('recordOriginals', () => {
     expect(first).toEqual({ chat: { providerId: 'my-gateway', modelId: 'gpt-x' } })
     const applied = applyPlan(base, manifest, keyRef, ['chat'])
     // 重新导入时 chat 的「现在」已经是套餐，最初那条才是用户自己的
-    expect(recordOriginals(first, applied, manifest, ['chat', 'agent'])).toEqual({
+    expect(recordOriginals(first, applied, manifest, ['chat', 'vision'])).toEqual({
       chat: { providerId: 'my-gateway', modelId: 'gpt-x' },
-      agent: null
+      vision: null
     })
   })
 
@@ -441,19 +447,151 @@ describe('recordOriginals', () => {
   })
 
   it('原来就由套餐管着、又没有记录的：按「原来没设置」记', () => {
-    const managed = applyPlan(base, manifest, keyRef, ['agent'])
-    expect(recordOriginals({}, managed, manifest, ['agent'])).toEqual({ agent: null })
+    const managed = applyPlan(base, manifest, keyRef, ['vision'])
+    expect(recordOriginals({}, managed, manifest, ['vision'])).toEqual({ vision: null })
   })
 })
 
 describe('removePlan 还原', () => {
   it('还原成原绑定；原绑定的模型已经不在了 → 未设置', () => {
-    const applied = applyPlan(base, manifest, keyRef, ['chat', 'agent'])
+    const applied = applyPlan(base, manifest, keyRef, ['chat', 'vision'])
     const removed = removePlan(applied, {
       chat: { providerId: 'my-gateway', modelId: 'gpt-x' },
-      agent: { providerId: 'my-gateway', modelId: 'gone' }
+      vision: { providerId: 'my-gateway', modelId: 'gone' }
     })
     expect(removed.roles).toEqual({ chat: { providerId: 'my-gateway', modelId: 'gpt-x' } })
+  })
+})
+
+/**
+ * 主模型：「对话」和「Agent」落盘时合成 chat 一格（store.ts 的 mergeMainModel）。
+ * 这里每一步都过真实的落盘归一化，和 ipc 里「读配置 → 记原绑定 → 应用 → 写盘 → 断开」同一条路
+ */
+describe('主模型（对话 + Agent 合并）', () => {
+  const user = normalizeSettings(base)
+  /** 照 ipc：先记原绑定，再应用、落盘 */
+  const importWith = (
+    settings: AiProviderSettings,
+    selected: CreatorPlanRoleChange['role'][]
+  ): { written: AiProviderSettings; originals: ReturnType<typeof recordOriginals> } => {
+    const originals = recordOriginals({}, settings, manifest, selected)
+    const written = normalizeSettings(applyPlan(settings, manifest, keyRef, selected, originals))
+    return { written, originals }
+  }
+
+  it('用户有自己的主模型：预览里主模型默认不勾，也没有单独一行 Agent', () => {
+    const changes = planRoleChanges(user, manifest)
+    expect(changes.some((c) => c.role === 'agent')).toBe(false)
+    expect(changes.find((c) => c.role === 'chat')).toMatchObject({
+      defaultSelected: false,
+      current: { providerId: 'my-gateway', modelId: 'gpt-x' }
+    })
+  })
+
+  it('按默认勾选导入：用户自己的主模型留着，断开后也还是它', () => {
+    const selected = planRoleChanges(user, manifest)
+      .filter((c) => c.defaultSelected)
+      .map((c) => c.role)
+    const { written, originals } = importWith(user, selected)
+    expect(written.roles.chat).toEqual({ providerId: 'my-gateway', modelId: 'gpt-x' })
+    expect(written.roles.vision).toMatchObject({ providerId: PLAN_PROVIDER_ID, source: 'plan' })
+    expect(normalizeSettings(removePlan(written, originals)).roles).toEqual({
+      chat: { providerId: 'my-gateway', modelId: 'gpt-x' }
+    })
+  })
+
+  it('用户自己勾上主模型：换成套餐；断开后还原成用户原来的', () => {
+    const { written, originals } = importWith(user, ['chat'])
+    expect(originals).toEqual({ chat: { providerId: 'my-gateway', modelId: 'gpt-x' } })
+    expect(written.roles).toEqual({
+      chat: { providerId: PLAN_PROVIDER_ID, modelId: 'uebox-agent', source: 'plan' }
+    })
+    // 重新导入：主模型那一格的「现在」是套餐，最初那条不被覆盖，预览里标成套餐管着
+    expect(planRoleChanges(written, manifest).find((c) => c.role === 'chat')).toMatchObject({
+      managed: true,
+      defaultSelected: true
+    })
+    expect(recordOriginals(originals, written, manifest, ['chat'])).toEqual(originals)
+    expect(normalizeSettings(removePlan(written, originals)).roles).toEqual({
+      chat: { providerId: 'my-gateway', modelId: 'gpt-x' }
+    })
+  })
+
+  it('没有主模型：默认勾上，断开后回到未设置', () => {
+    const empty = normalizeSettings({ ...base, roles: {} })
+    expect(planRoleChanges(empty, manifest).find((c) => c.role === 'chat')).toMatchObject({
+      defaultSelected: true,
+      current: null
+    })
+    const { written, originals } = importWith(empty, ['chat'])
+    expect(written.roles.chat?.source).toBe('plan')
+    expect(normalizeSettings(removePlan(written, originals)).roles).toEqual({})
+  })
+
+  /** 老记录照 ipc 的路子先过一遍读盘归一化（planState.ts），合并只在那一处做 */
+  const legacyOriginals = (
+    originals: Record<string, unknown>
+  ): ReturnType<typeof recordOriginals> => normalizePlanState({ originals }).originals
+
+  it('合并之前导入的老记录（原绑定记在 agent 上）：断开时还原到主模型', () => {
+    const { written } = importWith(user, ['chat'])
+    const legacy = legacyOriginals({ agent: { providerId: 'my-gateway', modelId: 'gpt-x' } })
+    expect(removePlan(written, legacy).roles).toEqual({
+      chat: { providerId: 'my-gateway', modelId: 'gpt-x' }
+    })
+    expect(recordOriginals(legacy, written, manifest, ['chat'])).toEqual({
+      chat: { providerId: 'my-gateway', modelId: 'gpt-x' }
+    })
+  })
+
+  it('老记录两条都有：听 agent 的（和 mergeMainModel 一致），重新导入也不丢', () => {
+    const { written } = importWith(user, ['chat'])
+    const gpt = { providerId: 'my-gateway', modelId: 'gpt-x' }
+    // 1.0.8：对话原来没设置、Agent 原来是 gpt-x
+    const unsetChat = legacyOriginals({ chat: null, agent: gpt })
+    expect(removePlan(written, unsetChat).roles).toEqual({ chat: gpt })
+    expect(recordOriginals(unsetChat, written, manifest, ['chat'])).toEqual({ chat: gpt })
+    // 两条都有值：断开后主模型是 Agent 原来那个（1.0.8 断开后合并读出来的也是它）
+    const both = legacyOriginals({
+      chat: { providerId: 'my-gateway', modelId: 'gpt-old' },
+      agent: gpt
+    })
+    const providers = written.providers.map((p) =>
+      p.id === mine.id ? { ...p, models: [...p.models, { id: 'gpt-old' }] } : p
+    )
+    expect(removePlan({ ...written, providers }, both).roles).toEqual({ chat: gpt })
+  })
+
+  /**
+   * 1.0.8 按默认勾选导入：对话是用户自己的，Agent「未设置」被套餐接管，原绑定只记了 agent: null。
+   * 升级后用户自己的主模型留着，套餐不再管主模型；断开、刷新都不动它
+   */
+  it('1.0.8 默认勾选导入的老用户：主模型留用户自己的，断开、刷新后也是它', () => {
+    const gpt = { providerId: 'my-gateway', modelId: 'gpt-x' }
+    const old = normalizeSettings({
+      ...base,
+      providers: [mine, ...planProviders(manifest, keyRef)],
+      roles: {
+        chat: gpt,
+        agent: { providerId: PLAN_PROVIDER_ID, modelId: 'uebox-agent', source: 'plan' }
+      }
+    })
+    const originals = legacyOriginals({ agent: null })
+    expect(old.roles.chat).toEqual(gpt)
+    expect(managedRoles(old)).toEqual([])
+    expect(planRoleChanges(old, manifest).find((c) => c.role === 'chat')).toMatchObject({
+      managed: false,
+      defaultSelected: false
+    })
+    expect(removePlan(old, originals).roles).toEqual({ chat: gpt })
+    const noMain = { ...manifest, roles: { ...manifest.roles, chat: null, agent: null } }
+    expect(releaseDroppedRoles(old, noMain, originals).roles.chat).toEqual(gpt)
+    // 之后自己勾上主模型重新导入：记下的是用户自己的那个，断开照着还原
+    const reOriginals = recordOriginals(originals, old, manifest, ['chat'])
+    expect(reOriginals.chat).toEqual(gpt)
+    const reWritten = normalizeSettings(applyPlan(old, manifest, keyRef, ['chat'], reOriginals))
+    expect(reWritten.roles.chat?.source).toBe('plan')
+    expect(removePlan(reWritten, reOriginals).roles).toEqual({ chat: gpt })
   })
 })
 
@@ -588,7 +726,7 @@ describe('source 字段落盘', () => {
       providers: [mine],
       roles: {
         chat: { providerId: 'my-gateway', modelId: 'gpt-x', source: 'plan' },
-        agent: { providerId: 'my-gateway', modelId: 'gpt-x', source: 'whatever' }
+        summary: { providerId: 'my-gateway', modelId: 'gpt-x', source: 'whatever' }
       }
     })
     expect(settings.roles.chat).toEqual({
@@ -596,7 +734,7 @@ describe('source 字段落盘', () => {
       modelId: 'gpt-x',
       source: 'plan'
     })
-    expect(settings.roles.agent).toEqual({ providerId: 'my-gateway', modelId: 'gpt-x' })
+    expect(settings.roles.summary).toEqual({ providerId: 'my-gateway', modelId: 'gpt-x' })
   })
 })
 
@@ -668,5 +806,193 @@ describe('accepted route prices', () => {
     const provider = planProviders(priced, keyRef)[0]!
     const model = toPiModel(provider, provider.models.find((m) => m.id === 'uebox-chat')!)
     expect(model.headers).toMatchObject({ 'X-UEBox-Pricing-Version': 'rp-one' })
+  })
+})
+
+/**
+ * 清单 `models`（2026-10-15）：模型列表、名字、标签、能接的角色都由服务端定。
+ * 形状照服务端 capabilities.test.ts：默认模型合成一项，可选模型 default_for 为空
+ */
+describe('清单 models：模型列表由服务端定', () => {
+  const CHAT_ROLES = ['chat', 'agent', 'vision', 'summary']
+  const chat = chatSpec('uebox-chat', {
+    display_name: 'Box-Chat',
+    supports_vision: true,
+    supports_video: true,
+    context_window: 262144,
+    max_output_tokens: 65536
+  })
+  const chatBeta = {
+    ...chatSpec('uebox-chat-beta', {
+      display_name: 'Box-Chat Beta',
+      supports_vision: true,
+      supports_video: false,
+      context_window: 200000,
+      max_output_tokens: 32000
+    }),
+    roles: CHAT_ROLES,
+    default_for: [],
+    badge: 'Beta',
+    description: '更便宜的对话线路，测试阶段，偶尔会失败；失败不扣 Credits',
+    free_on_failure: true
+  }
+  const image = { model: 'uebox-image', display_name: 'Box-Image', sizes: ['1K', '2K'] }
+  const music = { model: 'uebox-music', display_name: 'Box-Music', seconds: { min: 10, max: 240 } }
+  /** 客户端从没见过的未来可选模型，换个角色类别：不改代码也该出现 */
+  const imagePro = {
+    model: 'uebox-image-pro',
+    display_name: 'Box-Image Pro',
+    sizes: ['2K', '4K'],
+    roles: ['image'],
+    default_for: [],
+    badge: 'New'
+  }
+  const modelsManifest: CreatorPlanManifest = {
+    ...manifest,
+    roles: { chat, agent: chat, vision: chat, summary: chat, image, music, judge: null },
+    models: [
+      { ...chat, roles: CHAT_ROLES, default_for: CHAT_ROLES },
+      { ...image, roles: ['image'], default_for: ['image'] },
+      { ...music, roles: ['music'], default_for: ['music'], badge: 'Beta' },
+      chatBeta,
+      imagePro
+    ]
+  }
+  const withoutBeta: CreatorPlanManifest = {
+    ...modelsManifest,
+    models: modelsManifest.models!.filter((m) => m !== chatBeta)
+  }
+  const imported = (): AiProviderSettings =>
+    normalizeSettings(
+      applyPlan(base, modelsManifest, keyRef, ['chat', 'summary', 'vision', 'image', 'music'])
+    )
+  const choose = (
+    settings: AiProviderSettings,
+    roles: AiProviderSettings['roles']
+  ): AiProviderSettings => ({ ...settings, roles: { ...settings.roles, ...roles } })
+  const betaBinding = { providerId: PLAN_PROVIDER_ID, modelId: 'uebox-chat-beta' }
+  const defaultBinding = { providerId: PLAN_PROVIDER_ID, modelId: 'uebox-chat', source: 'plan' }
+  const plan = (settings: AiProviderSettings, id = PLAN_PROVIDER_ID): ProviderConfig =>
+    settings.providers.find((p) => p.id === id)!
+
+  it('可选模型出现在它主角色那一类的来源里，名字、标签、说明、能力都照它自己那一项', () => {
+    const providers = planProviders(modelsManifest, keyRef)
+    const chatProvider = providers.find((p) => p.id === PLAN_PROVIDER_ID)!
+    expect(chatProvider.models.map((m) => m.id)).toEqual(['uebox-chat', 'uebox-chat-beta'])
+    expect(chatProvider.models[0]).toMatchObject({
+      displayName: 'Box-Chat',
+      supportsVideo: true,
+      contextWindow: 262144,
+      allowedRoles: CHAT_ROLES
+    })
+    expect(chatProvider.models[0]!.badge).toBeUndefined()
+    expect(chatProvider.models[1]).toMatchObject({
+      displayName: 'Box-Chat Beta',
+      badge: 'Beta',
+      description: chatBeta.description,
+      supportsVision: true,
+      supportsVideo: false,
+      contextWindow: 200000,
+      maxOutputTokens: 32000,
+      allowedRoles: CHAT_ROLES,
+      freeOnFailure: true
+    })
+
+    const imageProvider = providers.find((p) => p.id === 'creator-plan-image')!
+    expect(imageProvider.models.map((m) => m.id)).toEqual(['uebox-image', 'uebox-image-pro'])
+    expect(imageProvider.models[1]).toMatchObject({
+      displayName: 'Box-Image Pro',
+      badge: 'New',
+      imageApi: 'uebox-images',
+      allowedRoles: ['image']
+    })
+    // 音乐的「Beta」来自服务端的 badge，名字里不再拼
+    expect(providers.find((p) => p.id === 'creator-plan-music')!.models[0]).toMatchObject({
+      displayName: 'Box-Music',
+      badge: 'Beta'
+    })
+    const musicChange = planRoleChanges({ version: 3, providers: [], roles: {} }, modelsManifest)
+    expect(musicChange.find((c) => c.role === 'music')!.modelDisplayName).toBe('Box-Music (Beta)')
+  })
+
+  it('默认绑定照旧按 roles：可选模型不会被自动绑上', () => {
+    const settings = imported()
+    expect(settings.roles.chat).toEqual(defaultBinding)
+    expect(settings.roles.image?.modelId).toBe('uebox-image')
+  })
+
+  it('落盘归一化后新字段不丢；同一份清单再刷新、再对齐都原样返回（不白写盘）', () => {
+    const settings = imported()
+    expect(plan(settings).models[1]).toMatchObject({
+      badge: 'Beta',
+      allowedRoles: CHAT_ROLES,
+      freeOnFailure: true
+    })
+    expect(refreshPlanModels(settings, modelsManifest)).toBe(settings)
+    expect(syncPlanModels(settings, modelsManifest)).toBe(settings)
+  })
+
+  it('旧服务端导入的老用户：清单带上 models 后，可选模型不用重新导入就出现；没导入的类不新建来源', () => {
+    const old = normalizeSettings(applyPlan(base, manifest, keyRef, ['chat']))
+    const next = syncPlanModels(refreshPlanModels(old, modelsManifest), modelsManifest)
+    expect(plan(next).models.map((m) => m.id)).toContain('uebox-chat-beta')
+    expect(next.providers.some((p) => p.id === 'creator-plan-image')).toBe(false)
+  })
+
+  it('用户手动绑的可选模型下线了：那个角色退回默认模型，模型从列表里拿掉', () => {
+    const chosen = choose(imported(), { chat: betaBinding })
+    // 还在：什么都不动，不替用户换
+    expect(syncPlanModels(chosen, modelsManifest)).toBe(chosen)
+
+    const next = syncPlanModels(chosen, withoutBeta)
+    expect(next.roles.chat).toEqual(defaultBinding)
+    expect(plan(next).models.map((m) => m.id)).toEqual(['uebox-chat'])
+    expect(next.roles.summary).toEqual(chosen.roles.summary)
+  })
+
+  it('可选模型不再允许接某个角色（换档）：只把那个角色退回默认', () => {
+    const chosen = choose(imported(), { chat: betaBinding, summary: betaBinding })
+    const narrowed: CreatorPlanManifest = {
+      ...modelsManifest,
+      models: modelsManifest.models!.map((m) =>
+        m === chatBeta ? { ...chatBeta, roles: ['chat'] } : m
+      )
+    }
+    const next = syncPlanModels(chosen, narrowed)
+    expect(next.roles.chat).toEqual(betaBinding)
+    expect(next.roles.summary).toEqual(defaultBinding)
+  })
+
+  it('重新导入时没勾的角色绑着已下线的可选模型：同样退回默认', () => {
+    const chosen = choose(imported(), { chat: betaBinding })
+    expect(applyPlan(chosen, withoutBeta, keyRef, []).roles.chat).toEqual(defaultBinding)
+  })
+
+  it('旧清单（没有 models）、订阅失效：一概不增不删、不换绑定', () => {
+    const chosen = choose(imported(), { chat: betaBinding })
+    expect(syncPlanModels(chosen, { ...withoutBeta, models: undefined })).toBe(chosen)
+    const canceled = { ...withoutBeta, plan: { ...withoutBeta.plan, status: 'canceled' as const } }
+    expect(syncPlanModels(chosen, canceled)).toBe(chosen)
+  })
+
+  it('认不出的项跳过：主角色不认识、规格形状不对', () => {
+    const odd: CreatorPlanManifest = {
+      ...modelsManifest,
+      models: [
+        ...modelsManifest.models!,
+        { model: 'uebox-holo', display_name: 'Box-Holo', roles: ['hologram'], default_for: [] },
+        { model: 'uebox-chat-broken', display_name: 'Broken', roles: ['chat'], default_for: [] }
+      ]
+    }
+    const ids = planProviders(odd, keyRef).flatMap((p) => p.models.map((m) => m.id))
+    expect(ids).not.toContain('uebox-holo')
+    expect(ids).not.toContain('uebox-chat-broken')
+  })
+
+  it('哪个模型失败不扣费，按它自己那一项', () => {
+    const settings = imported()
+    expect(isFreeOnFailureModel(settings, PLAN_PROVIDER_ID, 'uebox-chat-beta')).toBe(true)
+    expect(isFreeOnFailureModel(settings, PLAN_PROVIDER_ID, 'uebox-chat')).toBe(false)
+    expect(isFreeOnFailureModel(settings, 'my-gateway', 'gpt-x')).toBe(false)
   })
 })

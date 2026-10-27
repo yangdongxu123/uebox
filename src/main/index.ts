@@ -16,6 +16,8 @@ if (process.platform === 'win32') {
 process.env.UV_THREADPOOL_SIZE = '16'
 
 import { app, BrowserWindow, dialog, ipcMain, Tray, Menu, protocol, screen } from 'electron'
+import { handleTeamDeepLink, teamDeepLinkFromArgv } from './ipc/team'
+import { handleShareDeepLink } from './ipc/share'
 import { join } from 'path'
 import os from 'os'
 import { existsSync, readdirSync } from 'fs'
@@ -261,7 +263,7 @@ function createWindow(): void {
       /*
        * 托盘菜单与悬停提示不能走「主进程回码、渲染层查语言包」那条路：
        * Electron 把它们交给操作系统画，渲染进程碰不到。所以托盘文案在主进程翻
-       * （见 `main/i18n.ts`）。菜单的结构、最近会话 / 最近项目、退出确认都在
+       * （见 `main/i18n.ts`）。菜单的结构、最近对话 / 最近项目、退出确认都在
        * `tray/trayController.ts`，这里只把窗口相关的回调喂给它。
        */
       startTrayMenuController(tray, {
@@ -394,7 +396,11 @@ function setupSingleInstanceLock(): boolean {
   }
 
   // 监听第二实例启动事件，将已有窗口置前
-  app.on('second-instance', () => {
+  app.on('second-instance', (_event, argv) => {
+    // 邀请链接「用虚幻盒子打开」：unrealbox://join?… 作为第二实例的参数进来
+    // 共享技能「装到盒子」：unrealbox://install-skill?id=…，同一个协议，先认它
+    const teamLink = teamDeepLinkFromArgv(argv)
+    if (teamLink && (handleShareDeepLink(teamLink) || handleTeamDeepLink(teamLink))) return
     // 找到主窗口。判据在 appWindows.ts —— 那里会先把 Agent 浏览器窗口
     // （1280×820，正好落在这条尺寸判据里）摘出去，否则用户双击图标
     // 唤起的会是一个网页
@@ -431,11 +437,15 @@ function setupSingleInstanceLock(): boolean {
 }
 
 // ==================== V8 堆内存配置 ====================
-// 🛡️ 解决资产导入时的 OOM (Out of Memory) 崩溃问题
-// 注意：app.commandLine.appendSwitch('js-flags', ...) 对主进程取决于 Electron 版本
-// 必须分开设置每个 flag（多个 flag 写在同一字符串中可能不会被正确解析）
-app.commandLine.appendSwitch('js-flags', '--max-old-space-size=8192')
-app.commandLine.appendSwitch('js-flags', '--expose-gc')
+// 这一段**管不到主进程自己**：主进程的 V8 在这行代码执行之前就已经初始化好了，
+// js-flags 只对之后启动的渲染进程生效。所以别指望靠调大堆来扛「把整个库读进内存」，
+// 主进程里的大数据量操作必须分页 / 流式（见 SyncClient.reconcileSync）。
+// 开发时 package.json 的 dev 脚本用 NODE_OPTIONS 给了 16 GB 堆，正式包没有 ——
+// 在 dev 里跑得动的全量操作，到用户机器上可能直接 OOM。
+//
+// 两个 flag 必须写在**同一个**开关里：同名开关追加两次，后一次会覆盖前一次，
+// 以前分两行写，--max-old-space-size 实际上从来没生效过。
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=8192 --expose-gc')
 // 同时设置 NODE_OPTIONS 环境变量作为后备（影响子进程和某些 Electron 版本的主进程）
 if (!process.env.NODE_OPTIONS?.includes('max-old-space-size')) {
   process.env.NODE_OPTIONS =
@@ -475,6 +485,16 @@ if (process.platform === 'win32') {
 
 // 应用初始化前设置单例锁
 const shouldInitializeApp = setupSingleInstanceLock()
+
+// macOS 不把 unrealbox:// 放进命令行参数，而是发 open-url（冷启动时在 ready 之前就发）。
+// 等 ready 再交给团队处理：「打开工程」那一路要读资产库配置
+if (process.platform === 'darwin' && shouldInitializeApp) {
+  app.on('open-url', (event, url) => {
+    if (!/^unrealbox:\/\//i.test(url)) return
+    event.preventDefault()
+    void app.whenReady().then(() => handleShareDeepLink(url) || handleTeamDeepLink(url))
+  })
+}
 
 // 在应用启动前声明自定义协议（必须在 app.whenReady() 之前）
 // 这告诉 Electron 这是一个特权协议，允许在渲染进程中使用
@@ -688,7 +708,7 @@ appReady?.then(async () => {
     // （两者各自都会打一行「初始化完成」，这里不再复述）
     spotlightManager.initialize()
     miniChatManager.initialize()
-    // 从标签栏拖出来的独立聊天窗口（见 chatWindowManager.ts 文件头）
+    // 从标签栏拖出来的独立对话窗口（见 chatWindowManager.ts 文件头）
     chatWindowManager.initialize()
 
     // 初始化应用全局快捷键
@@ -704,6 +724,19 @@ appReady?.then(async () => {
 
     // 编辑器崩溃看门人：认出崩溃、关掉崩溃报告窗口、重开工程，并告诉等着的 agent
     startEditorCrashWatch()
+
+    // 团队工程：邀请链接「用虚幻盒子打开」。只有安装版登记这个协议 —— 开发时登记的会是
+    // 这份源码的 electron.exe，把本机其他人装的盒子顶掉
+    if (app.isPackaged && !app.isDefaultProtocolClient('unrealbox'))
+      app.setAsDefaultProtocolClient('unrealbox')
+    const coldTeamLink = teamDeepLinkFromArgv(process.argv)
+    if (coldTeamLink && !handleShareDeepLink(coldTeamLink)) handleTeamDeepLink(coldTeamLink)
+    // 加入过团队的：托盘连上通知流（问他改完没、通过 / 打回、冻结……）。没加入过就什么都不做
+    setTimeout(() => {
+      void import('./libraryV3')
+        .then((module) => module.getTeamService().startAll())
+        .catch((e) => logger.warn('[team] 通知流启动失败:', e))
+    }, 4000)
 
     // 初始化自动更新服务（仅在非开发环境或明确启用时）
     if (!is.dev || process.env.ENABLE_AUTO_UPDATE === 'true') {

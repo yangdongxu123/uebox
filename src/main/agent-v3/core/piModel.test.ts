@@ -3,12 +3,119 @@ import { describe, expect, it, vi } from 'vitest'
 vi.mock('../../ai/credentials', () => ({
   resolveRequestAuth: vi.fn(async () => ({ apiKey: 'sk-test-key' }))
 }))
+vi.mock('../../ai/store', () => ({
+  readSettings: vi.fn(async () => ({ version: 3, providers: [], roles: {} }))
+}))
+vi.mock('../../ai/zcodeCaptcha', () => ({
+  getZCodeVerification: vi.fn(async () => undefined),
+  invalidateZCodeVerification: vi.fn()
+}))
 
 import { createModels, getSupportedThinkingLevels } from '@earendil-works/pi-ai'
+import { streamSimple } from '@earendil-works/pi-ai/api/openai-responses'
+import { normalizeContext } from '@earendil-works/pi-ai/utils/transcript'
 import { getBuiltinModels, getBuiltinProviders } from '@earendil-works/pi-ai/providers/all'
 import { toPiModel, toPiProvider } from './piModel'
 import { PROVIDER_CATALOG } from '../../ai/catalog'
 import type { ProviderConfig } from '../../ai/types'
+import { ZCODE_BASE_URL } from '../../ai/zcode'
+
+describe('ZCode provider integration', () => {
+  it.each(['stream', 'streamSimple'] as const)(
+    'adapts %s and decodes streamed tool calls',
+    async (method) => {
+      const { resolveRequestAuth } = await import('../../ai/credentials')
+      const token = `header.${Buffer.from('{}').toString('base64url')}.signature`
+      vi.mocked(resolveRequestAuth).mockResolvedValueOnce({ apiKey: token })
+      const models = createModels()
+      models.setProvider(
+        toPiProvider({
+          id: 'zcode',
+          displayName: 'ZCode',
+          kind: 'chat',
+          protocol: 'anthropic-messages',
+          baseUrl: ZCODE_BASE_URL,
+          apiKey: { kind: 'oauth', id: 'zcode-key', provider: 'zcode' },
+          models: [{ id: 'GLM-5.2', supportsTools: true, supportsReasoning: false }]
+        })
+      )
+      const events = [
+        {
+          type: 'message_start',
+          message: {
+            id: 'msg1',
+            type: 'message',
+            role: 'assistant',
+            model: 'GLM-5.2',
+            content: [],
+            usage: { input_tokens: 4, output_tokens: 0 }
+          }
+        },
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'tool_use', id: 'call1', name: 'ping', input: {} }
+        },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'input_json_delta', partial_json: '{"value":1}' }
+        },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 5 } },
+        { type: 'message_stop' }
+      ]
+      const capture = vi
+        .fn<typeof fetch>()
+        .mockImplementation(
+          async () =>
+            new Response(
+              events
+                .map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+                .join(''),
+              { headers: { 'Content-Type': 'text/event-stream' } }
+            )
+        )
+      const stream = models[method](
+        models.getModel('zcode', 'GLM-5.2')!,
+        {
+          messages: [{ role: 'user', content: 'Call ping', timestamp: 0 }]
+        },
+        { fetch: capture }
+      )
+      const result = await stream.result()
+      expect(result.stopReason).toBe('toolUse')
+      expect(result.content).toContainEqual(
+        expect.objectContaining({ type: 'toolCall', name: 'ping', arguments: { value: 1 } })
+      )
+      const [url, init] = capture.mock.calls[0]
+      expect(String(url)).toContain(`${ZCODE_BASE_URL}/v1/messages`)
+      expect(new Headers(init?.headers).get('Authorization')).toBe(`Bearer ${token}`)
+      expect(new Headers(init?.headers).has('x-api-key')).toBe(false)
+    }
+  )
+
+  it('does not resolve a ZCode login token for an edited external endpoint', async () => {
+    const { resolveRequestAuth } = await import('../../ai/credentials')
+    const before = vi.mocked(resolveRequestAuth).mock.calls.length
+    const provider = toPiProvider({
+      id: 'zcode',
+      displayName: 'ZCode',
+      kind: 'chat',
+      protocol: 'anthropic-messages',
+      baseUrl: 'https://example.test',
+      apiKey: { kind: 'oauth', id: 'zcode-key', provider: 'zcode' },
+      models: []
+    })
+    await expect(
+      provider.auth.apiKey!.resolve({
+        ctx: { env: async () => undefined, fileExists: async () => false },
+        signal: new AbortController().signal
+      })
+    ).rejects.toThrow('subscription endpoint')
+    expect(vi.mocked(resolveRequestAuth).mock.calls.length).toBe(before)
+  })
+})
 
 const openaiProvider: ProviderConfig = {
   id: 'openai',
@@ -203,6 +310,102 @@ describe('toPiModel', () => {
 
       expect(toPiModel(custom, custom.models[0]).thinkingLevelMap).toEqual(mine)
     })
+
+    /**
+     * responses 那两条路上，没给档位 pi 就发 `effort: "none"`，除非写明 `off: null`。
+     * 哪本目录都没收录的型号认不认 none 没人知道，猜错就是整个模型用不了（GPT-6.1 Sol 那次）
+     */
+    it.each(['openai-responses', 'openai-codex-responses'] as const)(
+      '%s 上目录外的推理模型不发 none',
+      (protocol) => {
+        const gateway: ProviderConfig = {
+          ...provider,
+          id: 'my-gateway',
+          protocol,
+          models: [{ id: 'gpt-next-unlisted', supportsReasoning: true }]
+        }
+
+        expect(toPiModel(gateway, gateway.models[0]).thinkingLevelMap).toEqual({ off: null })
+      }
+    )
+
+    it('目录外的不推理模型、别的协议照旧不带阶梯', () => {
+      const plain: ProviderConfig = {
+        ...provider,
+        id: 'my-gateway',
+        protocol: 'openai-responses',
+        models: [{ id: 'gpt-next-unlisted', supportsReasoning: false }]
+      }
+      const completions: ProviderConfig = {
+        ...plain,
+        protocol: 'openai-completions',
+        models: [{ id: 'gpt-next-unlisted', supportsReasoning: true }]
+      }
+
+      expect(toPiModel(plain, plain.models[0]).thinkingLevelMap).toBeUndefined()
+      expect(toPiModel(completions, completions.models[0]).thinkingLevelMap).toBeUndefined()
+    })
+
+    /**
+     * 2026-10-18 的真实配置：第二个 OpenAI 渠道自动起名 `openai-4`、没存 `catalogId`，
+     * 存下的阶梯是老版本滤掉 `off` 之后的样子。目录按 id 查不到，`off: null` 补不回来，
+     * pi 就在「自动」档、上下文压缩这类不带档位的请求里发 `effort: "none"`，
+     * GPT-6.1 Sol 不认，每轮 400。这里直接看 pi 组出来的请求体。
+     */
+    describe('不认 none 的模型收不到 none', () => {
+      const savedSol = {
+        id: 'gpt-6.1-sol',
+        supportsReasoning: true,
+        thinkingLevelMap: { minimal: null, xhigh: 'xhigh', max: 'max' }
+      }
+
+      async function sentEffort(
+        provider: ProviderConfig,
+        reasoning?: 'low'
+      ): Promise<string | undefined> {
+        const model = toPiModel(provider, provider.models[0])
+        let payload: { reasoning?: { effort?: string } } | undefined
+        const events = streamSimple(
+          model as Parameters<typeof streamSimple>[0],
+          normalizeContext({ messages: [{ role: 'user', content: 'hi', timestamp: 0 }] }),
+          {
+            apiKey: 'sk-test-key',
+            reasoning,
+            onPayload: (params) => {
+              payload = params as typeof payload
+              throw new Error('stop before network')
+            }
+          }
+        )
+        for await (const event of events) if (event.type === 'error') break
+        expect(payload).toBeDefined()
+        return payload?.reasoning?.effort
+      }
+
+      const channels: ProviderConfig[] = [
+        { ...openaiProvider, id: 'openai-4', models: [savedSol] },
+        { ...openaiProvider, id: 'my-gateway', catalogId: 'openai', models: [savedSol] },
+        { ...openaiProvider, id: 'my-gateway', models: [savedSol] }
+      ]
+
+      it.each(channels.map((channel) => [channel.id, channel.catalogId ?? '-', channel] as const))(
+        '%s（catalogId %s）「自动」档不发 effort，选了 low 就发 low',
+        async (_id, _catalogId, channel) => {
+          expect(await sentEffort(channel)).toBeUndefined()
+          expect(await sentEffort(channel, 'low')).toBe('low')
+        }
+      )
+
+      it('自建网关恰好叫 openai-2、协议不同时不冒认 OpenAI 目录', () => {
+        const gateway: ProviderConfig = {
+          ...ollamaProvider,
+          id: 'openai-2',
+          models: [{ id: 'gpt-6.1-sol' }]
+        }
+
+        expect(toPiModel(gateway, gateway.models[0]).thinkingLevelMap).toBeUndefined()
+      })
+    })
   })
 
   /**
@@ -305,6 +508,23 @@ describe('toPiModel', () => {
 
       expect(adaptiveOf(model)).toBe(true)
       expect(getSupportedThinkingLevels(model)).toContain('max')
+    })
+
+    /**
+     * 中转网关、第二个 Claude 渠道（自动起名 `anthropic-4`）按自己的 id 两本目录
+     * 都查不到。Sonnet 5.5 只认自适应，退回预算那条路就是整轮 400。
+     */
+    it('Anthropic 协议的其他渠道也按官方目录认型号', () => {
+      const provider = {
+        ...claude([{ id: 'claude-sonnet-5-5' }]),
+        id: 'anthropic-4',
+        baseUrl: 'https://relay.example.com'
+      }
+      const model = toPiModel(provider, provider.models[0])
+
+      expect(adaptiveOf(model)).toBe(true)
+      expect(getSupportedThinkingLevels(model)).toContain('max')
+      expect(getSupportedThinkingLevels(model)).not.toContain('off')
     })
 
     /** 4.6 那几代 pi 目录里就有，不必再往我们的目录里抄一遍 */
@@ -470,6 +690,38 @@ describe('toPiProvider', () => {
     })
 
     expect(result?.auth.apiKey).toBe('not-required')
+  })
+
+  it('取不到密钥、且服务商已从设置里删掉时，照实说是被删了', async () => {
+    const { resolveRequestAuth } = await import('../../ai/credentials')
+    const { readSettings } = await import('../../ai/store')
+    vi.mocked(resolveRequestAuth).mockRejectedValueOnce(new Error('密钥不存在'))
+    vi.mocked(readSettings).mockResolvedValueOnce({ version: 3, providers: [], roles: {} })
+
+    const resolving = toPiProvider(openaiProvider).auth.apiKey!.resolve({
+      ctx: { env: async () => undefined, fileExists: async () => false },
+      signal: new AbortController().signal
+    })
+
+    await expect(resolving).rejects.toThrow(`「${openaiProvider.displayName}」已从模型设置中删除`)
+  })
+
+  it('服务商还在时，密钥库的原始报错原样抛出', async () => {
+    const { resolveRequestAuth } = await import('../../ai/credentials')
+    const { readSettings } = await import('../../ai/store')
+    vi.mocked(resolveRequestAuth).mockRejectedValueOnce(new Error('密钥不存在'))
+    vi.mocked(readSettings).mockResolvedValueOnce({
+      version: 3,
+      providers: [openaiProvider],
+      roles: {}
+    })
+
+    const resolving = toPiProvider(openaiProvider).auth.apiKey!.resolve({
+      ctx: { env: async () => undefined, fileExists: async () => false },
+      signal: new AbortController().signal
+    })
+
+    await expect(resolving).rejects.toThrow('密钥不存在')
   })
 
   it('密钥来源描述不含密钥本身', async () => {

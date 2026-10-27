@@ -20,9 +20,9 @@
         size="small"
         variant="primary"
         class="btn-allow"
-        @click="handleAllowForSession"
+        @click="handleAllowForChat"
       >
-        {{ $t('miniSensitiveConfirm.actions.allowSession') }}
+        {{ $t('miniSensitiveConfirm.actions.allowForChat') }}
       </AppButton>
       <AppButton size="small" variant="primary" class="btn-confirm" @click="handleConfirm">
         {{ $t('miniSensitiveConfirm.actions.confirm') }}
@@ -65,8 +65,8 @@ function handleConfirm(): void {
   reply('approve')
 }
 
-/** 「本次会话都允许」。V3 的 'always' 语义就是「本会话内该工具不再询问」，正好对上 */
-function handleAllowForSession(): void {
+/** 「本对话内都允许」。V3 的 'always' 语义是「本 session 内该工具不再询问」，对用户就是这条对话 */
+function handleAllowForChat(): void {
   reply('always')
 }
 
@@ -76,10 +76,11 @@ function handleReject(): void {
 </script>
 
 <style scoped lang="less">
+/* 和主窗口那张确认卡同一套：中性底，警示色只留给图标（理由见 SensitiveActionConfirm.vue） */
 .mini-sensitive-confirm {
-  background: var(--color-warning-bg);
-  border: 1px solid var(--color-warning-border);
-  border-radius: 8px;
+  background: var(--color-bg-surface-hover);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 12px;
   padding: 10px 12px;
   margin: 8px 0;
   animation: slideIn 0.2s ease-out;
@@ -111,13 +112,13 @@ function handleReject(): void {
 .title {
   flex: 1;
   font-weight: 600;
-  color: var(--color-warning-text);
+  color: var(--color-text-primary);
   font-size: 13px;
 }
 
 .queued {
   font-size: 11px;
-  color: var(--color-warning-text);
+  color: var(--color-text-secondary);
 }
 
 .confirm-body {
@@ -150,24 +151,7 @@ function handleReject(): void {
   }
 }
 
-.btn-allow {
-  background: var(--color-success-bg) !important;
-  border-color: var(--color-success-border) !important;
-  color: var(--color-success-text) !important;
-
-  &:hover {
-    background: var(--color-success-bg) !important;
-  }
-}
-
 .btn-confirm {
-  background: var(--color-warning-solid) !important;
-  border: none !important;
-  color: var(--color-warning-on-solid) !important;
   font-weight: 500;
-
-  &:hover {
-    background: var(--color-warning-solid-hover) !important;
-  }
 }
 </style>

@@ -51,6 +51,7 @@ const LOGO_ALIAS = {
   // 生图条目是同一家厂商的另一个入口（见 CURATED 里的「图片生成」一段），
   // 用母公司的标，免得目录里出现一排没有图标的方块
   'openai-image': 'openai',
+  'chatgpt-image': 'openai',
   'google-image': 'google',
   'xai-image': 'xai',
   'ark-seedream': 'bytedance',
@@ -60,6 +61,7 @@ const LOGO_ALIAS = {
 
   // 网页检索里的 Jina 也是同一家的另一个入口
   'jina-search': 'jina',
+  'deepseek-search': 'deepseek',
 
   // 向量化条目同理（见 CURATED 里的「向量化」一段）
   'ollama-embedding': 'ollama',
@@ -74,6 +76,7 @@ const LOGO_ALIAS = {
   'alibaba-tts': 'alibaba',
   'doubao-stt': 'bytedance',
   'alibaba-asr': 'alibaba',
+  'siliconflow-stt': 'siliconflow',
   'doubao-realtime': 'bytedance'
 
   // 3D 那三家（hyper3d / tripo / meshy）在 models.dev 里没有条目，也没有可借用的
@@ -193,8 +196,10 @@ const KEY_PAGE = {
   // 火山的**语音**控制台，不是方舟那个 —— 两条产品线的凭据互不通用
   'doubao-tts': 'https://console.volcengine.com/speech/new/setting/apikeys',
   'alibaba-tts': 'https://bailian.console.aliyun.com/?apiKey=1',
+  'fish-audio-tts': 'https://fish.audio/app/api-keys',
   'doubao-stt': 'https://console.volcengine.com/speech/new/setting/apikeys',
   'alibaba-asr': 'https://bailian.console.aliyun.com/?apiKey=1',
+  'siliconflow-stt': 'https://cloud.siliconflow.cn/account/ak',
   'doubao-realtime': 'https://console.volcengine.com/speech/app',
 
   // ── 3D 生成 ──
@@ -330,6 +335,14 @@ export const CURATED = [
     displayName: 'CodeBuddy / WorkBuddy',
     supportsOAuth: true
   },
+  {
+    id: 'zcode',
+    group: 'subscription',
+    baseUrl: 'https://zcode.z.ai/api/v1/zcode-plan/anthropic',
+    protocol: 'anthropic-messages',
+    displayName: 'ZCode Coding Plan',
+    supportsOAuth: true
+  },
 
   // ── 图片生成 ──
   //
@@ -349,6 +362,18 @@ export const CURATED = [
     baseUrl: 'https://api.openai.com/v1',
     protocol: 'openai-responses',
     displayName: 'OpenAI GPT Image'
+  },
+  // ChatGPT 订阅出图：与上面的「Codex」对话是同一个账号、同一个后端，走的是 Codex CLI
+  // 出图那条路（Responses 的 image_generation 工具，适配器 codex-images）。额度算在订阅里，
+  // 不按张计费。oauthProvider 让已经登录过 Codex 的用户直接沿用那份登录
+  {
+    id: 'chatgpt-image',
+    group: 'image',
+    baseUrl: 'https://chatgpt.com/backend-api/codex',
+    protocol: 'openai-codex-responses',
+    displayName: 'Codex 生图（ChatGPT 订阅）',
+    supportsOAuth: true,
+    oauthProvider: 'chatgpt'
   },
   {
     id: 'google-image',
@@ -417,8 +442,8 @@ export const CURATED = [
   },
 
   // ── 网页检索 ──
-  // 这一组的「模型」不是模型，是**去哪儿搜**。三条各缺一样东西，都是真实情况：
-  // 内置浏览器没有地址也没有密钥，SearXNG 只有地址，只有 Jina 三样齐全。
+  // 这一组的「模型」不是模型，是**去哪儿搜**。几条各缺一样东西，都是真实情况：
+  // 内置浏览器没有地址也没有密钥，SearXNG 只有地址，Jina 和 DeepSeek 三样齐全。
   {
     id: 'builtin-browser',
     group: 'search',
@@ -440,6 +465,13 @@ export const CURATED = [
     group: 'search',
     baseUrl: 'https://s.jina.ai',
     displayName: 'Jina AI（网页检索）'
+  },
+  {
+    id: 'deepseek-search',
+    group: 'search',
+    // 不带 /v1：接口路径是 /v1/tools/search，由 deepseekSearch.ts 自己拼
+    baseUrl: 'https://api.deepseek.com',
+    displayName: 'DeepSeek（网页检索）'
   },
 
   // ── 结构化判定 ──
@@ -571,6 +603,12 @@ export const CURATED = [
     displayName: 'ElevenLabs Music'
   },
   {
+    id: 'elevenlabs-sfx',
+    group: 'sfx',
+    baseUrl: 'https://api.elevenlabs.io/v1',
+    displayName: 'ElevenLabs 音效'
+  },
+  {
     id: 'sunoapi-music',
     group: 'music',
     baseUrl: 'https://api.sunoapi.org/api/v1',
@@ -596,10 +634,25 @@ export const CURATED = [
     baseUrl: 'wss://dashscope.aliyuncs.com/api-ws/v1/inference',
     displayName: '阿里云 Qwen-Audio 3.0 语音合成'
   },
+  {
+    id: 'fish-audio-tts',
+    group: 'tts',
+    baseUrl: 'https://api.fish.audio/v1',
+    displayName: 'Fish Audio'
+  },
 
   // ── 语音识别 ──
   // 这一组只转写、不回话。与上面那两家是**同一个控制台、同一把密钥**，
   // 单独列条目是因为地址不同（一个 Provider = 一个地址 + 一套凭据 + 一种用途）。
+  {
+    id: 'local-tts',
+    group: 'tts',
+    // Kokoro-FastAPI 的默认地址。CosyVoice、GPT-SoVITS 的 OpenAI 兼容封装、LocalAI
+    // 改成它们自己的 /v1 —— 走的都是 /audio/speech（ai/speechOpenAi.ts）
+    baseUrl: 'http://127.0.0.1:8880/v1',
+    displayName: '本机语音合成',
+    requiresApiKey: false
+  },
   {
     id: 'doubao-stt',
     group: 'stt',
@@ -611,6 +664,25 @@ export const CURATED = [
     group: 'stt',
     baseUrl: 'wss://dashscope.aliyuncs.com/api-ws/v1/inference',
     displayName: '阿里云 Qwen-Audio 语音识别'
+  },
+  // 下面两条走 OpenAI 兼容的整段转写（ai/stt/transcriptionStt.ts）：
+  // 不是流式的，断句在我们这边做
+  {
+    id: 'siliconflow-stt',
+    group: 'stt',
+    baseUrl: 'https://api.siliconflow.cn/v1',
+    displayName: '硅基流动 SenseVoice'
+  },
+  {
+    id: 'local-stt',
+    group: 'stt',
+    // Gradio 网页界面的默认地址：SenseVoice 官方 webui.py、各种一键包都是它，
+    // 也是用户在浏览器里打开的那个。api.py 填 :50000/api/v1/asr，Xinference、FunASR、
+    // speaches 这些 OpenAI 兼容的服务填它们自己的 /v1 —— 适配器按地址认是哪一种
+    baseUrl: 'http://127.0.0.1:7860',
+    // 卡片放不下更长的名字；SenseVoice、Whisper 这些词靠模型名搜得到
+    displayName: '本机语音识别',
+    requiresApiKey: false
   },
   {
     id: 'doubao-realtime',
@@ -675,6 +747,13 @@ export const CURATED = [
   { id: 'baseten', group: 'cloud', baseUrl: 'https://inference.baseten.co/v1' },
   { id: 'venice', group: 'cloud', baseUrl: 'https://api.venice.ai/api/v1' },
   { id: 'inference', group: 'cloud', baseUrl: 'https://api.inference.net/v1' },
+  // Meta 的 Muse 系列。只预置当前主力的两个，旧版和 contributor 变体让用户按需导入
+  {
+    id: 'meta',
+    group: 'cloud',
+    baseUrl: 'https://api.meta.ai/v1',
+    onlyModels: ['muse-spark-1.3', 'muse-wonder-1.0']
+  },
   { id: 'amazon-bedrock', group: 'cloud', baseUrl: '', requiresApiKey: true },
   { id: 'azure', group: 'cloud', baseUrl: '', requiresApiKey: true },
   { id: 'google-vertex', group: 'cloud', baseUrl: '', requiresApiKey: true },
@@ -837,6 +916,25 @@ const model3d = (id, name, api) => ({
  *    份额不小，先手写几个主力模型；等 models.dev 收录了就把这里删掉。
  */
 const MANUAL_ENTRIES = {
+  // Subscription model ID is case-sensitive (maskeb34/zcode, routes/gateway.py).
+  // Limits verified against zcode.z.ai/api/v1/client/configs on 2026-10-13.
+  // Other account models can be added manually.
+  zcode: {
+    name: 'ZCode Coding Plan',
+    env: [],
+    doc: 'https://zcode.z.ai',
+    models: {
+      'GLM-5.2': model(
+        'GLM-5.2',
+        'GLM-5.2',
+        false,
+        true,
+        { context: 1_048_576, output: 131_072 },
+        true,
+        { release_date: '2026-06-13' }
+      )
+    }
+  },
   /**
    * CodeBuddy 会员。models.dev 没有这一家，而且它**没有** `/models` 接口，
    * 「导入模型」用不了 —— 清单不能留空（理由同下面 chatgpt 那条）。
@@ -958,6 +1056,15 @@ const MANUAL_ENTRIES = {
       // 塞进 `web_search` 的契约里本来就不成立。知识库的深度研究现在跑盒子自己的
       // 研究内核（`agent-v3/core/research/`），更不需要它。
       's.jina.ai': { id: 's.jina.ai', name: '网页搜索（s.jina.ai）' }
+    }
+  },
+  'deepseek-search': {
+    name: 'DeepSeek',
+    env: ['DEEPSEEK_API_KEY'],
+    doc: 'https://platform.deepseek.com/api_keys',
+    models: {
+      // 接口没有模型之分，只有一个 /v1/tools/search。和对话那条 DeepSeek 共用一把 Key
+      search: { id: 'search', name: '网页搜索（/v1/tools/search）' }
     }
   },
   'openai-embedding': {
@@ -1099,6 +1206,16 @@ const MANUAL_ENTRIES = {
     doc: 'https://elevenlabs.io/docs/api-reference/music/compose',
     models: { music_v2: { id: 'music_v2', name: 'Eleven Music v2' } }
   },
+  'elevenlabs-sfx': {
+    name: 'ElevenLabs 音效',
+    env: ['ELEVENLABS_API_KEY'],
+    doc: 'https://elevenlabs.io/docs/api-reference/text-to-sound-effects/convert',
+    models: {
+      // v2 在前当默认：官方文档写明 loop 只有 v2 支持；v3 接口已收，文档未列
+      eleven_text_to_sound_v2: { id: 'eleven_text_to_sound_v2', name: 'Eleven Sound Effects v2' },
+      eleven_text_to_sound_v3: { id: 'eleven_text_to_sound_v3', name: 'Eleven Sound Effects v3' }
+    }
+  },
   'mureka-music': {
     name: 'Mureka',
     env: ['MUREKA_API_KEY'],
@@ -1130,6 +1247,21 @@ const MANUAL_ENTRIES = {
         name: 'Qwen-Audio 3.0 TTS Flash',
         ttsVoice: 'longanfengyue'
       }
+    }
+  },
+  /*
+   * 音色填 fish.audio 音色页地址里的那串 ID（reference_id），留空用它的默认音色。
+   * s2.1-pro 在前当默认：接口不带 model 头时也是落到它
+   */
+  'fish-audio-tts': {
+    name: 'Fish Audio',
+    env: ['FISH_API_KEY'],
+    doc: 'https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to-speech',
+    models: {
+      's2.1-pro': { id: 's2.1-pro', name: 'Fish Audio S2.1 Pro' },
+      'drama-3': { id: 'drama-3', name: 'Fish Audio Drama 3' },
+      's2-pro': { id: 's2-pro', name: 'Fish Audio S2 Pro' },
+      s1: { id: 's1', name: 'Fish Audio S1' }
     }
   },
   'doubao-tts': {
@@ -1180,6 +1312,35 @@ const MANUAL_ENTRIES = {
         name: 'Qwen-Audio 3.0 ASR Flash Streaming'
       },
       'fun-asr-realtime': { id: 'fun-asr-realtime', name: 'Fun-ASR Realtime' }
+    }
+  },
+  'local-tts': {
+    name: '本机语音合成',
+    env: [],
+    doc: 'https://github.com/remsky/Kokoro-FastAPI',
+    models: {
+      // Kokoro 的中文女声。别的服务换成它自己的模型名和音色
+      kokoro: { id: 'kokoro', name: 'Kokoro', ttsVoice: 'zf_xiaobei' }
+    }
+  },
+  'siliconflow-stt': {
+    name: '硅基流动 SenseVoice',
+    env: ['SILICONFLOW_API_KEY'],
+    doc: 'https://docs.siliconflow.cn/cn/api-reference/audio/create-audio-transcriptions',
+    models: {
+      'FunAudioLLM/SenseVoiceSmall': {
+        id: 'FunAudioLLM/SenseVoiceSmall',
+        name: 'SenseVoice Small'
+      }
+    }
+  },
+  'local-stt': {
+    name: '本机语音识别',
+    env: [],
+    doc: 'https://github.com/FunAudioLLM/SenseVoice',
+    models: {
+      // SenseVoice 自带的服务不看这一栏；OpenAI 兼容的服务按它找模型（Xinference 里就叫这个名字）
+      SenseVoiceSmall: { id: 'SenseVoiceSmall', name: 'SenseVoice Small' }
     }
   },
   'doubao-realtime': {
@@ -1258,6 +1419,9 @@ const MANUAL_ENTRIES = {
     // 模型**，所以最后那个参数一律为 true —— 少了它输入框里的「思考程度」
     // 对 ChatGPT 订阅完全不起作用。
     models: {
+      'gpt-6.1-sol': model('gpt-6.1-sol', 'GPT-6.1 Sol', true, true, CODEX_LIMIT, true, {
+        release_date: '2026-09-29'
+      }),
       'gpt-6-astra': model('gpt-6-astra', 'GPT-6 Astra', true, true, CODEX_LIMIT, true, {
         release_date: '2026-09-04'
       }),
@@ -1275,25 +1439,9 @@ const MANUAL_ENTRIES = {
       }),
       'gpt-5.6-luna': model('gpt-5.6-luna', 'GPT-5.6 Luna', true, true, CODEX_LIMIT, true, {
         release_date: '2026-07-09'
-      }),
-      'gpt-5.5': model('gpt-5.5', 'GPT-5.5', true, true, CODEX_LIMIT, true, {
-        release_date: '2026-04-23'
-      }),
-      'gpt-5.4': model('gpt-5.4', 'GPT-5.4', true, true, CODEX_LIMIT, true, {
-        release_date: '2026-03-05'
-      }),
-      'gpt-5.4-mini': model('gpt-5.4-mini', 'GPT-5.4 mini', true, true, CODEX_LIMIT, true, {
-        release_date: '2026-03-17'
-      }),
-      'gpt-5.3-codex-spark': model(
-        'gpt-5.3-codex-spark',
-        'GPT-5.3 Codex Spark',
-        false,
-        true,
-        { context: 128_000, output: 128_000 },
-        true,
-        { release_date: '2026-02-12' }
-      )
+      })
+      // 下线的不留：GPT-5.4 / 5.4 mini（08-31）、5.3 Codex Spark（09-14）、
+      // GPT-5.5（10-14）。https://learn.chatgpt.com/docs/models (2026-10-12)
     }
   },
   /**
@@ -1306,6 +1454,23 @@ const MANUAL_ENTRIES = {
    *
    * 下面每一条的接口路径与 model id 都在 2026-08 逐一核对过厂商文档。
    */
+  /**
+   * 模型 id 是**驱动生图工具的对话模型**，不是画图的那个 —— 画图的模型由 Codex 后端定，
+   * 请求里指定了也不听（2026-10-17 实测）。取同一批订阅模型里最轻的一档：它只负责把
+   * 提示词交给工具，一次约两千 token。下线了用户可以在详情里换成别的 Codex 模型。
+   */
+  'chatgpt-image': {
+    name: 'Codex 生图（ChatGPT 订阅）',
+    env: [],
+    doc: 'https://developers.openai.com/codex/auth',
+    models: {
+      'gpt-5.6-luna': imageModel(
+        'gpt-5.6-luna',
+        'GPT Image（经 GPT-5.6 Luna 调用）',
+        'codex-images'
+      )
+    }
+  },
   'openai-image': {
     name: 'OpenAI GPT Image',
     env: ['OPENAI_API_KEY'],
@@ -1442,6 +1607,9 @@ const MANUAL_ENTRIES = {
       // 别名，跟着厂商滚动。默认给这个 —— 判定的问题是我们写死在代码里的，
       // 版本锁死收益不大，而新版本修的正是 jaggedness 上那些已知短板。
       'jev-latest': { id: 'jev-latest', name: 'Jev（最新）' },
+      // 2026-10-14 发布：https://typesafe.ai/blog/jev-1-14
+      'jev-preview': { id: 'jev-preview', name: 'Jev Preview' },
+      'jev-1.14.0': { id: 'jev-1.14.0', name: 'Jev 1.14.0' },
       // 要可复现的判定时绑这个：同一份 state 同一组问题，换了版本答案会变
       'jev-1.13.0': { id: 'jev-1.13.0', name: 'Jev 1.13（锁定版本）' }
     }
@@ -1465,6 +1633,7 @@ const GROUP_KIND = {
   tts: 'tts',
   stt: 'stt',
   music: 'music',
+  sfx: 'sfx',
   search: 'search',
   judge: 'judge'
 }
@@ -1645,6 +1814,10 @@ const THINKING_OVERRIDES = {
     // https://developers.openai.com/api/docs/models/gpt-6-sol / gpt-6-luna (2026-09-23)
     'gpt-6-sol': { thinking: { minimal: null, xhigh: 'xhigh', max: 'max' } },
     'gpt-6-luna': { thinking: { minimal: null, xhigh: 'xhigh', max: 'max' } },
+    // https://developers.openai.com/api/docs/models/gpt-6.1-sol (2026-10-12)
+    // 没有 `none`：pi 不给档位时默认发 effort: "none"，400「Supported values are: 'low',
+    // 'medium', 'high', 'xhigh', and 'max'」（2026-10-15 团队换模型体检撞上）
+    'gpt-6.1-sol': { thinking: { off: null, minimal: null, xhigh: 'xhigh', max: 'max' } },
     'gpt-5.6': {
       thinking: {
         minimal: null,
@@ -1661,21 +1834,18 @@ const THINKING_OVERRIDES = {
    * ChatGPT 订阅（Codex 那条 responses 路）。型号与 OpenAI 直连同源，
    * 但 provider id 对不上 pi 的 `openai-codex`，整家拿不到阶梯。
    *
-   * `max` 只有 5.6 那一代有；5.5 / 5.4 / codex-spark 到 xhigh 为止 ——
-   * 显式写 `null` 而不是省略，是为了让「这一档查过了、确实没有」和
-   * 「还没查」在这张表里长得不一样。
+   * 6.x 与 5.6 都有 `max`、都没有 `minimal`。显式写 `null` 而不是省略，
+   * 是为了让「这一档查过了、确实没有」和「还没查」在这张表里长得不一样。
    */
   chatgpt: {
+    // 同 openai 那条：6.1 Sol 没有 `none`
+    'gpt-6.1-sol': { thinking: { off: null, minimal: null, xhigh: 'xhigh', max: 'max' } },
     'gpt-6-astra': { thinking: { minimal: null, xhigh: 'xhigh', max: 'max' } },
     'gpt-6-sol': { thinking: { minimal: null, xhigh: 'xhigh', max: 'max' } },
     'gpt-6-luna': { thinking: { minimal: null, xhigh: 'xhigh', max: 'max' } },
     'gpt-5.6-sol': { thinking: { minimal: null, xhigh: 'xhigh', max: 'max' } },
     'gpt-5.6-terra': { thinking: { minimal: null, xhigh: 'xhigh', max: 'max' } },
-    'gpt-5.6-luna': { thinking: { minimal: null, xhigh: 'xhigh', max: 'max' } },
-    'gpt-5.5': { thinking: { minimal: null, xhigh: 'xhigh', max: null } },
-    'gpt-5.4': { thinking: { minimal: null, xhigh: 'xhigh', max: null } },
-    'gpt-5.4-mini': { thinking: { minimal: null, xhigh: 'xhigh', max: null } },
-    'gpt-5.3-codex-spark': { thinking: { minimal: null, xhigh: 'xhigh', max: null } }
+    'gpt-5.6-luna': { thinking: { minimal: null, xhigh: 'xhigh', max: 'max' } }
   },
 
   /*
@@ -1690,7 +1860,12 @@ const THINKING_OVERRIDES = {
     // Opus 5.5 的思考关不掉：发 `thinking: disabled` 在任何档位都是 400，
     // 所以 `off` 写成不存在（pi 给 Fable 5 也是这么标的）。
     // https://platform.claude.com/docs/en/build-with-claude/effort (2026-09-23)
-    'claude-opus-5-5': { adaptive: true, thinking: { off: null, xhigh: 'xhigh', max: 'max' } }
+    'claude-opus-5-5': { adaptive: true, thinking: { off: null, xhigh: 'xhigh', max: 'max' } },
+    // Sonnet 5.5 只认自适应思考：老式预算 400「requires adaptive thinking or
+    // thinking.type=between_tools」；`disabled` 也不收（关思考要发 between_tools，
+    // pi 没有这一档），所以 `off` 同样写成不存在。
+    // https://platform.claude.com/docs/en/build-with-claude/effort (2026-10-15)
+    'claude-sonnet-5-5': { adaptive: true, thinking: { off: null, xhigh: 'xhigh', max: 'max' } }
   },
 
   // 2026-09-16: https://api-docs.deepseek.com/guides/thinking_mode/
@@ -1754,10 +1929,39 @@ const MODEL_OVERRIDES = {
   }
 }
 
+/**
+ * 上游列着、厂商那边其实没有的模型。预置进去，用户一绑就是一句「模型不存在」。
+ *
+ * 刷完目录跑一遍 `pnpm check:catalog-models`，查出「不存在」的写到这里。
+ *
+ * 硅基流动（2026-10-09 拿真账号逐个发请求核对）：这几个回 20012 Model does not exist。
+ * 回 30004「私有模型」的不在这里 —— 那是账号权限，换个账号可能就能用。
+ * 社区真机：Agent 绑了 Kimi K3，盒子里一用就是 400
+ */
+const MODEL_REMOVALS = {
+  siliconflow: new Set([
+    'moonshotai/Kimi-K3',
+    'deepseek-ai/DeepSeek-V4-Pro-0813',
+    'deepseek-ai/DeepSeek-V4-Flash-Vision-Exp',
+    'Qwen/Qwen3.8-2.4T-A95B',
+    'tencent/Hy3'
+  ]),
+  // 小米（同日，`check-catalog-models.mjs`）：回 400 Unsupported model
+  xiaomi: new Set(['mimo-v2.5-pro-ultraspeed'])
+}
+
 /** Keep stable app provider IDs while reading metadata for the exact configured route. */
 export function sourceFor(item, upstream) {
   const source = upstream[item.sourceId || item.id] || MANUAL_ENTRIES[item.id]
   if (!source) return undefined
+  if (item.onlyModels) {
+    return {
+      ...source,
+      models: Object.fromEntries(
+        Object.entries(source.models).filter(([id]) => item.onlyModels.includes(id))
+      )
+    }
+  }
   if (item.id !== 'bytedance') return source
   return {
     ...source,
@@ -1776,6 +1980,7 @@ export function pickModels(models, providerId, onlyProtocol) {
   // 按日期排序时会把真正能用的对话模型挤出预置清单。
   // 没有 modalities 字段的留着：判断不了，不该替上游做减法。
   const all = Object.values(models)
+    .filter((m) => !MODEL_REMOVALS[providerId]?.has(m.id))
     .map((m) => ({
       ...m,
       ...MODEL_OVERRIDES[providerId]?.[m.id]
@@ -1910,7 +2115,9 @@ const NO_LOGO = new Set([
   'mureka-music',
   'sunoapi-music',
   'builtin-browser',
-  'searxng'
+  'searxng',
+  'local-stt',
+  'local-tts'
 ])
 
 async function downloadLogo(id, aliasOf) {
@@ -1956,7 +2163,7 @@ async function main() {
 
     const protocol = item.protocol || NPM_TO_PROTOCOL[source.npm] || 'openai-completions'
     const models =
-      item.group === 'tts' || item.group === 'music'
+      item.group === 'tts' || item.group === 'music' || item.group === 'sfx'
         ? Object.values(source.models).map((model) => ({
             id: model.id,
             displayName: model.name,
@@ -2009,6 +2216,7 @@ async function main() {
       defaultEnvVar: (source.env || [])[0],
       hasLogo,
       supportsOAuth: item.supportsOAuth || undefined,
+      oauthProvider: item.oauthProvider,
       models
     })
   }

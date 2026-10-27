@@ -25,6 +25,7 @@
 import { z } from 'zod'
 
 import type { V2Tool } from '../../adaptV2Tool'
+import type { ToolRisk } from '../../defineTool'
 
 import { createProjectTool } from './projectTool'
 
@@ -40,6 +41,30 @@ export const WRITE_ACTIONS = [
   'setup_level_sequence',
   'enable_plugins'
 ] as const
+
+/**
+ * 只往外加东西、不碰已有内容的写动作：新建工程、打开工程、导资产进工程 / 关卡、
+ * 建定序器（开在编辑器事务里）。这些按 mutating 走，默认的 auto-edit 不再每次问。
+ *
+ * 不在名单里的仍按声明的 destructive 问：`enable_plugins` 改用户的 .uproject，
+ * 开错了工程可能打不开；导入带 `overwrite: true` 会盖掉工程里已有的同名资产。
+ */
+const ADDITIVE_ACTIONS: ReadonlySet<string> = new Set([
+  'create_project',
+  'open_project',
+  'import_assets',
+  'import_assets_to_scene',
+  'setup_level_sequence'
+])
+
+/** `project_manage` 这一次调用的实际风险（审批门的 `riskFor`，只降不升） */
+export function projectManageRisk(args: unknown): ToolRisk {
+  const input = (args ?? {}) as { action?: unknown; overwrite?: unknown }
+  if (input.overwrite === true) return 'destructive'
+  return typeof input.action === 'string' && ADDITIVE_ACTIONS.has(input.action)
+    ? 'mutating'
+    : 'destructive'
+}
 
 type AnyTool = V2Tool & {
   description?: string
@@ -183,12 +208,12 @@ connected=false 不是打开失败，不要重复启动。用 ue_session_health 
 switched_target=true 表示本轮目标已切换。两者都确认后直接接着干。
 不要说「请你在界面上把当前工程切过去」，也不要说「请再发一条消息我下轮再来」：
 那两句话在这里都是错的，盒子已经替用户做完了。
-唯一切不过去的情况是这条会话被用户归到了另一个工程下，那时 details 里会写清楚，
+唯一切不过去的情况是这条对话被用户归到了另一个工程下，那时 details 里会写清楚，
 照实转告即可。
 
 【open_project 不改这条对话的归属】它动的是**这一轮引擎命令发给谁**，
 不动侧边栏里这条对话挂在哪个工程下。两者通常一致，所以多数时候开完就能接着干。
-只有在「这条对话被归到了别的工程」时才会撞上 session-scoped 的拒绝 ——
+只有在「这条对话被归到了别的工程」时才会被挡住切换 ——
 那时候才需要 set_session_project，而且那是用户的组织方式，换之前要有依据。
 
 【assetKeys 从哪来】先用 search_assets 找到资产，结果里的 assetKey 就是。

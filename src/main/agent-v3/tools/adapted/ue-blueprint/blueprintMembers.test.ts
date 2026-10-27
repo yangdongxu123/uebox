@@ -27,6 +27,7 @@ vi.mock('../../../core/projectTargetContext', () => ({
 
 import {
   createBlueprintComponentEventTool,
+  createBlueprintCreateEventGraphTool,
   createBlueprintEventDispatcherTool,
   createBlueprintFunctionSignatureTool,
   createSetBlueprintParentClassTool,
@@ -209,6 +210,46 @@ describe('blueprint_remove_variable', () => {
 
     expect(result.success).toBe(false)
     expect(String(result.error)).toContain('IsLocked')
+  })
+
+  it('删局部变量时透传 function，回执报引擎删掉的节点数', async () => {
+    callRequest.mockResolvedValue({
+      ok: true,
+      blueprint_path: '/Game/A/PC.PC',
+      name: 'MinDist',
+      function: 'FindNearest',
+      removed: true,
+      removed_node_count: 3
+    })
+    const result = await runRemove({
+      blueprint_path: '/Game/A/PC',
+      name: 'MinDist',
+      function: 'FindNearest'
+    })
+
+    expect((callRequest.mock.calls[0][1] as Record<string, unknown>).function).toBe('FindNearest')
+    expect(result.success).toBe(true)
+    expect(result.removed_node_count).toBe(3)
+    expect(String(result.message)).toContain('3 个')
+    expect(String(result.message)).not.toContain('孤儿')
+  })
+
+  it('引擎说局部变量还在时不报成功', async () => {
+    callRequest.mockResolvedValue({
+      ok: true,
+      blueprint_path: '/Game/A/PC.PC',
+      name: 'MinDist',
+      function: 'FindNearest',
+      removed: false,
+      removed_node_count: 0
+    })
+    const result = await runRemove({
+      blueprint_path: '/Game/A/PC',
+      name: 'MinDist',
+      function: 'FindNearest'
+    })
+
+    expect(result.success).toBe(false)
   })
 })
 
@@ -600,5 +641,73 @@ describe('blueprint_set_parent_class', () => {
 
     expect(result.success).toBe(false)
     expect(String(result.error)).toContain('cycle')
+  })
+})
+
+describe('blueprint_create_event_graph', () => {
+  const run = (input: unknown): Promise<ToolResult> =>
+    (createBlueprintCreateEventGraphTool() as unknown as Executable).execute(input)
+
+  it('发 blueprint.create_event_graph，只带蓝图路径和图名', async () => {
+    callRequest.mockResolvedValue({
+      ok: true,
+      blueprint_path: '/Game/BP_Hero.BP_Hero',
+      graph_name: 'Combat',
+      event_graphs: ['EventGraph', 'Combat']
+    })
+    await run({ blueprint_path: '/Game/BP_Hero', graph_name: 'Combat' })
+    expect(lastCall()).toEqual({
+      method: 'blueprint.create_event_graph',
+      params: { blueprint_path: '/Game/BP_Hero', graph_name: 'Combat' }
+    })
+  })
+
+  /** 回执跟着引擎走：后面 apply_graph 要填的是引擎里实际的图名，不是入参 */
+  it('图名以引擎回的为准，不回显入参', async () => {
+    callRequest.mockResolvedValue({
+      ok: true,
+      blueprint_path: '/Game/BP_Hero.BP_Hero',
+      graph_name: 'Combat_0',
+      event_graphs: ['EventGraph', 'Combat_0']
+    })
+    const result = await run({ blueprint_path: '/Game/BP_Hero', graph_name: 'Combat' })
+    expect(result.success).toBe(true)
+    expect(result.graph_name).toBe('Combat_0')
+    expect(result.message).toContain('graph_name 填 "Combat_0"')
+    expect(result.event_graphs).toEqual(['EventGraph', 'Combat_0'])
+  })
+
+  it('没存上盘要在第一句里说，存上了才说已存盘', async () => {
+    callRequest.mockResolvedValue({
+      ok: true,
+      blueprint_path: '/Game/BP_Hero.BP_Hero',
+      graph_name: 'Combat',
+      event_graphs: ['EventGraph', 'Combat'],
+      saved: false
+    })
+    const failed = await run({ blueprint_path: '/Game/BP_Hero', graph_name: 'Combat' })
+    expect(String(failed.message)).toContain('没**存盘成功')
+    expect(String(failed.message)).not.toContain('蓝图已存盘')
+
+    callRequest.mockResolvedValue({
+      ok: true,
+      blueprint_path: '/Game/BP_Hero.BP_Hero',
+      graph_name: 'Combat',
+      saved: true
+    })
+    const ok = await run({ blueprint_path: '/Game/BP_Hero', graph_name: 'Combat' })
+    expect(String(ok.message)).toContain('蓝图已存盘')
+  })
+
+  it('引擎拒绝（如函数库没有事件图）时原样带回原因', async () => {
+    callRequest.mockResolvedValue({
+      ok: false,
+      error: "Blueprint 'BPL_Math' cannot have event graphs",
+      __rpc: { code: 400 }
+    })
+    const result = await run({ blueprint_path: '/Game/BPL_Math', graph_name: 'Combat' })
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('cannot have event graphs')
+    expect(result.code).toBe(400)
   })
 })

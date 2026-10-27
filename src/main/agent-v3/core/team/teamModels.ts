@@ -111,7 +111,7 @@ export interface MemberRoute {
   pin?: TeamModel
   /** 这件活实际用的模型，记账和回话用。说不准（老 `fast` 档）时不给 */
   used?: TeamModel
-  /** 它的模型这会儿用不了，这件活改用制作人的 */
+  /** 它的模型这会儿用不了，这件活改用制作人的；没有制作人的模型（混合团队）就是盒子的默认模型 */
   fellBack: boolean
 }
 
@@ -134,6 +134,28 @@ export async function routeMember(
   // 老名册：strong 跟着制作人；fast 走对话模型，具体是哪个这里说不准
   if (member.tier === 'fast') return { fellBack: false }
   return { ...(models?.producer ? { used: models.producer } : {}), fellBack: false }
+}
+
+/**
+ * 按名单里的 id 认出模型。外部 MCP 调用方给 `task` 点名用（`hostSession.ts`）。
+ *
+ * 和队员不同，点了名就照办或者报错，不悄悄换成别的：调用方是冲着这个模型来的，
+ * 换了它也不知道，拿回来的结论就不是它要比的那个。
+ */
+export async function pickModel(models: TeamModels, key: string): Promise<TeamModel> {
+  const picked = models.candidates.find((c) => c.key === key.trim())
+  if (!picked) {
+    throw new Error(
+      `没有「${key}」这个模型。可选：${models.candidates.map((c) => c.key).join('、')}`
+    )
+  }
+  const model: TeamModel = { providerId: picked.providerId, modelId: picked.modelId }
+  if (!(await models.isAvailable(model))) {
+    throw new Error(
+      `${picked.name} 现在用不了（来源删了或模型下架了）。换一个，或省略 model 用默认模型`
+    )
+  }
+  return model
 }
 
 interface CatalogLookup {

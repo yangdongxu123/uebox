@@ -59,6 +59,21 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
     "supportsOAuth": true,
     "models": [
       {
+        "id": "gpt-6.1-sol",
+        "displayName": "GPT-6.1 Sol",
+        "supportsVision": true,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "thinkingLevelMap": {
+          "off": null,
+          "minimal": null,
+          "xhigh": "xhigh",
+          "max": "max"
+        },
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      {
         "id": "gpt-6-sol",
         "displayName": "GPT-6 Sol",
         "supportsVision": true,
@@ -140,62 +155,6 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
           "max": "max"
         },
         "contextWindow": 272000,
-        "maxOutputTokens": 128000
-      },
-      {
-        "id": "gpt-5.5",
-        "displayName": "GPT-5.5",
-        "supportsVision": true,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "thinkingLevelMap": {
-          "minimal": null,
-          "xhigh": "xhigh",
-          "max": null
-        },
-        "contextWindow": 272000,
-        "maxOutputTokens": 128000
-      },
-      {
-        "id": "gpt-5.4-mini",
-        "displayName": "GPT-5.4 mini",
-        "supportsVision": true,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "thinkingLevelMap": {
-          "minimal": null,
-          "xhigh": "xhigh",
-          "max": null
-        },
-        "contextWindow": 272000,
-        "maxOutputTokens": 128000
-      },
-      {
-        "id": "gpt-5.4",
-        "displayName": "GPT-5.4",
-        "supportsVision": true,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "thinkingLevelMap": {
-          "minimal": null,
-          "xhigh": "xhigh",
-          "max": null
-        },
-        "contextWindow": 272000,
-        "maxOutputTokens": 128000
-      },
-      {
-        "id": "gpt-5.3-codex-spark",
-        "displayName": "GPT-5.3 Codex Spark",
-        "supportsVision": false,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "thinkingLevelMap": {
-          "minimal": null,
-          "xhigh": "xhigh",
-          "max": null
-        },
-        "contextWindow": 128000,
         "maxOutputTokens": 128000
       }
     ]
@@ -993,6 +952,16 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         }
       },
       {
+        "id": "step-5-preview-free",
+        "displayName": "Step 5 Preview Free",
+        "supportsVision": true,
+        "supportsVideo": true,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 65536
+      },
+      {
         "id": "deepseek-v4.1-flash",
         "displayName": "DeepSeek V4.1 Flash",
         "supportsVision": true,
@@ -1083,19 +1052,6 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         "cost": {
           "input": 3,
           "output": 15
-        }
-      },
-      {
-        "id": "hy3",
-        "displayName": "Hy3",
-        "supportsVision": false,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "contextWindow": 256000,
-        "maxOutputTokens": 128000,
-        "cost": {
-          "input": 0.14,
-          "output": 0.58
         }
       }
     ]
@@ -1238,6 +1194,26 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         "id": "gpt-image-2",
         "displayName": "GPT Image 2",
         "imageApi": "gpt-images"
+      }
+    ]
+  },
+  {
+    "id": "chatgpt-image",
+    "displayName": "Codex 生图（ChatGPT 订阅）",
+    "group": "image",
+    "kind": "image",
+    "protocol": "openai-codex-responses",
+    "baseUrl": "https://chatgpt.com/backend-api/codex",
+    "apiKeyUrl": "https://developers.openai.com/codex/auth",
+    "requiresApiKey": true,
+    "hasLogo": true,
+    "supportsOAuth": true,
+    "oauthProvider": "chatgpt",
+    "models": [
+      {
+        "id": "gpt-5.6-luna",
+        "displayName": "GPT Image（经 GPT-5.6 Luna 调用）",
+        "imageApi": "codex-images"
       }
     ]
   },
@@ -1550,6 +1526,14 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
       {
         "id": "jev-latest",
         "displayName": "Jev（最新）"
+      },
+      {
+        "id": "jev-preview",
+        "displayName": "Jev Preview"
+      },
+      {
+        "id": "jev-1.14.0",
+        "displayName": "Jev 1.14.0"
       },
       {
         "id": "jev-1.13.0",
@@ -1874,6 +1858,28 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
     ]
   },
   {
+    "id": "elevenlabs-sfx",
+    "displayName": "ElevenLabs 音效",
+    "group": "sfx",
+    "kind": "sfx",
+    "protocol": "openai-completions",
+    "baseUrl": "https://api.elevenlabs.io/v1",
+    "apiKeyUrl": "https://elevenlabs.io/docs/api-reference/text-to-sound-effects/convert",
+    "requiresApiKey": true,
+    "defaultEnvVar": "ELEVENLABS_API_KEY",
+    "hasLogo": false,
+    "models": [
+      {
+        "id": "eleven_text_to_sound_v2",
+        "displayName": "Eleven Sound Effects v2"
+      },
+      {
+        "id": "eleven_text_to_sound_v3",
+        "displayName": "Eleven Sound Effects v3"
+      }
+    ]
+  },
+  {
     "id": "sunoapi-music",
     "displayName": "SUNO (SunoAPI.org)",
     "group": "music",
@@ -1959,6 +1965,36 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         "id": "qwen-audio-3.0-tts-flash",
         "displayName": "Qwen-Audio 3.0 TTS Flash",
         "ttsVoice": "longanfengyue"
+      }
+    ]
+  },
+  {
+    "id": "fish-audio-tts",
+    "displayName": "Fish Audio",
+    "group": "tts",
+    "kind": "tts",
+    "protocol": "openai-completions",
+    "baseUrl": "https://api.fish.audio/v1",
+    "apiKeyUrl": "https://fish.audio/app/api-keys",
+    "requiresApiKey": true,
+    "defaultEnvVar": "FISH_API_KEY",
+    "hasLogo": false,
+    "models": [
+      {
+        "id": "s2.1-pro",
+        "displayName": "Fish Audio S2.1 Pro"
+      },
+      {
+        "id": "drama-3",
+        "displayName": "Fish Audio Drama 3"
+      },
+      {
+        "id": "s2-pro",
+        "displayName": "Fish Audio S2 Pro"
+      },
+      {
+        "id": "s1",
+        "displayName": "Fish Audio S1"
       }
     ]
   },
@@ -2087,7 +2123,7 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         "supportsVision": true,
         "supportsTools": true,
         "supportsReasoning": true,
-        "contextWindow": 524288,
+        "contextWindow": 1048576,
         "maxOutputTokens": 262144,
         "cost": {
           "input": 0.68,
@@ -2101,7 +2137,7 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         "supportsTools": true,
         "supportsReasoning": true,
         "contextWindow": 262144,
-        "maxOutputTokens": 32768
+        "maxOutputTokens": 235929
       },
       {
         "id": "unbiased/pareto-26.10-preview",
@@ -2232,6 +2268,19 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
     "hasLogo": true,
     "models": [
       {
+        "id": "callstack/apex",
+        "displayName": "Apex",
+        "supportsVision": true,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "contextWindow": 262144,
+        "maxOutputTokens": 131072,
+        "cost": {
+          "input": 0.5,
+          "output": 3
+        }
+      },
+      {
         "id": "stealth/glyph-cluster",
         "displayName": "Glyph Cluster",
         "supportsVision": false,
@@ -2361,19 +2410,6 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
           "input": 3,
           "output": 15
         }
-      },
-      {
-        "id": "anthropic/claude-opus-5.5-fast",
-        "displayName": "Claude Opus 5.5 (Fast)",
-        "supportsVision": true,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "contextWindow": 1000000,
-        "maxOutputTokens": 128000,
-        "cost": {
-          "input": 8,
-          "output": 40
-        }
       }
     ]
   },
@@ -2405,15 +2441,6 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
       {
         "id": "exo-free",
         "displayName": "Exo Free",
-        "supportsVision": true,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "contextWindow": 1048576,
-        "maxOutputTokens": 131072
-      },
-      {
-        "id": "fledge-alpha-free",
-        "displayName": "Fledge Alpha Free",
         "supportsVision": true,
         "supportsTools": true,
         "supportsReasoning": true,
@@ -2457,6 +2484,16 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         "supportsReasoning": true,
         "contextWindow": 200000,
         "maxOutputTokens": 32000
+      },
+      {
+        "id": "step-5-preview-free",
+        "displayName": "Step 5 Preview Free",
+        "supportsVision": true,
+        "supportsVideo": true,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 65536
       },
       {
         "id": "deepseek-v4.1-flash",
@@ -2711,6 +2748,12 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         "supportsVision": true,
         "supportsTools": true,
         "supportsReasoning": true,
+        "thinkingLevelMap": {
+          "off": null,
+          "minimal": null,
+          "xhigh": "xhigh",
+          "max": "max"
+        },
         "contextWindow": 1050000,
         "maxOutputTokens": 128000,
         "cost": {
@@ -2917,6 +2960,12 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         "supportsVision": true,
         "supportsTools": true,
         "supportsReasoning": true,
+        "thinkingLevelMap": {
+          "off": null,
+          "xhigh": "xhigh",
+          "max": "max"
+        },
+        "adaptiveThinking": true,
         "contextWindow": 1000000,
         "maxOutputTokens": 128000,
         "cost": {
@@ -3366,7 +3415,7 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         "supportsVision": true,
         "supportsTools": true,
         "supportsReasoning": true,
-        "contextWindow": 524288,
+        "contextWindow": 1048576,
         "maxOutputTokens": 262144,
         "cost": {
           "input": 0.68,
@@ -4457,7 +4506,7 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
       },
       {
         "id": "deepseek-ai/DeepSeek-V4.1-Flash-Fast",
-        "displayName": "deepseek-ai/DeepSeek-V4.1-Flash-Fast",
+        "displayName": "DeepSeek V4.1 Flash Fast",
         "supportsVision": true,
         "supportsTools": true,
         "supportsReasoning": true,
@@ -4613,6 +4662,19 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
     "hasLogo": true,
     "models": [
       {
+        "id": "openai-gpt-61-sol-ultrafast",
+        "displayName": "GPT-6.1 Sol Ultrafast",
+        "supportsVision": true,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "contextWindow": 1050000,
+        "maxOutputTokens": 128000,
+        "cost": {
+          "input": 15,
+          "output": 75
+        }
+      },
+      {
         "id": "claude-haiku-5-5",
         "displayName": "Claude Haiku 5.5",
         "supportsVision": true,
@@ -4755,19 +4817,6 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
           "input": 4.8,
           "output": 24
         }
-      },
-      {
-        "id": "grok-4-7",
-        "displayName": "Grok 4.7",
-        "supportsVision": true,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "contextWindow": 500000,
-        "maxOutputTokens": 200000,
-        "cost": {
-          "input": 2.27,
-          "output": 6.8
-        }
       }
     ]
   },
@@ -4783,6 +4832,48 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
     "defaultEnvVar": "INFERENCE_API_KEY",
     "hasLogo": true,
     "models": []
+  },
+  {
+    "id": "meta",
+    "displayName": "Meta",
+    "group": "cloud",
+    "kind": "chat",
+    "protocol": "openai-responses",
+    "baseUrl": "https://api.meta.ai/v1",
+    "apiKeyUrl": "https://dev.meta.ai/docs",
+    "requiresApiKey": true,
+    "defaultEnvVar": "META_MODEL_API_KEY",
+    "hasLogo": true,
+    "models": [
+      {
+        "id": "muse-wonder-1.0",
+        "displayName": "Muse Wonder",
+        "supportsVision": true,
+        "supportsVideo": true,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "contextWindow": 1048576,
+        "maxOutputTokens": 131072,
+        "cost": {
+          "input": 4,
+          "output": 20
+        }
+      },
+      {
+        "id": "muse-spark-1.3",
+        "displayName": "Muse Spark 1.3",
+        "supportsVision": true,
+        "supportsVideo": true,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "contextWindow": 1048576,
+        "maxOutputTokens": 131072,
+        "cost": {
+          "input": 1.25,
+          "output": 4.25
+        }
+      }
+    ]
   },
   {
     "id": "amazon-bedrock",
@@ -5054,6 +5145,15 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         "maxOutputTokens": 500000
       },
       {
+        "id": "deepseek-v4.1-flash",
+        "displayName": "DeepSeek-V4.1-Flash",
+        "supportsVision": true,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000
+      },
+      {
         "id": "gpt-6-astra",
         "displayName": "GPT-6 Astra",
         "supportsVision": true,
@@ -5103,19 +5203,6 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         "cost": {
           "input": 5,
           "output": 25
-        }
-      },
-      {
-        "id": "gpt-5.6-luna",
-        "displayName": "GPT-5.6 Luna",
-        "supportsVision": true,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "contextWindow": 1050000,
-        "maxOutputTokens": 128000,
-        "cost": {
-          "input": 0.2,
-          "output": 1.2
         }
       }
     ]
@@ -5172,6 +5259,19 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         }
       },
       {
+        "id": "xai/grok-4.7",
+        "displayName": "Grok 4.7",
+        "supportsVision": true,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "contextWindow": 524288,
+        "maxOutputTokens": 500000,
+        "cost": {
+          "input": 2,
+          "output": 6
+        }
+      },
+      {
         "id": "gemini-3.8-flash",
         "displayName": "Gemini 3.8 Flash",
         "supportsVision": true,
@@ -5196,20 +5296,6 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         "cost": {
           "input": 10,
           "output": 50
-        }
-      },
-      {
-        "id": "gemini-flash-latest",
-        "displayName": "Gemini Flash Latest",
-        "supportsVision": true,
-        "supportsVideo": true,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "contextWindow": 1048576,
-        "maxOutputTokens": 65536,
-        "cost": {
-          "input": 1.5,
-          "output": 9
         }
       },
       {
@@ -5253,34 +5339,6 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         }
       },
       {
-        "id": "gemini-flash-lite-latest",
-        "displayName": "Gemini Flash-Lite Latest",
-        "supportsVision": true,
-        "supportsVideo": true,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "contextWindow": 1048576,
-        "maxOutputTokens": 65536,
-        "cost": {
-          "input": 0.25,
-          "output": 1.5
-        }
-      },
-      {
-        "id": "gemini-3.6-flash",
-        "displayName": "Gemini 3.6 Flash",
-        "supportsVision": true,
-        "supportsVideo": true,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "contextWindow": 1048576,
-        "maxOutputTokens": 65536,
-        "cost": {
-          "input": 0.75,
-          "output": 3.75
-        }
-      },
-      {
         "id": "gemini-3.5-flash-lite",
         "displayName": "Gemini 3.5 Flash Lite",
         "supportsVision": true,
@@ -5292,6 +5350,32 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         "cost": {
           "input": 0.3,
           "output": 2.5
+        }
+      },
+      {
+        "id": "claude-sonnet-5@default",
+        "displayName": "Claude Sonnet 5",
+        "supportsVision": true,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "cost": {
+          "input": 2,
+          "output": 10
+        }
+      },
+      {
+        "id": "zai-org/glm-5.2-maas",
+        "displayName": "GLM-5.2",
+        "supportsVision": false,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 64000,
+        "cost": {
+          "input": 1.4,
+          "output": 4.4
         }
       }
     ]
@@ -5771,19 +5855,6 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         }
       },
       {
-        "id": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
-        "displayName": "DeepSeek V4 Flash Vision Exp",
-        "supportsVision": true,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "contextWindow": 1000000,
-        "maxOutputTokens": 384000,
-        "cost": {
-          "input": 0.44,
-          "output": 1.32
-        }
-      },
-      {
         "id": "zai-org/GLM-5.3",
         "displayName": "GLM-5.3",
         "supportsVision": false,
@@ -5797,32 +5868,6 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         }
       },
       {
-        "id": "Qwen/Qwen3.8-2.4T-A95B",
-        "displayName": "Qwen3.8 2.4T A95B",
-        "supportsVision": false,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "contextWindow": 1049000,
-        "maxOutputTokens": 131000,
-        "cost": {
-          "input": 2,
-          "output": 6
-        }
-      },
-      {
-        "id": "deepseek-ai/DeepSeek-V4-Pro-0813",
-        "displayName": "DeepSeek V4 Pro 0813",
-        "supportsVision": false,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "contextWindow": 1000000,
-        "maxOutputTokens": 384000,
-        "cost": {
-          "input": 1.32,
-          "output": 3.96
-        }
-      },
-      {
         "id": "deepseek-ai/DeepSeek-V4-Flash-0731",
         "displayName": "DeepSeek V4 Flash 0731",
         "supportsVision": false,
@@ -5833,32 +5878,6 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         "cost": {
           "input": 0.22,
           "output": 0.66
-        }
-      },
-      {
-        "id": "moonshotai/Kimi-K3",
-        "displayName": "Kimi K3",
-        "supportsVision": true,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "contextWindow": 1048576,
-        "maxOutputTokens": 262000,
-        "cost": {
-          "input": 2.7,
-          "output": 13.5
-        }
-      },
-      {
-        "id": "tencent/Hy3",
-        "displayName": "Hy3",
-        "supportsVision": false,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "contextWindow": 262144,
-        "maxOutputTokens": 262144,
-        "cost": {
-          "input": 0.132,
-          "output": 0.528
         }
       },
       {
@@ -5911,6 +5930,71 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         "cost": {
           "input": 0.1,
           "output": 0.3
+        }
+      },
+      {
+        "id": "nex-agi/Nex-N2-Pro",
+        "displayName": "Nex-N2-Pro",
+        "supportsVision": true,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "contextWindow": 262144,
+        "maxOutputTokens": 256000,
+        "cost": {
+          "input": 0.5,
+          "output": 2.5
+        }
+      },
+      {
+        "id": "MiniMaxAI/MiniMax-M3",
+        "displayName": "MiniMax-M3",
+        "supportsVision": true,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "contextWindow": 1048576,
+        "maxOutputTokens": 131000,
+        "cost": {
+          "input": 0.3,
+          "output": 1.2
+        }
+      },
+      {
+        "id": "deepseek-ai/DeepSeek-V4-Flash",
+        "displayName": "DeepSeek V4 Flash",
+        "supportsVision": false,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 384000,
+        "cost": {
+          "input": 0.13,
+          "output": 0.28
+        }
+      },
+      {
+        "id": "deepseek-ai/DeepSeek-V4-Pro",
+        "displayName": "DeepSeek V4 Pro",
+        "supportsVision": false,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 384000,
+        "cost": {
+          "input": 1.50162,
+          "output": 3.135
+        }
+      },
+      {
+        "id": "Qwen/Qwen3.6-27B",
+        "displayName": "Qwen3.6 27B",
+        "supportsVision": false,
+        "supportsTools": true,
+        "supportsReasoning": false,
+        "contextWindow": 262144,
+        "maxOutputTokens": 262144,
+        "cost": {
+          "input": 0.3,
+          "output": 3.2
         }
       }
     ]
@@ -6349,19 +6433,6 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
         }
       },
       {
-        "id": "mimo-v2.5-pro-ultraspeed",
-        "displayName": "MiMo-V2.5-Pro-UltraSpeed",
-        "supportsVision": false,
-        "supportsTools": true,
-        "supportsReasoning": true,
-        "contextWindow": 1048576,
-        "maxOutputTokens": 131072,
-        "cost": {
-          "input": 1.305,
-          "output": 2.61
-        }
-      },
-      {
         "id": "mimo-v2.5",
         "displayName": "MiMo-V2.5",
         "supportsVision": true,
@@ -6387,6 +6458,100 @@ export const GENERATED_CATALOG: readonly CatalogEntry[] = Object.freeze([
           "input": 0.435,
           "output": 0.87
         }
+      }
+    ]
+  },
+  {
+    "id": "zcode",
+    "displayName": "ZCode Coding Plan",
+    "group": "subscription",
+    "kind": "chat",
+    "protocol": "anthropic-messages",
+    "baseUrl": "https://zcode.z.ai/api/v1/zcode-plan/anthropic",
+    "apiKeyUrl": "https://zcode.z.ai",
+    "requiresApiKey": true,
+    "hasLogo": false,
+    "supportsOAuth": true,
+    "models": [
+      {
+        "id": "GLM-5.2",
+        "displayName": "GLM-5.2",
+        "supportsVision": false,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "contextWindow": 1048576,
+        "maxOutputTokens": 131072
+      }
+    ]
+  },
+  {
+    "id": "siliconflow-stt",
+    "displayName": "硅基流动 SenseVoice",
+    "group": "stt",
+    "kind": "stt",
+    "protocol": "openai-completions",
+    "baseUrl": "https://api.siliconflow.cn/v1",
+    "apiKeyUrl": "https://cloud.siliconflow.cn/account/ak",
+    "requiresApiKey": true,
+    "defaultEnvVar": "SILICONFLOW_API_KEY",
+    "hasLogo": true,
+    "models": [
+      {
+        "id": "FunAudioLLM/SenseVoiceSmall",
+        "displayName": "SenseVoice Small"
+      }
+    ]
+  },
+  {
+    "id": "local-stt",
+    "displayName": "本机语音识别",
+    "group": "stt",
+    "kind": "stt",
+    "protocol": "openai-completions",
+    "baseUrl": "http://127.0.0.1:7860",
+    "apiKeyUrl": "https://github.com/FunAudioLLM/SenseVoice",
+    "requiresApiKey": false,
+    "hasLogo": false,
+    "models": [
+      {
+        "id": "SenseVoiceSmall",
+        "displayName": "SenseVoice Small"
+      }
+    ]
+  },
+  {
+    "id": "local-tts",
+    "displayName": "本机语音合成",
+    "group": "tts",
+    "kind": "tts",
+    "protocol": "openai-completions",
+    "baseUrl": "http://127.0.0.1:8880/v1",
+    "apiKeyUrl": "https://github.com/remsky/Kokoro-FastAPI",
+    "requiresApiKey": false,
+    "hasLogo": false,
+    "models": [
+      {
+        "id": "kokoro",
+        "displayName": "Kokoro",
+        "ttsVoice": "zf_xiaobei"
+      }
+    ]
+  },
+  {
+    "id": "deepseek-search",
+    "displayName": "DeepSeek（网页检索）",
+    "group": "search",
+    "kind": "search",
+    "protocol": "openai-completions",
+    "baseUrl": "https://api.deepseek.com",
+    "apiKeyUrl": "https://platform.deepseek.com/api_keys",
+    "requiresApiKey": true,
+    "defaultEnvVar": "DEEPSEEK_API_KEY",
+    "hasLogo": true,
+    "models": [
+      {
+        "id": "search",
+        "displayName": "网页搜索（/v1/tools/search）"
       }
     ]
   }

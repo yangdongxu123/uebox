@@ -24,6 +24,7 @@ vi.mock('../../../services/project/projectManager', () => ({
 }))
 
 import { getTargetConnectionId } from '../../core/projectTargetContext'
+import { getMetaTeamSeat } from '../../core/team/teamSeatContext'
 import { defineTool, type ToolRisk, type UnrealAgentTool } from '../../tools/defineTool'
 import { CLI_CONTRACT_VERSION } from './externalTarget'
 import {
@@ -70,8 +71,13 @@ const TOOLS: UnrealAgentTool<never>[] = [
   fakeTool('boom', 'ue.system', 'safe', async () => {
     throw new Error('工具内部炸了')
   }),
-  // 报出自己看到的目标连接。绑定到底生没生效，只有工具自己说了算
-  fakeTool('ue_session_health', 'ue.system', 'safe', async () => `目标=${getTargetConnectionId()}`)
+  // 报出自己看到的目标连接和团队通行证。绑定到底生没生效，只有工具自己说了算
+  fakeTool(
+    'ue_session_health',
+    'ue.system',
+    'safe',
+    async () => `目标=${getTargetConnectionId()} 通行证=${getMetaTeamSeat()}`
+  )
 ]
 
 describe('selectExposedTools', () => {
@@ -129,6 +135,32 @@ describe('selectExposedTools', () => {
   })
 })
 
+/**
+ * fetch 规范里的「禁用端口」，undici 照着实现了。
+ *
+ * 服务端用 `port: 0` 让系统随手给一个端口，偶尔会分到 6000、10080 这类，
+ * 而客户端一 fetch 就抛 `bad port`，和被测代码毫无关系。
+ * 这类偶发红灯不修的话，最后是整条门禁没人信。
+ *
+ * 完整清单见 https://fetch.spec.whatwg.org/#port-blocking，
+ * 这里只列可能落在动态端口区间里的那几个。
+ */
+const FETCH_BLOCKED_PORTS = new Set([6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080])
+
+/** 起服务；系统随机分到 fetch 禁用端口就停了重开，端口是调用方指定的就照办 */
+async function startFetchable(
+  host: McpServerHost,
+  ...args: Parameters<McpServerHost['start']>
+): ReturnType<McpServerHost['start']> {
+  for (let attempt = 0; ; attempt++) {
+    const status = await host.start(...args)
+    const port = status.url ? Number(new URL(status.url).port) : 0
+    // 10 次都摇到禁用端口是不可能事件，真发生了就让它红，别无限转
+    if (args[1]?.port || !FETCH_BLOCKED_PORTS.has(port) || attempt >= 10) return status
+    await host.stop()
+  }
+}
+
 describe('McpServerHost 端到端', () => {
   const hosts: McpServerHost[] = []
   const clients: Client[] = []
@@ -138,38 +170,15 @@ describe('McpServerHost 端到端', () => {
     await Promise.all(hosts.splice(0).map((h) => h.stop()))
   })
 
-  /**
-   * fetch 规范里的「禁用端口」，undici 照着实现了。
-   *
-   * 服务端用 `port: 0` 让系统随手给一个端口，本机的动态端口区间是五位数打头的
-   * 一万上下 —— 于是偶尔会分到 10080，而客户端一 fetch 就抛 `bad port`，
-   * 和被测代码毫无关系。这类偶发红灯不修的话，最后是整条门禁没人信。
-   *
-   * 完整清单见 https://fetch.spec.whatwg.org/#port-blocking，
-   * 这里只列可能落在动态端口区间里的那几个。
-   */
-  const FETCH_BLOCKED_PORTS = new Set([6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080])
-
   async function startHost(
     options: Parameters<McpServerHost['start']>[1] = {}
   ): Promise<{ host: McpServerHost; url: string; token: string }> {
-    // 端口是调用方指定的就照办；系统随机分的才允许重摇
-    const mayRetry = !options.port
-
-    for (let attempt = 0; ; attempt++) {
-      const host = new McpServerHost()
-      hosts.push(host)
-      const status = await host.start(TOOLS, options)
-      expect(status.error).toBeUndefined()
-      expect(status.running).toBe(true)
-
-      const port = Number(new URL(status.url!).port)
-      // 10 次都摇到禁用端口是不可能事件，真发生了就让它红，别无限转
-      if (!mayRetry || !FETCH_BLOCKED_PORTS.has(port) || attempt >= 10) {
-        return { host, url: status.url!, token: status.token! }
-      }
-      await host.stop()
-    }
+    const host = new McpServerHost()
+    hosts.push(host)
+    const status = await startFetchable(host, TOOLS, options)
+    expect(status.error).toBeUndefined()
+    expect(status.running).toBe(true)
+    return { host, url: status.url!, token: status.token! }
   }
 
   async function connect(url: string, token?: string): Promise<Client> {
@@ -392,7 +401,7 @@ describe('McpServerHost 多客户端', () => {
   async function startHost(): Promise<{ host: McpServerHost; url: string; token: string }> {
     const host = new McpServerHost()
     hosts.push(host)
-    const status = await host.start(TOOLS, {})
+    const status = await startFetchable(host, TOOLS, {})
     expect(status.running).toBe(true)
     return { host, url: status.url!, token: status.token! }
   }
@@ -557,7 +566,7 @@ describe('McpServerHost 契约声明', () => {
   async function connected(): Promise<Client> {
     const host = new McpServerHost()
     hosts.push(host)
-    const status = await host.start(TOOLS, {})
+    const status = await startFetchable(host, TOOLS, {})
     const client = new Client({ name: 'test', version: '1.0.0' }, { capabilities: {} })
     clients.push(client)
     await client.connect(
@@ -628,7 +637,7 @@ describe('McpServerHost 目标工程', () => {
   async function connected(): Promise<Client> {
     const host = new McpServerHost()
     hosts.push(host)
-    const status = await host.start(TOOLS, {})
+    const status = await startFetchable(host, TOOLS, {})
     const client = new Client({ name: 'test', version: '1.0.0' }, { capabilities: {} })
     clients.push(client)
     await client.connect(
@@ -732,6 +741,15 @@ describe('McpServerHost 目标工程', () => {
     expect(JSON.stringify(result.content)).toContain('目标=undefined')
   }, 30_000)
 
+  it('_meta.unrealBox.teamSeat 带进工具的执行流；不带就没有', async () => {
+    const client = await connected()
+
+    const seated = await callWithTarget(client, { teamSeat: 'ext-t1.abc' })
+    expect(JSON.stringify(seated.content)).toContain('通行证=ext-t1.abc')
+    const plain = await callWithTarget(client, undefined)
+    expect(JSON.stringify(plain.content)).toContain('通行证=undefined')
+  }, 30_000)
+
   it('工具执行失败仍然是 isError，不会被包装成成功', async () => {
     const client = await connected()
 
@@ -762,7 +780,7 @@ describe('McpServerHost 公共结果', () => {
   async function connected(): Promise<Client> {
     const host = new McpServerHost()
     hosts.push(host)
-    const status = await host.start(TOOLS, {})
+    const status = await startFetchable(host, TOOLS, {})
     const client = new Client({ name: 'test', version: '1.0.0' }, { capabilities: {} })
     clients.push(client)
     await client.connect(
@@ -825,7 +843,7 @@ describe('McpServerHost 按会话装配', () => {
   ): Promise<Client> {
     const host = new McpServerHost()
     hosts.push(host)
-    const status = await host.start(source, options)
+    const status = await startFetchable(host, source, options)
     const client = new Client({ name: 'test', version: '1.0.0' }, capabilities)
     clients.push(client)
     await client.connect(
@@ -849,6 +867,45 @@ describe('McpServerHost 按会话装配', () => {
     expect(seen).toHaveLength(2)
     expect(seen[1]).toBe(transport.sessionId)
     expect(seen[1]).toMatch(/^mcp-/)
+  }, 30_000)
+
+  it('会话结束时调一次装配给的收尾（外部团队靠它把没交回的活收成停下）', async () => {
+    let disposed = 0
+    const client = await connect(async () => ({
+      tools: TOOLS,
+      dispose: () => {
+        disposed++
+      }
+    }))
+    const transport = (client as unknown as { transport: StreamableHTTPClientTransport }).transport
+    await transport.terminateSession()
+    await client.close()
+    await vi.waitFor(() => expect(disposed).toBe(1))
+  }, 30_000)
+
+  it('初始化请求带的 X-Unreal-Box-Profile 头原样交给装配函数，不带就没有', async () => {
+    const profiles: Array<string | undefined> = []
+    const host = new McpServerHost()
+    hosts.push(host)
+    const status = await startFetchable(
+      host,
+      async (request) => {
+        if (request.clientCapabilities) profiles.push(request.profile)
+        return { tools: TOOLS }
+      },
+      { includeMutating: true }
+    )
+    const variants: Array<Record<string, string>> = [{ 'X-Unreal-Box-Profile': 'producer' }, {}]
+    for (const headers of variants) {
+      const client = new Client({ name: 'test', version: '1.0.0' }, { capabilities: {} })
+      clients.push(client)
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(status.url!), {
+          requestInit: { headers: { Authorization: `Bearer ${status.token!}`, ...headers } }
+        })
+      )
+    }
+    expect(profiles).toEqual(['producer', undefined])
   }, 30_000)
 
   it('握手时下发说明', async () => {
@@ -925,7 +982,7 @@ describe('McpServerHost 工具注解', () => {
   it('只读 / 破坏性 / 派子任务各自标对', async () => {
     const host = new McpServerHost()
     hosts.push(host)
-    const status = await host.start(TOOLS, { includeMutating: true })
+    const status = await startFetchable(host, TOOLS, { includeMutating: true })
     const client = new Client({ name: 'test', version: '1.0.0' }, { capabilities: {} })
     clients.push(client)
     await client.connect(
@@ -986,7 +1043,7 @@ describe('McpServerHost 进度', () => {
   async function open(): Promise<Client> {
     const host = new McpServerHost()
     hosts.push(host)
-    const status = await host.start([reporter])
+    const status = await startFetchable(host, [reporter])
     const client = new Client({ name: 'test', version: '1.0.0' }, { capabilities: {} })
     clients.push(client)
     await client.connect(

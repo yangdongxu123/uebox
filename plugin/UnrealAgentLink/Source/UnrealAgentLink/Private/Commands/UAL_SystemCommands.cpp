@@ -98,6 +98,52 @@ void FUAL_SystemCommands::RegisterCommands(TMap<FString, TFunction<void(const TS
 	});
 }
 
+namespace
+{
+	/**
+	 * 收「引擎替脚本答掉的弹窗」。
+	 *
+	 * 无人值守下 `FMessageDialog::Open` 不弹框，直接取默认答案，然后留一行
+	 * `Message dialog closed, result: No, title: ..., text: ...`（UE 5.4 MessageDialog.cpp）。
+	 * 不回给模型的话，它只看到 create_asset 返回 None，不知道引擎问过「要不要覆写」、答的是「否」。
+	 *
+	 * 不用 `FUAL_ScopedLogCapture`：那一行走的是 `GWarn->Logf`，类别取的是线程上
+	 * 当前的覆盖值，不固定 —— 只能按正文认。
+	 */
+	class FUAL_DialogLogCapture : public FOutputDevice
+	{
+	public:
+		FUAL_DialogLogCapture()
+		{
+			if (GLog)
+			{
+				GLog->AddOutputDevice(this);
+			}
+		}
+
+		virtual ~FUAL_DialogLogCapture() override
+		{
+			if (GLog)
+			{
+				GLog->RemoveOutputDevice(this);
+			}
+		}
+
+		using FOutputDevice::Serialize;
+
+		virtual void Serialize(const TCHAR* V, ELogVerbosity::Type, const FName&) override
+		{
+			static const TCHAR* Prefix = TEXT("Message dialog closed, ");
+			if (V && FCString::Strncmp(V, Prefix, FCString::Strlen(Prefix)) == 0 && Lines.Num() < 20)
+			{
+				Lines.Add(FString(V + FCString::Strlen(Prefix)));
+			}
+		}
+
+		TArray<FString> Lines;
+	};
+}
+
 // ========== 从 UAL_CommandHandler.cpp 迁移以下函数 ==========
 // 原始行号参考:
 //   Handle_RunPython:           1631-1653
@@ -134,8 +180,30 @@ void FUAL_SystemCommands::Handle_RunPython(const TSharedPtr<FJsonObject>& Payloa
 		PythonCommand.Command = Script;
 		PythonCommand.ExecutionMode = EPythonCommandExecutionMode::ExecuteFile;
 		PythonCommand.FileExecutionScope = EPythonFileExecutionScope::Public; // 共享环境，便于后续脚本访问变量
-		
-		bExecuted = PythonPlugin->ExecPythonCommandEx(PythonCommand);
+
+		// 无人值守：脚本里没人能点模态框，弹出来就把整个编辑器卡住。
+		// 真机（2026-10-11）：脚本对已存在的 SQ_Chase 再 create_asset，引擎先弹「覆写现有Object」，
+		// 用户点了是，强删又因为序列正被使用而弹「正在使用中」—— 两个框都挡着主线程，最后照样写不进去。
+		// 开着这个开关时框直接取默认答案（覆写 → 否），create_asset 安静地返回 None，
+		// 盒子那边按脚本里的 create_asset 补「先查重、已存在就 load_asset 接着改」的提示
+		TArray<FString> Dialogs;
+		{
+			TGuardValue<bool> UnattendedScriptGuard(GIsRunningUnattendedScript, true);
+			FUAL_DialogLogCapture DialogCapture;
+			bExecuted = PythonPlugin->ExecPythonCommandEx(PythonCommand);
+			Dialogs = MoveTemp(DialogCapture.Lines);
+		}
+
+		// 被自动答掉的弹窗原样回去：「覆写？→ 否」这种信息模型自己从返回值里推不出来
+		if (Dialogs.Num() > 0)
+		{
+			TArray<TSharedPtr<FJsonValue>> DialogArray;
+			for (const FString& Line : Dialogs)
+			{
+				DialogArray.Add(MakeShared<FJsonValueString>(Line));
+			}
+			Data->SetArrayField(TEXT("dialogs"), DialogArray);
+		}
 		
 		// 返回脚本结果（成功时为表达式结果，失败时为错误追踪）
 		if (!PythonCommand.CommandResult.IsEmpty())
@@ -183,10 +251,30 @@ void FUAL_SystemCommands::Handle_ExecConsole(const TSharedPtr<FJsonObject>& Payl
 	// 现在是多少，回一个 "OK"；`stat` 系列、`obj list`、各种 cvar 查询同理。
 	// 调用方能执行命令却永远看不到结果，"跑个命令看看" 这件事办不成。
 	FStringOutputDevice CommandOutput;
+	// PIE 在跑时打到游戏世界。
+	//
+	// 原来写死编辑器世界：全局的控制台变量（r.*、ShowFlag.*）不受影响，
+	// 可 dumpticks、对象查询这类依赖世界的命令，查的是编辑器那份关卡，
+	// 不是用户此刻在玩的那一局 —— PIE 开始时关卡被复制了一份，两边的 Actor 不是同一批。
+	// 回执里的 world 字段说清这次打到了哪边。
+	bool bPieWorld = false;
 	if (GEngine)
 	{
 #if WITH_EDITOR
-		UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+		UWorld* World = nullptr;
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			if (Context.WorldType == EWorldType::PIE && Context.World())
+			{
+				World = Context.World();
+				bPieWorld = true;
+				break;
+			}
+		}
+		if (!World)
+		{
+			World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+		}
 #else
 		UWorld* World = GWorld;
 #endif
@@ -195,6 +283,7 @@ void FUAL_SystemCommands::Handle_ExecConsole(const TSharedPtr<FJsonObject>& Payl
 
 	TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
 	Data->SetStringField(TEXT("result"), bResult ? TEXT("OK") : TEXT("Failed"));
+	Data->SetStringField(TEXT("world"), bPieWorld ? TEXT("pie") : TEXT("editor"));
 
 	FString Output = CommandOutput;
 	Output.TrimStartAndEndInline();
@@ -214,7 +303,7 @@ void FUAL_SystemCommands::Handle_ExecConsole(const TSharedPtr<FJsonObject>& Payl
 		// 说清楚是「这条命令本来就不打印东西」，而不是「输出丢了」——
 		// 像 `stat unit` 是切换屏幕叠加显示的，本来就没有文字返回。
 		Data->SetStringField(TEXT("output_note"),
-			TEXT("该命令没有产生文字输出（切换类命令如 stat unit 属于正常情况；部分命令只写引擎日志，可用 messagelog 查看）。"));
+			TEXT("该命令没有产生文字输出（切换类命令如 stat unit 属于正常情况；部分命令如 dumpticks 只写输出日志，去 Saved/Logs/<工程名>.log 里找，Message Log 窗口里没有）。"));
 	}
 
 	// 失败要说为什么。

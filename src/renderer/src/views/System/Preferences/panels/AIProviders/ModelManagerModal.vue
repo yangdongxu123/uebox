@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import AppButton from '@renderer/components/AppButton.vue'
 import AppModal from '@renderer/components/AppModal.vue'
+import AppSwitch from '@renderer/components/AppSwitch.vue'
 import { PhCaretRight } from '@phosphor-icons/vue'
 /**
  * 模型管理弹窗 —— **只有这一层**。
@@ -14,13 +15,13 @@ import { PhCaretRight } from '@phosphor-icons/vue'
  * 两个详情面板各自成组件（ProviderFields / ModelFields），
  * 免得又长回一个什么都干的大组件。
  */
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, h, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { message } from '@renderer/utils/messageManager'
 import { confirmDialog } from '@renderer/utils/dialog'
 import { PROVIDER_KINDS, type ProviderKind, type ProviderView } from '@core/shared/aiProvider'
 import { isPlanProvider } from '@core/shared/creatorPlan'
-import type { AiProvidersState } from './useAiProviders'
+import { missingCatalogModels, type AiProvidersState } from './useAiProviders'
 import ProviderFields from './ProviderFields.vue'
 import ModelFields from './ModelFields.vue'
 import { Z_CONFIRM, Z_MANAGER } from './modalLayers'
@@ -31,7 +32,18 @@ const props = defineProps<{ open: boolean; state: AiProvidersState }>()
 const emit = defineEmits<{ 'update:open': [value: boolean]; addProvider: [] }>()
 
 const { t } = useI18n()
-const { draft, providers, isNew, isDirty, saving, testing, selectedId, configPath } = props.state
+const {
+  draft,
+  managedProviders: providers,
+  disabledIds,
+  isNew,
+  isDirty,
+  saving,
+  testing,
+  selectedId,
+  configPath,
+  catalog
+} = props.state
 
 /**
  * 右侧显示谁。
@@ -179,6 +191,11 @@ function pickProvider(providerId: string): void {
   })
 }
 
+async function toggleProvider(providerId: string, enabled: boolean): Promise<void> {
+  const result = await props.state.setEnabled(providerId, enabled)
+  if (!result.ok) message.error(result.error || t('aiProvider.messages.saveFailed'))
+}
+
 function addModel(): void {
   if (!draft.value) return
   draft.value.models = [...draft.value.models, { id: '', supportsTools: true }]
@@ -191,6 +208,27 @@ function removeModel(index: number): void {
   // 删掉的正是当前选中的（或它前面的），焦点得跟着挪，否则右边显示的是别人
   if (focus.value === index) focus.value = 'provider'
   else if (typeof focus.value === 'number' && focus.value > index) focus.value -= 1
+}
+
+/** 目录里新出、这条 provider 还没有的预置模型。新建中的草稿本来就是从目录复制的，不算 */
+const catalogAdditions = computed(() =>
+  draft.value && !isNew.value ? missingCatalogModels(draft.value, catalog.value) : []
+)
+
+const catalogAdditionsLabel = computed(() => {
+  const [first] = catalogAdditions.value
+  if (!first) return ''
+  const name = first.displayName || first.id
+  return catalogAdditions.value.length === 1
+    ? t('aiProvider.field.addCatalogModel', { name })
+    : t('aiProvider.field.addCatalogModels', { name, count: catalogAdditions.value.length })
+})
+
+/** 加进草稿，跟手动添加一样要点保存才落盘 */
+function addCatalogModels(): void {
+  if (!draft.value || catalogAdditions.value.length === 0) return
+  draft.value.models = [...catalogAdditions.value, ...draft.value.models]
+  focus.value = 0
 }
 
 /** 树上模型那一行的名字。新加的还没填 id，给个占位，否则是一行空白 */
@@ -270,11 +308,20 @@ function deleteFocusedModel(index: number): void {
   })
 }
 
-/** 删掉整条 Provider：配置、已存的密钥、指向它的角色绑定一起没 */
-function deleteProvider(providerId: string): void {
+/**
+ * 删掉整条 Provider：配置、已存的密钥、指向它的角色绑定一起没。
+ *
+ * 正在跑的对话开跑时就定了模型，删掉之后它下一次调模型才报错 —— 确认框里先说清楚
+ */
+async function deleteProvider(providerId: string): Promise<void> {
+  const inUse = await window.api.aiProvider.usage(providerId).catch(() => 0)
+  const content = t('aiProvider.delete.content')
   confirmDialog({
     title: t('aiProvider.delete.title', { name: draft.value?.displayName || providerId }),
-    content: t('aiProvider.delete.content'),
+    content:
+      inUse > 0
+        ? () => h('div', [h('p', content), h('p', t('aiProvider.delete.inUse', { count: inUse }))])
+        : content,
     okText: t('aiProvider.delete.ok'),
     danger: true,
     cancelText: t('aiProvider.delete.cancel'),
@@ -292,7 +339,7 @@ function handleDelete(): void {
     deleteFocusedModel(focusedIndex.value)
     return
   }
-  if (selectedId.value) deleteProvider(selectedId.value)
+  if (selectedId.value) void deleteProvider(selectedId.value)
 }
 
 async function handleImport(): Promise<void> {
@@ -323,7 +370,13 @@ async function handleTest(): Promise<void> {
     ? { type: 'error', text: describeProbeFailure(result.error) }
     : result.skipped
       ? { type: 'warning', text: t(`aiProvider.probeSkip.${result.skipped}`) }
-      : { type: 'success', text: t('aiProvider.messages.testOk', { model: modelId }) }
+      : // 通了但开思考会被拒：不给绿勾，否则用户开了思考才撞上 400
+        result.caveat === 'thinkingRejected'
+        ? {
+            type: 'warning',
+            text: t('aiProvider.messages.testOkThinkingRejected', { model: modelId })
+          }
+        : { type: 'success', text: t('aiProvider.messages.testOk', { model: modelId }) }
 }
 
 function close(): void {
@@ -385,29 +438,43 @@ function addProvider(): void {
 
             <template v-if="!isCollapsed(group.kind)">
               <template v-for="provider in group.providers" :key="provider.id">
-                <button
-                  type="button"
-                  class="tree-provider"
-                  :class="{ active: selectedId === provider.id && !isNew }"
-                  @click="pickProvider(provider.id)"
-                >
-                  <span class="tree-logo">
-                    <img
-                      v-if="providerLogoUrl(provider.id)"
-                      :src="providerLogoUrl(provider.id)"
-                      alt=""
-                      aria-hidden="true"
+                <div class="tree-provider-row">
+                  <button
+                    type="button"
+                    class="tree-provider"
+                    :class="{
+                      active: selectedId === provider.id && !isNew,
+                      off: disabledIds.has(provider.id)
+                    }"
+                    @click="pickProvider(provider.id)"
+                  >
+                    <span class="tree-logo">
+                      <img
+                        v-if="providerLogoUrl(provider.id)"
+                        :src="providerLogoUrl(provider.id)"
+                        alt=""
+                        aria-hidden="true"
+                      />
+                      <template v-else>{{ logoFallbackText(provider.displayName) }}</template>
+                    </span>
+                    <span class="tree-provider-name">{{ provider.displayName }}</span>
+                    <!-- 改过还没存的那条带个点，否则「切走会丢东西」只有拦截弹窗才说得出来 -->
+                    <span
+                      v-if="selectedId === provider.id && !isNew && isDirty"
+                      class="tree-dirty"
+                      :title="$t('aiProvider.unsaved.dot')"
                     />
-                    <template v-else>{{ logoFallbackText(provider.displayName) }}</template>
-                  </span>
-                  <span class="tree-provider-name">{{ provider.displayName }}</span>
-                  <!-- 改过还没存的那条带个点，否则「切走会丢东西」只有拦截弹窗才说得出来 -->
-                  <span
-                    v-if="selectedId === provider.id && !isNew && isDirty"
-                    class="tree-dirty"
-                    :title="$t('aiProvider.unsaved.dot')"
+                  </button>
+                  <AppSwitch
+                    class="tree-provider-switch"
+                    size="small"
+                    :checked="!disabledIds.has(provider.id)"
+                    :aria-label="
+                      $t('aiProvider.list.enableProvider', { name: provider.displayName })
+                    "
+                    @change="(on: boolean) => toggleProvider(provider.id, on)"
                   />
-                </button>
+                </div>
 
                 <!-- 只展开当前这一条：全展开的话十几个模型就把树撑爆了 -->
                 <template v-if="selectedId === provider.id && !isNew && draft">
@@ -424,6 +491,15 @@ function addProvider(): void {
                   </button>
                   <button type="button" class="tree-model tree-add" @click="addModel">
                     {{ $t('aiProvider.field.addModel') }}
+                  </button>
+                  <button
+                    v-if="catalogAdditions.length > 0"
+                    type="button"
+                    class="tree-model tree-add"
+                    :title="catalogAdditions.map(modelLabel).join(', ')"
+                    @click="addCatalogModels"
+                  >
+                    {{ catalogAdditionsLabel }}
                   </button>
                 </template>
               </template>
@@ -744,6 +820,26 @@ function addProvider(): void {
 
 .tree-provider:hover {
   background: var(--color-bg-surface-hover);
+}
+
+.tree-provider-row {
+  position: relative;
+}
+
+.tree-provider-row .tree-provider {
+  padding-right: 44px;
+}
+
+.tree-provider-switch {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  transform: translateY(-50%);
+}
+
+.tree-provider.off .tree-logo,
+.tree-provider.off .tree-provider-name {
+  opacity: 0.45;
 }
 
 .tree-provider.active {

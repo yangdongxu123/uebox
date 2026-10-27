@@ -18,7 +18,8 @@
 import type { AgentMessage } from '@earendil-works/pi-agent-core'
 import { z } from 'zod'
 
-import { defineTool, type UnrealAgentTool } from '../../tools/defineTool'
+import { defineTool, type ToolRisk, type UnrealAgentTool } from '../../tools/defineTool'
+import { SET_SESSION_PROJECT_TOOL_NAME } from '../../tools/toolNames'
 import {
   formatWriteAudit,
   stripPendingToolCalls,
@@ -30,6 +31,7 @@ import { createStatusTool } from './teamStatus'
 import { snapshotMessage, type TeamSnapshots } from './snapshots'
 import type { TeamLive } from './teamLive'
 import {
+  MEMORY_KEPT_NOTE,
   PRODUCER,
   TASK_STATUSES,
   type BoardTask,
@@ -38,8 +40,16 @@ import {
   type TeamModel,
   type TeamStore
 } from './teamStore'
-import { sameTeamModel } from '../../../../shared/agentTeam'
+import {
+  ACCEPTOR,
+  DISMISSAL_GROUNDS,
+  sameTeamModel,
+  type TeamDismissal,
+  type TeamUsage
+} from '../../../../shared/agentTeam'
+import { dismissMember, formatDismissal } from './dismissal'
 import { getTargetProjectPath } from '../projectTargetContext'
+import { withoutSystemMessages } from '../systemMessages'
 import { checkupPassed } from './modelCheckups'
 import {
   canChooseModels,
@@ -53,6 +63,7 @@ import {
 
 export const TEAM_TOOL_NAMES = [
   'team_hire',
+  'team_dismiss',
   'team_send',
   'team_board',
   'team_deliver',
@@ -69,10 +80,15 @@ export interface RunMemberInput {
   signal?: AbortSignal
   onProgress: (text: string) => void
   ledger: WriteLedger
-  /** 跑完（含被停下）时交回它的全部消息，下次派活时接着用 */
+  /**
+   * 交回它的全部消息，下次派活时接着用。每说完一轮交一次，跑完（含被停下）再交一次最终版
+   * （见 `runSubAgent` 的同名参数）
+   */
   keepMessages: (messages: AgentMessage[]) => void
   /** 钉给它的模型。不给 = 老规矩（制作人的模型，或老 `fast` 档的对话模型），见 `routeMember` */
   pin?: TeamModel
+  /** 跑完（含被停下）时交回这件活花掉的 token，记进这件活和团队的总账 */
+  keepUsage?: (usage: TeamUsage) => void
 }
 
 export interface TeamToolDeps {
@@ -88,6 +104,8 @@ export interface TeamToolDeps {
     packageExe?: string
     signal?: AbortSignal
     onProgress: (text: string) => void
+    /** 跑完（含被停下）时交回验收花掉的 token，记进团队的总账 */
+    keepUsage: (usage: TeamUsage) => void
   }) => Promise<string>
   /** 验收有了结论。宿主用它记「这一局有没有过验收」 */
   onVerdict?: (verdict: GoalVerdict | null) => void | Promise<void>
@@ -103,26 +121,90 @@ export interface TeamToolDeps {
 
 // ── 任务板 ──────────────────────────────────────────────────────────────
 
-export function renderBoard(tasks: BoardTask[]): string {
-  if (tasks.length === 0) return '任务板是空的。'
+/** 计数那一行。整张板、只看几项、改完回执都以它开头，模型随时知道全局 */
+function boardSummary(tasks: BoardTask[]): string {
   const count = (status: string): number => tasks.filter((t) => t.status === status).length
-  const lines = [
-    `任务板：${tasks.length} 项（待办 ${count('todo')} · 进行中 ${count('doing')} · 完成 ${count('done')} · 卡住 ${count('blocked')}）`
-  ]
-  for (const t of tasks) {
-    lines.push(
-      `- [${t.status}] ${t.id} ${t.title}` +
-        (t.owner ? ` @${t.owner}` : '') +
-        (t.deps?.length ? ` ←${t.deps.join(',')}` : '') +
-        (t.evidence ? `\n    证据：${t.evidence}` : '') +
-        (t.note ? `\n    备注：${t.note}` : '')
+  return `任务板：${tasks.length} 项（待办 ${count('todo')} · 进行中 ${count('doing')} · 完成 ${count('done')} · 卡住 ${count('blocked')}）`
+}
+
+/** 一项任务。`full` 时带上证据和备注全文，否则只标「有」 */
+function boardLine(t: BoardTask, full: boolean): string {
+  const head =
+    `- [${t.status}] ${t.id} ${t.title}` +
+    (t.owner ? ` @${t.owner}` : '') +
+    (t.deps?.length ? ` ←${t.deps.join(',')}` : '')
+  if (full) {
+    return (
+      head +
+      (t.evidence ? `\n    证据：${t.evidence}` : '') +
+      (t.note ? `\n    备注：${t.note}` : '')
     )
+  }
+  return head + (t.evidence ? ' · 有证据' : '') + (t.note ? ' · 有备注' : '')
+}
+
+/**
+ * 任务板给模型看的样子。
+ *
+ * **已完成的项默认只列一行，证据和备注折叠成「有证据 / 有备注」。** 以前每次都是整张板
+ * 带全文：真机上一个团队 138 项、每项带完整证据，一次 list 约 14 万字符，一个队员的
+ * 历史里攒了 13 份 —— 工具结果进了上下文就不出来，这是把队员顶到厂商上下文上限的
+ * 放大器之一。完成项的证据是「交回时」要看的东西，之后大多只用知道它做完了；
+ * 要验收某几项，`team_board` list 带 `ids` 看全文（`expand`）。
+ *
+ * 没做完的项照旧带全文：那是正在干的活，备注里往往就是下一步。
+ */
+export function renderBoard(
+  tasks: BoardTask[],
+  options: { expand?: readonly string[] } = {}
+): string {
+  if (tasks.length === 0) return '任务板是空的。'
+  const expand = new Set(options.expand ?? [])
+  const lines = [boardSummary(tasks)]
+  let folded = false
+  for (const t of tasks) {
+    const full = t.status !== 'done' || expand.has(t.id)
+    if (!full && (t.evidence || t.note)) folded = true
+    lines.push(boardLine(t, full))
+  }
+  if (folded) {
+    lines.push('（已完成项的证据和备注折叠了：team_board list 带 ids，如 ["t1"]，看全文）')
   }
   return lines.join('\n')
 }
 
+/** 只看这几项：计数行 + 这几项的全文。没有的 id 说出来，免得模型以为它们存在 */
+export function renderBoardTasks(tasks: BoardTask[], ids: readonly string[]): string {
+  const wanted = new Set(ids)
+  const found = tasks.filter((t) => wanted.has(t.id))
+  const missing = ids.filter((id) => !tasks.some((t) => t.id === id))
+  return [
+    boardSummary(tasks),
+    ...found.map((t) => boardLine(t, true)),
+    ...(missing.length ? [`（任务板上没有：${missing.join('、')}）`] : [])
+  ].join('\n')
+}
+
+/**
+ * 改完的回执：计数行 + 改到的那几项。
+ *
+ * 不再回整张板：改一项就回 138 项全文，正是上面说的那个放大器里占大头的一份 ——
+ * 改任务板是队员最常做的事。要看整张板用 list
+ */
+export function renderBoardUpdate(tasks: BoardTask[], changedIds: readonly string[]): string {
+  const changed = new Set(changedIds)
+  return [
+    `已更新 ${changed.size} 项。${boardSummary(tasks)}`,
+    ...tasks.filter((t) => changed.has(t.id)).map((t) => boardLine(t, true))
+  ].join('\n')
+}
+
 const boardInput = z.object({
   action: z.enum(['list', 'update']).describe('list = 看整张板；update = 新建或修改任务'),
+  ids: z
+    .array(z.string())
+    .optional()
+    .describe('action=list 时只看这几项，带证据和备注全文（整张板里已完成项的证据是折叠的）'),
   tasks: z
     .array(
       z.object({
@@ -151,19 +233,101 @@ export function createBoardTool(store: TeamStore): UnrealAgentTool<BoardTask[]> 
       '按 id 合并：写一个已有的 id 就是修改它，新 id 就是新建（要给 title）。' +
       '标 done 时把证据写进 evidence —— 没有证据的「做完」谁也分不出真假。',
     input: boardInput,
-    execute: async ({ action, tasks }) => {
+    execute: async ({ action, ids, tasks }) => {
       if (action === 'update') {
         if (!tasks?.length) throw new Error('action=update 需要 tasks')
         const board = await store.patchBoard(tasks)
-        return { text: renderBoard(board), details: board }
+        return {
+          text: renderBoardUpdate(
+            board,
+            tasks.map((t) => t.id)
+          ),
+          details: board
+        }
       }
       const board = await store.board()
-      return { text: renderBoard(board), details: board }
+      return {
+        text: ids?.length ? renderBoardTasks(board, ids) : renderBoard(board),
+        details: board
+      }
+    }
+  })
+}
+
+// ── 辞退 ────────────────────────────────────────────────────────────────
+
+const sameName = (a: string, b: string): boolean =>
+  a.trim().toLowerCase() === b.trim().toLowerCase()
+
+/** 制作人能挑的依据：`user` 留给用户在任务板上辞的，制作人不能冒用 */
+const PRODUCER_GROUNDS = DISMISSAL_GROUNDS.filter((g) => g !== 'user') as [
+  Exclude<(typeof DISMISSAL_GROUNDS)[number], 'user'>,
+  ...Exclude<(typeof DISMISSAL_GROUNDS)[number], 'user'>[]
+]
+
+function createDismissTool(
+  deps: TeamToolDeps,
+  busy: BusyMap,
+  now: () => number
+): UnrealAgentTool<TeamDismissal> {
+  const dismissInput = z.object({
+    name: z.string().min(1).describe('要辞退的队员名'),
+    grounds: z
+      .enum(PRODUCER_GROUNDS)
+      .describe(
+        'quality = 交的活不达标；unfinished = 活老是干不完；redundant = 岗位不需要了或和别人重了；' +
+          'user_request = 用户在对话里要求的'
+      ),
+    reason: z.string().min(1).max(500).describe('理由，写给用户看的：具体到哪件活、哪里不行'),
+    evidence: z
+      .array(z.string())
+      .optional()
+      .describe(
+        '它名下的活 id（j…，team_status 的【最近的活】）或任务 id。grounds 是 quality / unfinished 时至少一条'
+      ),
+    handover_to: z
+      .string()
+      .optional()
+      .describe('它没做完的任务交给谁（在册队员）。省略 = 清掉负责人，之后你再分配')
+  })
+  return defineTool<typeof dismissInput, TeamDismissal>({
+    name: 'team_dismiss',
+    namespace: 'core',
+    risk: 'safe',
+    concurrency: 'sequential',
+    description:
+      '辞退一个队员：移出名册，没做完的任务交接出去，它的记忆归档。' +
+      '手上有活的不能辞。说它干得不行要引用它名下的活或任务当证据；' +
+      '盒子另从账上记下它交回、停下了几件，连同理由一起存档，用户在任务板上看得到。' +
+      '只是想换模型或改人设，用 team_hire 同名再招，不用辞。',
+    input: dismissInput,
+    execute: async ({ name, grounds, reason, evidence, handover_to }) => {
+      const record = await dismissMember(deps.store, {
+        name,
+        by: 'producer',
+        grounds,
+        reason,
+        ...(evidence ? { evidence } : {}),
+        ...(handover_to ? { handoverTo: handover_to } : {}),
+        isBusy: (who) => busy.has(who.toLowerCase()) || !!deps.live?.isRunning(who),
+        now
+      })
+      const roster = await deps.store.roster()
+      return {
+        text: formatDismissal(
+          record,
+          roster.map((m) => m.name)
+        ),
+        details: record
+      }
     }
   })
 }
 
 // ── 招人 ────────────────────────────────────────────────────────────────
+
+/** `team_hire` 说明里候选名单的开头。混合团队把名单挪进 `team_open` 的回话，按它切（`hybridTeamTools.ts`） */
+export const HIRE_CANDIDATES_HEADING = '可用模型：\n'
 
 function createHireTool(deps: TeamToolDeps, now: () => number): UnrealAgentTool<TeamMember> {
   const models = deps.models
@@ -179,7 +343,9 @@ function createHireTool(deps: TeamToolDeps, now: () => number): UnrealAgentTool<
     namespaces: z
       .array(z.string())
       .optional()
-      .describe(`只给它这些命名空间的工具；省略 = 和你同一套。可选：${deps.namespaces.join(', ')}`),
+      .describe(
+        `只给它这些命名空间的工具；省略 = 全套（含你手上没有的写工具）。可选：${deps.namespaces.join(', ')}`
+      ),
     read_only: z
       .boolean()
       .optional()
@@ -223,13 +389,17 @@ function createHireTool(deps: TeamToolDeps, now: () => number): UnrealAgentTool<
         ? '\n\n每个队员可以用不同的模型。看这个岗位的活要多强、量多大、要不要换一家的眼光来查，自己判断；' +
           '用户在任务板上亲手改过的模型（回话里标着「用户定的」），除非用户开口别再改。' +
           '某个岗位的活老被用户打回，可以同名再招一次换个模型，回话里跟用户说清依据。' +
-          '挑了你以外的模型，盒子会先给它做一次入职体检（通不通、会不会调工具），没过会告诉你。可用模型：\n' +
+          '挑了你以外的模型，盒子会先给它做一次入职体检（通不通、会不会调工具），没过会告诉你。' +
+          HIRE_CANDIDATES_HEADING +
           describeCandidates(models)
         : ''),
     input: hireInput,
     execute: async ({ name, role, model, model_reason, namespaces, read_only, role_type }) => {
       if (name.trim().toLowerCase() === PRODUCER) {
         throw new Error(`"${PRODUCER}" 是留给制作人（你）的名字，换一个`)
+      }
+      if (name.trim().toLowerCase() === ACCEPTOR) {
+        throw new Error(`"${ACCEPTOR}" 是留给验收员的名字，换一个`)
       }
       if (namespaces?.length) {
         const unknown = namespaces.filter((ns) => !deps.namespaces.includes(ns))
@@ -259,6 +429,10 @@ function createHireTool(deps: TeamToolDeps, now: () => number): UnrealAgentTool<
       }
       await deps.store.putMember(member)
       const roster = await deps.store.roster()
+      // 同名的人辞退过：新招的是新人，记忆从空白开始；用户辞的要让制作人看见理由
+      const dismissed = existing
+        ? undefined
+        : (await deps.store.dismissals()).filter((d) => sameName(d.name, member.name)).at(-1)
       const flags = [
         ...(choosable && member.model
           ? [
@@ -278,7 +452,14 @@ function createHireTool(deps: TeamToolDeps, now: () => number): UnrealAgentTool<
         text:
           `${existing ? '已更新' : '已招入'} ${member.name}` +
           (flags.length ? `（${flags.join('；')}）` : '') +
-          `。\n团队现在 ${roster.length} 人：${roster.map((m) => m.name).join('、')}`,
+          `。\n团队现在 ${roster.length} 人：${roster.map((m) => m.name).join('、')}` +
+          (dismissed
+            ? `\n注意：${dismissed.by === 'user' ? '用户' : '你'}辞退过同名队员，理由：${dismissed.reason}。` +
+              '这次是新人，不记得之前的活' +
+              (dismissed.by === 'user'
+                ? '；用户没开口要它回来的话，换个名字、换掉让用户不满的地方'
+                : '')
+            : ''),
         details: member
       }
     }
@@ -344,18 +525,80 @@ export function formatMail(title: string, mails: TeamMail[]): string {
   return [title, ...mails.map((m) => `- ${who(m.from)}：${m.text}`)].join('\n')
 }
 
-function createSendTool(
-  deps: TeamToolDeps
-): UnrealAgentTool<SubAgentResult | { dispatched: string }> {
-  /**
-   * 同一个队员一次只干一件活。它的记忆是一条对话，两件活同时往里写会串台，
-   * 所以同一个人的第二件活排在第一件后面；不同的人照常并行。
-   *
-   * 不同队员之间**不设人数上限**：真正扛不住并发的是模型套餐，那一层由
-   * `requestGate.ts` 按网关的实际反应自适应调度，队员在编辑器里干活、等工具的时候不占名额。
-   */
-  const busy = new Map<string, Promise<unknown>>()
+/**
+ * 干活途中按轮存盘，从第一次交来的那一轮起最多隔这么久落一次。
+ *
+ * 只是合并写盘：一件活里工具一轮接一轮，记忆是整份 JSON，每轮都整份重写太浪费；
+ * 隔一会儿只写最新那份。崩了最多丢这一小段，和模型怎么干活无关
+ */
+export const MEMORY_SAVE_INTERVAL_MS = 2_000
 
+/**
+ * 一件活的记忆存盘：`keep` 记下最新一份、合并着落盘，`flush` 取消待写的、把最终版写上去。
+ *
+ * 所有写都排在同一条链上，先交的先写 —— `flush` 那次排在最后，在途的旧快照盖不掉它。
+ * 提示词和工具增量每轮现算，不进队员的记忆（见 systemMessages.ts）
+ */
+export function createMemorySaver(
+  save: (messages: AgentMessage[]) => Promise<void>,
+  intervalMs = MEMORY_SAVE_INTERVAL_MS
+): {
+  keep: (messages: AgentMessage[]) => void
+  flush: () => Promise<void>
+  /** 交过至少一份（落没落盘另说） */
+  readonly kept: boolean
+} {
+  let latest: AgentMessage[] | undefined
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let chain: Promise<void> = Promise.resolve()
+  const write = (): void => {
+    const snapshot = latest
+    if (!snapshot) return
+    // 中途那几次写失败不要紧，下一次写的是更全的一份
+    chain = chain.then(() => save(snapshot)).catch(() => undefined)
+  }
+  return {
+    keep(messages) {
+      // 交来的是活的数组，下一轮还会往里推 —— 拷一份
+      latest = withoutSystemMessages(messages).slice()
+      timer ??= setTimeout(() => {
+        timer = undefined
+        write()
+      }, intervalMs)
+    },
+    async flush() {
+      if (timer) clearTimeout(timer)
+      timer = undefined
+      const snapshot = latest
+      if (!snapshot) return chain
+      // 最终版写失败要让调用方知道，和改之前一样
+      const final = chain.then(() => save(snapshot))
+      chain = final.catch(() => undefined)
+      return final
+    },
+    get kept() {
+      return latest !== undefined
+    }
+  }
+}
+
+/**
+ * 每个队员手上（在干 + 排着）的活，键是小写名字。
+ *
+ * 同一个队员一次只干一件活。它的记忆是一条对话，两件活同时往里写会串台，
+ * 所以同一个人的第二件活排在第一件后面；不同的人照常并行。
+ *
+ * 不同队员之间**不设人数上限**：真正扛不住并发的是模型套餐，那一层由
+ * `requestGate.ts` 按网关的实际反应自适应调度，队员在编辑器里干活、等工具的时候不占名额。
+ *
+ * 辞退也看它：手上有活的不能辞
+ */
+type BusyMap = Map<string, Promise<unknown>>
+
+function createSendTool(
+  deps: TeamToolDeps,
+  busy: BusyMap
+): UnrealAgentTool<SubAgentResult | { dispatched: string }> {
   const sendInput = z.object({
     to: z.string().min(1).describe('队员名'),
     message: z
@@ -388,6 +631,10 @@ function createSendTool(
     let current = member
     let route: MemberRoute = { fellBack: false }
     let startedAt = Date.now()
+    /** 活的账（`store.startJob`）：界面上「谁交回了什么」就是它。记不上不影响干活 */
+    let jobId: string | undefined
+    /** 这件活花掉的 token。跑完（含停下）才有，记进这件活和总账 */
+    let spent: TeamUsage | undefined
     // 记一笔履历：哪个模型、干哪类活、交没交回来。说不准是哪个模型（老 fast 档）就不记
     const remember = (outcome: 'done' | 'unfinished'): void => {
       if (!route.used || !deps.models?.record) return
@@ -401,13 +648,33 @@ function createSendTool(
         })
         .catch(() => undefined)
     }
+    const settleJob = async (
+      end: { outcome: 'done'; report: string } | { outcome: 'stopped'; reason: string }
+    ): Promise<void> => {
+      const usage = spent ? { usage: spent } : {}
+      await (
+        jobId
+          ? deps.store.finishJob(jobId, { ...end, ...usage })
+          : // 活的账没记上（startJob 失败）：用量照样进总账
+            spent
+            ? deps.store.addUsage(member.name, spent)
+            : Promise.resolve()
+      ).catch(() => undefined)
+    }
+
+    // 被停下也要存：它已经干了一半的活，下次派活时得记得
+    const memory = createMemorySaver((messages) => deps.store.saveHistory(member.name, messages))
     const previous = busy.get(key) ?? Promise.resolve()
     const run = previous
       .catch(() => undefined)
       .then(async () => {
-        current = (await deps.store.findMember(member.name)) ?? member
+        const latest = await deps.store.findMember(member.name)
+        // 排队期间被用户在任务板上辞了：这件不开工
+        if (!latest) throw new Error(`${member.name} 在排队期间被辞退了，这件活没开工`)
+        current = latest
         route = await routeMember(deps.models, current)
         startedAt = Date.now()
+        jobId = (await deps.store.startJob(member.name, message).catch(() => undefined))?.id
         const ledger = new WriteLedger()
         ctx.setAbortNote?.(() => formatInterruptedWrites(ledger.list(), member.readOnly))
         // 上次被停在半截工具调用上的话，那条调用没有结果 —— 摘掉，不然它一睁眼
@@ -415,7 +682,6 @@ function createSendTool(
         const history = stripPendingToolCalls(await deps.store.history(member.name))
         // 它不在的时候队友给它的留言，这次接活时一起交给它
         const inbox = formatMail('【队友给你的留言】', await deps.store.takeInbox(member.name))
-        let latest: AgentMessage[] | undefined
         deps.live?.setAssignment(member.name, message)
         try {
           return await deps.runMember({
@@ -423,18 +689,20 @@ function createSendTool(
             message: inbox ? `${inbox}\n\n${message}` : message,
             history,
             ledger,
+            keepUsage: (usage) => (spent = usage),
             ...(route.pin ? { pin: route.pin } : {}),
             ...(ctx.signal ? { signal: ctx.signal } : {}),
             // 界面给这类进度统一加「团队：」前缀，这里只标是哪个队员
-            onProgress: (text) => ctx.report({ text: `${member.name} · ${text}` }),
-            keepMessages: (messages) => {
-              latest = messages
-            }
+            // 后台派的活这次调用早就结束了，report 推不出去；动态另走一条推送
+            onProgress: (text) => {
+              ctx.report({ text: `${member.name} · ${text}` })
+              deps.live?.note(member.name, text)
+            },
+            keepMessages: memory.keep
           })
         } finally {
           deps.live?.setAssignment(member.name, null)
-          // 被停下也要存：它已经干了一半的活，下次派活时得记得
-          if (latest) await deps.store.saveHistory(member.name, latest)
+          await memory.flush()
         }
       })
     busy.set(key, run)
@@ -444,9 +712,15 @@ function createSendTool(
         result = await run
       } catch (error) {
         remember('unfinished')
+        const why = error instanceof Error ? error.message : String(error)
+        // 制作人决定重派时要知道：它记得干到哪了，可以让它接着上次的往下干
+        const reason = memory.kept ? `${why}；${MEMORY_KEPT_NOTE}` : why
+        // 停下的活也记已经花掉的：钱是真花了
+        await settleJob({ outcome: 'stopped', reason })
         throw error
       }
       remember('done')
+      await settleJob({ outcome: 'done', report: result.text })
       // 按台账记下它实际改了什么 —— `team_status` 的「最近改动」读它，不靠队员自己说
       await deps.store
         .recordActivity({
@@ -488,8 +762,10 @@ function createSendTool(
       const member = await deps.store.findMember(to)
       if (!member) {
         const roster = await deps.store.roster()
+        const gone = (await deps.store.dismissals()).filter((d) => sameName(d.name, to)).at(-1)
         throw new Error(
           `团队里没有「${to}」。` +
+            (gone ? `它已被${gone.by === 'user' ? '用户' : '你'}辞退（${gone.reason}）。` : '') +
             (roster.length
               ? `现有：${roster.map((m) => m.name).join('、')}`
               : '还没招任何人，先用 team_hire')
@@ -500,12 +776,15 @@ function createSendTool(
         const live = deps.live
         // 后台跑：进度照样冒到这次调用的泳道上，结论作为留言送回制作人
         const job = assign(member, message, ctx).then(
-          ({ text }) => live.send(member.name, PRODUCER, `【交活】${text}`),
+          ({ text }) =>
+            live.send(member.name, PRODUCER, `【交活】${text}`, undefined, { interrupt: true }),
           (error: unknown) =>
             live.send(
               member.name,
               PRODUCER,
-              `【没干完】${member.name} 这件活停下了：${error instanceof Error ? error.message : String(error)}`
+              `【没干完】${member.name} 这件活停下了：${error instanceof Error ? error.message : String(error)}`,
+              undefined,
+              { interrupt: true }
             )
         )
         live.track(member.name, job)
@@ -540,7 +819,8 @@ function describeRoute(
   route: MemberRoute
 ): string {
   if (route.fellBack && member.model) {
-    return `（它的模型 ${modelLabel(models, member.model)} 现在用不了，这件活改用你的模型）`
+    // 没有「制作人的模型」（混合团队的制作人在盒子外）时退回的是盒子的默认模型，不能说成你的
+    return `（它的模型 ${modelLabel(models, member.model)} 现在用不了，这件活改用${models?.producer ? '你的模型' : '盒子的默认模型'}）`
   }
   if (!canChooseModels(models) || !route.used) return ''
   return `（${modelLabel(models, route.used)}${member.modelBy === 'user' ? '，用户定的' : ''}）`
@@ -592,7 +872,7 @@ export function createMessageTool(
       : delivery === 'live'
         ? `${to} 正在干活，已插进它的下一步。`
         : to === PRODUCER
-          ? '制作人这会儿没在跑，已放进它的信箱。'
+          ? '已放进制作人的信箱，它下次看信箱时会读到。'
           : `${to} 这会儿没在干活，已放进它的信箱，下次接活时会看到。`
 
   return defineTool<typeof messageInput, unknown>({
@@ -604,6 +884,7 @@ export function createMessageTool(
     description:
       `给队友或制作人（"${PRODUCER}"）说话：交接产出、提问、提醒对方你改了什么。**它不派活** —— ` +
       '对方正在干活的话，这句会插进它的下一步；对方空闲的话只是进信箱，不会让它开工（要它干活用 team_send）。' +
+      '发给制作人的话不带 wait 只进它的信箱，不打断它。' +
       'wait=read 等回执（对方真的读到），wait=reply 等对方回话。',
     input: messageInput,
     execute: async ({ to, text, reply_to, wait, wait_seconds }, ctx) => {
@@ -635,7 +916,10 @@ export function createMessageTool(
         return { text: deliveryNote(target, 'queued'), details: mail }
       }
 
-      const { mail, delivery } = await live.send(from, target, text, reply_to)
+      // 给制作人的话只有对方要等的才当场插进去，见 `teamLive.ts` 文件头
+      const { mail, delivery } = await live.send(from, target, text, reply_to, {
+        interrupt: wait !== 'none'
+      })
       const lines = [`已发出 ${mail.id}。${deliveryNote(target, delivery)}`]
       // 2026-09-26 真机反馈：制作人给空闲的队员发 team_message 当派活，其实只进了信箱，
       // 白等一整轮才发现得再用 team_send 发一遍
@@ -704,14 +988,20 @@ async function autoSnapshot(
 ): Promise<string> {
   if (!deps.snapshots || Object.keys(result.writeToolCalls ?? {}).length === 0) return ''
   try {
-    const snapshot = await deps.snapshots.save(snapshotMessage(who, what))
+    // 标签说「它干了什么」：交回报告的第一句比派活原文贴切 —— 派活常以工程路径这类背景开头，
+    // 一串快照全叫「地编：工程：I:\…」就分不出来了
+    const did = result.text
+      .trim()
+      .split(/(?<=[。！？!?])|\n/)
+      .find((s) => s.trim())
+    const snapshot = await deps.snapshots.save(snapshotMessage(who, did || what))
     return snapshot ? `【快照】已存 ${snapshot.id}（${snapshot.message}）` : ''
   } catch (error) {
     return `【快照】这次没存上：${error instanceof Error ? error.message : String(error)}`
   }
 }
 
-function createSnapshotTool(snapshots: TeamSnapshots): UnrealAgentTool<unknown> {
+export function createSnapshotTool(snapshots: TeamSnapshots): UnrealAgentTool<unknown> {
   const snapshotInput = z.object({
     action: z
       .enum(['list', 'save', 'rollback'])
@@ -723,8 +1013,11 @@ function createSnapshotTool(snapshots: TeamSnapshots): UnrealAgentTool<unknown> 
   return defineTool<typeof snapshotInput, unknown>({
     name: 'team_snapshot',
     namespace: 'core',
-    // 回滚会关掉编辑器、改写工程文件
+    // 回滚会关掉编辑器、改写工程文件，编辑器里没保存的改动会丢
     risk: 'destructive',
+    // list 只读；save 只多存一份。回滚虽然先存了当前状态，但未保存的改动救不回，仍要问
+    riskFor: ({ action }) =>
+      action === 'list' ? 'safe' : action === 'save' ? 'mutating' : 'destructive',
     concurrency: 'sequential',
     description:
       '工程快照。每个队员交回一件改了东西的活，盒子都会自动存一份（回话里有编号）。' +
@@ -767,7 +1060,10 @@ function createDeliverTool(deps: TeamToolDeps): UnrealAgentTool<GoalVerdict | nu
   const deliverInput = z.object({
     report: z.string().min(1).describe('交付说明：做了什么、玩法是什么、已知缺口'),
     how_to_play: z.string().min(1).describe('怎么玩：打开哪个关卡、操作键位、胜负条件'),
-    project_path: z.string().optional().describe('这次新建的工程目录'),
+    project_path: z
+      .string()
+      .optional()
+      .describe('这次新建的工程目录；交付的是模型、贴图这类文件而不是游戏时，给交付目录'),
     package_exe: z
       .string()
       .optional()
@@ -784,14 +1080,22 @@ function createDeliverTool(deps: TeamToolDeps): UnrealAgentTool<GoalVerdict | nu
       'PASS 之前不算交付；FAIL 就修它指出的问题，再按交付标准整体过一遍才交；BLOCKED 就停下来告诉用户缺什么。',
     input: deliverInput,
     execute: async ({ report, how_to_play, project_path, package_exe }, ctx) => {
-      const text = await deps.runAcceptance({
-        report,
-        howToPlay: how_to_play,
-        ...(project_path ? { projectPath: project_path } : {}),
-        ...(package_exe ? { packageExe: package_exe } : {}),
-        ...(ctx.signal ? { signal: ctx.signal } : {}),
-        onProgress: (line) => ctx.report({ text: line })
-      })
+      // 验收员不进活的账（它不是队员、不交成果），用量只记进总账；被停下也记
+      let spent: TeamUsage | undefined
+      let text: string
+      try {
+        text = await deps.runAcceptance({
+          report,
+          howToPlay: how_to_play,
+          ...(project_path ? { projectPath: project_path } : {}),
+          ...(package_exe ? { packageExe: package_exe } : {}),
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+          onProgress: (line) => ctx.report({ text: line }),
+          keepUsage: (usage) => (spent = usage)
+        })
+      } finally {
+        if (spent) await deps.store.addUsage(ACCEPTOR, spent).catch(() => undefined)
+      }
       const verdict = parseVerdict(text)
       await deps.onVerdict?.(verdict)
       const head = !verdict
@@ -810,9 +1114,11 @@ export function createTeamTools(
   deps: TeamToolDeps,
   now: () => number = Date.now
 ): UnrealAgentTool<never>[] {
+  const busy: BusyMap = new Map()
   return [
     createHireTool(deps, now),
-    createSendTool(deps),
+    createDismissTool(deps, busy, now),
+    createSendTool(deps, busy),
     createBoardTool(deps.store),
     createDeliverTool(deps),
     // 制作人也能当场跟正在干活的队员说话（配合 team_send 的 wait=false）
@@ -830,4 +1136,151 @@ export function createTeamTools(
         ]
       : [])
   ] as unknown as UnrealAgentTool<never>[]
+}
+
+/**
+ * 制作人手上留哪些工具：只读的，加上建工程、绑工程。其余（写文件、改编辑器、跑命令、
+ * `task` 子任务）一律收走，活只能招人派出去。团队工具在这之后追加，不经这道过滤。
+ *
+ * 2026-10-16 加，规则台账有记：制作人拿着全套写工具，两次都一个人没招、自己把游戏写完。
+ * 团队模式就是为了多个模型分工协作，想单干用普通对话就行。参照 Claude Code Agent Teams 的 delegate mode。
+ *
+ * - `task` 虽然是 safe，但它派出去的子 agent 带全套写工具，留着等于没收。
+ * - 建工程、绑工程留给制作人：队员开了工程，它这一轮的工具清单不会跟着刷新
+ *   （见 `runSubAgent` 的 `refreshEngine`），而快照、`team_status` 认的是这条会话绑的工程。
+ */
+const PRODUCER_SETUP_TOOLS = new Set(['project_manage', SET_SESSION_PROJECT_TOOL_NAME])
+
+/** `project_manage` 里制作人能用的动作。导资产、往关卡放东西、建定序器、开插件都是改游戏，派给队员 */
+const PRODUCER_PROJECT_ACTIONS = ['create_project', 'open_project'] as const
+const PRODUCER_PROJECT_ACTION_SET: ReadonlySet<string> = new Set(PRODUCER_PROJECT_ACTIONS)
+
+/** 这两个动作用得到的参数。导入、插件、定序器那十几个字段制作人一个都用不上 */
+const PRODUCER_PROJECT_FIELDS: ReadonlySet<string> = new Set([
+  'action',
+  'templateName',
+  'projectName',
+  'targetDir',
+  'engineVersion',
+  'projectKey',
+  'projectPath',
+  'waitSeconds'
+])
+
+/**
+ * 底层这两个字段的说明里写着 import / enable_plugins 也认 —— 留着就等于在提示词里
+ * 再告诉一遍制作人「这个工具还能导资产」，所以连说明一起换掉。
+ */
+const PRODUCER_FIELD_DESCRIPTIONS: Record<string, string> = {
+  projectKey:
+    'open_project 用：项目唯一标识（project_list 的 list_projects 里查），优先于 projectPath',
+  projectPath: 'open_project 用：项目目录或 .uproject 路径（没有 projectKey 时给它）'
+}
+
+const PRODUCER_PROJECT_DESCRIPTION = `建新工程、打开已有工程。工作室模式里你只用它做这两件事。
+
+【action 取值】
+- create_project：按模板建新工程（需要 templateName、projectName、targetDir）
+- open_project：打开一个已有工程（给 projectKey，或直接给 projectPath）
+
+导资产、往关卡里放东西、建定序器、给工程开插件都是改游戏内容，写进任务派给队员。
+列模板、列工程用 project_list。
+
+【打开不用先挑引擎】open_project 把 .uproject 交给系统打开，用哪个引擎由工程里的
+EngineAssociation 定，这里没有引擎参数；UnrealAgentLink 插件由盒子在打开前装好。
+【打开默认立即返回】waitSeconds 默认 0，connected=false 是还在加载，不是失败，不要重复启动。
+用 ue_session_health 确认目标工程连上后，再对同一工程调一次 open_project、waitSeconds: 5
+做就绪校验；connected=true 且 switched_target=true 就直接接着干，不用请用户去界面上切工程。
+open_project 不改这条对话挂在哪个工程下，要改归属用 set_session_project。`
+
+/**
+ * 只认 create / open 的 JSON Schema：action 枚举收窄，用不上的字段去掉。
+ *
+ * 和 `splitByRisk.ts` 的 `withWriteActionsOnly` 是同一件事（2026-09-11「声明在骗人」：
+ * 枚举里露着调不通的动作），只是做在适配之后的 JSON Schema 上 —— 这里拿到的是已经
+ * 适配、包过资产锁的工具，Zod schema 早就转掉了；而为了拿 Zod 去 import `splitByRisk`，
+ * 会把底下 `projectTool` 那一整串（数据库、服务、electron）拖进团队模块。
+ *
+ * 枚举收窄不只是给模型看的：pi 在 `beforeToolCall` **之前**按这份 schema 校验参数，
+ * 枚举外的动作在那一步就被退回，根本走不到审批门。
+ */
+function producerProjectSchema(parameters: unknown): unknown {
+  const schema = parameters as
+    | { properties?: Record<string, unknown>; required?: unknown }
+    | undefined
+  // 不是对象 schema（测试替身、将来换写法）就原样返回，execute 那道拦截照样在
+  if (!schema?.properties) return parameters
+  const properties: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(schema.properties)) {
+    if (!PRODUCER_PROJECT_FIELDS.has(key)) continue
+    properties[key] = PRODUCER_FIELD_DESCRIPTIONS[key]
+      ? { ...(value as object), description: PRODUCER_FIELD_DESCRIPTIONS[key] }
+      : value
+  }
+  properties.action = {
+    type: 'string',
+    enum: [...PRODUCER_PROJECT_ACTIONS],
+    description: '【必填】create_project 建工程 / open_project 开工程'
+  }
+  return {
+    ...schema,
+    properties,
+    ...(Array.isArray(schema.required)
+      ? { required: schema.required.filter((key) => PRODUCER_PROJECT_FIELDS.has(String(key))) }
+      : {})
+  }
+}
+
+/**
+ * 制作人版的 `project_manage`：说明、schema、风险、执行入口四处一起收窄。
+ *
+ * 原来只在 execute 里拒，可审批门跑在 execute 前面：ask 档下制作人调一次
+ * `enable_plugins`，先弹一张审批卡、用户点了允许才换回一句「不让做」；
+ * 卡上还有「以后都允许」，点了就把**整个** `project_manage` 记进永久名单，
+ * 普通对话里的开插件从此再也不问。
+ *
+ * - **schema 收窄**：模型看不见别的动作；看见了硬调，pi 的参数校验先退回。
+ * - **riskFor 封顶 mutating**：声明风险仍是 destructive，于是实际风险永远低于声明，
+ *   审批门不会给「以后都允许」（只在两者相等时给），工具名不会进永久名单。
+ *   名单外的动作算 safe：反正下面 execute 会拒，不该为一次注定被拒的调用弹框。
+ * - **execute 拦截保留**：schema 只是建议，绕过校验漏进来的照样挡掉。
+ */
+function producerProjectManage(tool: UnrealAgentTool<never>): UnrealAgentTool<never> {
+  const allowed = (args: unknown): boolean => {
+    const action = (args as { action?: unknown } | undefined)?.action
+    return typeof action === 'string' && PRODUCER_PROJECT_ACTION_SET.has(action)
+  }
+  return {
+    ...tool,
+    description: PRODUCER_PROJECT_DESCRIPTION,
+    parameters: producerProjectSchema(tool.parameters) as UnrealAgentTool<never>['parameters'],
+    unrealBox: {
+      ...tool.unrealBox,
+      // 建工程、开工程只往外加东西（见 splitByRisk 的 ADDITIVE_ACTIONS），按 mutating 问
+      riskFor: (args): ToolRisk => (allowed(args) ? 'mutating' : 'safe')
+    },
+    execute: (async (...args: Parameters<UnrealAgentTool<never>['execute']>) => {
+      if (!allowed(args[1])) {
+        const action = String((args[1] as { action?: unknown } | undefined)?.action)
+        const hint =
+          action === 'list_projects' || action === 'list_templates'
+            ? '列模板、列工程用 project_list'
+            : '这是改游戏内容的活，写进任务派给队员去做'
+        throw new Error(
+          `制作人的 project_manage 只能 create_project、open_project，不支持 action="${action}"；${hint}`
+        )
+      }
+      return tool.execute(...args)
+    }) as UnrealAgentTool<never>['execute']
+  }
+}
+
+export function producerTools(pool: UnrealAgentTool<never>[]): UnrealAgentTool<never>[] {
+  return pool
+    .filter(
+      (tool) =>
+        PRODUCER_SETUP_TOOLS.has(tool.name) ||
+        (tool.name !== 'task' && tool.unrealBox.risk === 'safe')
+    )
+    .map((tool) => (tool.name === 'project_manage' ? producerProjectManage(tool) : tool))
 }

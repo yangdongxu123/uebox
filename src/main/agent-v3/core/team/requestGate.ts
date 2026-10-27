@@ -37,12 +37,13 @@ import {
   type AssistantMessage,
   type AssistantMessageEvent,
   type AssistantMessageEventStream,
-  type Context,
+  type TranscriptContext,
   type Model
 } from '@earendil-works/pi-ai'
 import type { StreamFn } from '@earendil-works/pi-agent-core'
 
 import { CODEBUDDY_ORIGIN } from '../../../ai/codebuddy'
+import { isPlanUpstreamUnavailable } from '../../../../shared/creatorPlan'
 import { classifyProviderError } from '../../host/providerError'
 
 export interface GateConfig {
@@ -337,6 +338,19 @@ export interface PacedStreamDeps {
   limiterFor?: (model: Model<Api>) => AdaptiveLimiter
   /** 每次重发前告诉宿主一声（写日志、给界面一条提示） */
   onRetry?: (info: { attempt: number; reason: string; model: Model<Api> }) => void
+  /**
+   * 「失败不扣费」的套餐模型（清单 `models[].free_on_failure`）。它回 503 `upstream_unavailable`
+   * 是线路池全挂了，不是网关在挤：只重发一次，再失败把原文交给调用方（界面提示稍后重试或换回默认模型），
+   * 不包成「连续 N 次扛不住」—— 那句会被持续续跑当成中转不稳，再转半小时
+   */
+  freeOnFailure?: (model: Model<Api>) => boolean
+}
+
+/** 失败不扣费的模型线路全挂了（见 PacedStreamDeps.freeOnFailure） */
+function isLineBusy(deps: PacedStreamDeps, model: Model<Api>, errorMessage: string): boolean {
+  if (!deps.freeOnFailure?.(model)) return false
+  const { statusCode, code } = classifyProviderError(errorMessage)
+  return isPlanUpstreamUnavailable(statusCode, code)
 }
 
 /**
@@ -345,7 +359,7 @@ export interface PacedStreamDeps {
 export function pacedStreamFn(inner: StreamFn, deps: PacedStreamDeps = {}): StreamFn {
   const pick = deps.limiterFor ?? limiterFor
 
-  return (model: Model<Api>, context: Context, options) => {
+  return (model: Model<Api>, context: TranscriptContext, options) => {
     const out = createAssistantMessageEventStream()
     const outer = options?.signal
     const limiter = pick(model)
@@ -404,7 +418,8 @@ export function pacedStreamFn(inner: StreamFn, deps: PacedStreamDeps = {}): Stre
               const failed = event.reason === 'error' && !outer?.aborted
               const overload = failed && isOverloadError(message)
               const transient = failed && isTransientBadRequest(model, message)
-              if ((overload || transient) && forwarded === 0) {
+              const busy = failed && isLineBusy(deps, model, message)
+              if ((overload || transient) && forwarded === 0 && !(busy && attempt >= 1)) {
                 lastReason = message
                 lastTransient = transient
                 release({ kind: 'overload' })

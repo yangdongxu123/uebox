@@ -17,7 +17,7 @@
  */
 
 import { execFile } from 'child_process'
-import { existsSync, promises as fs } from 'fs'
+import { existsSync, promises as fs, readFileSync } from 'fs'
 import { join } from 'path'
 import { promisify } from 'util'
 import { app } from 'electron'
@@ -39,6 +39,12 @@ import {
   type BlenderSetupStatus,
   type Version
 } from './blenderSetup'
+import { refreshProcessPath } from '../../../services/systemPath'
+import {
+  installPrerequisite,
+  type InstallablePrerequisite,
+  type WingetOutcome
+} from './blenderPrereqInstall'
 import { readMcpSettings, upsertMcpServer } from './store'
 
 const execFileAsync = promisify(execFile)
@@ -59,12 +65,35 @@ const INSTALL_TIMEOUT_MS = 15 * 60_000
 /** 安装脚本的输出。pip 的进度条能刷出很长一串 */
 const INSTALL_MAX_BUFFER = 16 * 1024 * 1024
 
+/** 随包资源的根。打包后是 `resources/`，开发时是仓库里的 `resources/` */
+function resourcesRoot(): string {
+  return app.isPackaged ? process.resourcesPath : join(app.getAppPath(), 'resources')
+}
+
 /** 技能里那两个安装脚本所在的目录。随包资源，不是用户目录 */
 function setupScriptDir(): string {
-  const root = app.isPackaged
-    ? join(process.resourcesPath, 'skills')
-    : join(app.getAppPath(), 'resources', 'skills')
-  return join(root, 'blender-ue-pipeline', 'scripts')
+  return join(resourcesRoot(), 'skills', 'blender-ue-pipeline', 'scripts')
+}
+
+/**
+ * 随包的官方源码 zip（锁定 commit，见 `scripts/fetch-blender-mcp.mjs`）。没有就返回 undefined。
+ *
+ * 有它，用户机器就不需要 Git，也不用连 projects.blender.org —— 国内直连时
+ * Git 安装包走 GitHub，握手失败、几百 KB/s 是常态，而拉的永远是同一个 commit。
+ * 没有它（开发时没跑过 `--ensure`）就退回安装脚本里原来的 git fetch。
+ */
+function bundledSourceArchive(): string | undefined {
+  const dir = join(resourcesRoot(), 'blender-mcp')
+  try {
+    const manifest = JSON.parse(readFileSync(join(dir, 'blender-mcp-source.json'), 'utf8')) as {
+      file?: unknown
+    }
+    if (typeof manifest.file !== 'string') return undefined
+    const archive = join(dir, manifest.file)
+    return existsSync(archive) ? archive : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -201,8 +230,35 @@ async function checkGit(): Promise<BlenderPrerequisite> {
  * 单独一支」—— 于是一台装着好好的 Python 3.13 的机器被判「没找到 Python」，
  * 而 Python 这一项又没有「选择…」那样的手动出路，等于永久锁死。
  */
-function pythonCandidates(platform: NodeJS.Platform): string[] {
-  return platform === 'win32' ? ['py', 'python', 'python3'] : ['python3', 'python']
+async function pythonCandidates(
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv
+): Promise<string[]> {
+  if (platform !== 'win32') return ['python3', 'python']
+  return ['py', 'python', 'python3', ...(await windowsUserPythons(env))]
+}
+
+/**
+ * python.org 按用户安装的标准位置：`%LOCALAPPDATA%\Programs\Python\Python3XX\`。
+ *
+ * 安装器默认不加 PATH，启动器 `py` 也可以被取消勾选 —— 那样装好的 Python
+ * 在 PATH 上一个入口都没有。一键安装那条路会显式打开 PATH，这里是兜底：
+ * 用户自己装、没勾选项的，也能被认出来。
+ */
+async function windowsUserPythons(env: NodeJS.ProcessEnv): Promise<string[]> {
+  const local = env.LOCALAPPDATA?.trim()
+  if (!local) return []
+  const root = join(local, 'Programs', 'Python')
+  let entries: string[]
+  try {
+    entries = await fs.readdir(root)
+  } catch {
+    return []
+  }
+  return entries
+    .filter((entry) => /^Python3\d+$/i.test(entry))
+    .map((entry) => join(root, entry, 'python.exe'))
+    .filter((exe) => existsSync(exe))
 }
 
 /**
@@ -237,10 +293,13 @@ async function resolveInterpreterPath(exe: string): Promise<string | undefined> 
  * 问不出绝对路径就当没找到 —— 把一个名字递给安装脚本只会换来一句
  * 用户读不懂的 PowerShell 报错，不如在这儿就说「没找到」。
  */
-async function checkPython(platform: NodeJS.Platform): Promise<BlenderPrerequisite> {
+async function checkPython(
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv
+): Promise<BlenderPrerequisite> {
   const found = await checkVersioned(
     'python',
-    pythonCandidates(platform),
+    await pythonCandidates(platform, env),
     ['--version'],
     'Python',
     MIN_PYTHON_VERSION
@@ -256,14 +315,23 @@ export interface BlenderSetupEnvironment {
   platform: NodeJS.Platform
   env: NodeJS.ProcessEnv
   home: string
+  /** 随包的官方源码 zip。有它就不需要 Git */
+  sourceArchive?: string
 }
 
 function currentEnvironment(): BlenderSetupEnvironment {
-  return { platform: process.platform, env: process.env, home: app.getPath('home') }
+  return {
+    platform: process.platform,
+    env: process.env,
+    home: app.getPath('home'),
+    sourceArchive: bundledSourceArchive()
+  }
 }
 
 /**
- * 探这台机器上的三项前置。要起三个子进程问版本，别在一次交互里调两遍。
+ * 探这台机器上的前置。要起几个子进程问版本，别在一次交互里调两遍。
+ *
+ * 随包带了源码就不探 Git：用不上的东西不该出现在「缺少」的清单里。
  */
 export async function checkPrerequisites(
   environment: BlenderSetupEnvironment
@@ -274,8 +342,8 @@ export async function checkPrerequisites(
 
   return Promise.all([
     checkVersioned('blender', candidates, ['--version'], 'Blender', MIN_BLENDER_VERSION),
-    checkGit(),
-    checkPython(platform)
+    ...(environment.sourceArchive ? [] : [checkGit()]),
+    checkPython(platform, env)
   ])
 }
 
@@ -320,6 +388,61 @@ export async function inspectBlenderSetup(
   }
 }
 
+export interface PrerequisiteInstallResult {
+  success: boolean
+  /** 给界面直接显示的一句话 */
+  message: string
+  /** 失败时原样交给 AI 的东西（winget 退出码和原话），不概括 */
+  error?: string
+}
+
+/**
+ * 装缺的 Git / Python（Python 先走国内镜像，见 blenderPrereqInstall.ts），装完刷新 PATH 再探一次。
+ *
+ * 一个一个装，第一个失败就停 —— 后面那个多半会以同样的原因失败
+ * （没网、没 winget），连报两遍只是噪音。
+ *
+ * **装完要再探一次，不能拿 winget 的退出码当结论。** winget 说成功，
+ * 盒子仍然可能找不到它（PATH 没加上、装进了别的位置）。那时候界面要
+ * 说实话并给「交给 AI 排查」，而不是安静地刷新出同一句「未找到」。
+ */
+export async function installBlenderPrerequisites(
+  ids: InstallablePrerequisite[],
+  environment: BlenderSetupEnvironment = currentEnvironment(),
+  deps: { install?: (id: InstallablePrerequisite) => Promise<WingetOutcome> } = {}
+): Promise<PrerequisiteInstallResult> {
+  if (environment.platform !== 'win32') {
+    return {
+      success: false,
+      message: '自动安装仅支持 Windows。',
+      error: `unsupported platform: ${environment.platform}`
+    }
+  }
+  const install = deps.install ?? installPrerequisite
+
+  for (const id of ids) {
+    const outcome = await install(id)
+    if (!outcome.ok) {
+      return { success: false, message: outcome.message ?? '', error: outcome.detail }
+    }
+  }
+
+  await refreshProcessPath()
+
+  const still = (await checkPrerequisites(environment)).filter(
+    (item) => !item.ok && (ids as string[]).includes(item.id)
+  )
+  if (still.length > 0) {
+    const missing = describeMissing(still)
+    return {
+      success: false,
+      message: `安装程序已运行完毕，但虚幻盒子仍未检测到：${missing}。`,
+      error: `winget reported success but still missing: ${still.map((item) => item.id).join(', ')}; PATH=${process.env.PATH ?? ''}`
+    }
+  }
+  return { success: true, message: '' }
+}
+
 export interface BlenderSetupResult {
   success: boolean
   /** 给界面直接显示的一句话 */
@@ -352,7 +475,7 @@ export async function runBlenderSetup(
   if (platform !== 'win32' && platform !== 'darwin') {
     return {
       success: false,
-      message: '这个平台还没有 Blender 安装脚本，只有 Windows 和 macOS 有。',
+      message: '当前平台暂无 Blender 安装脚本，仅支持 Windows 和 macOS。',
       error: `unsupported platform: ${platform}`
     }
   }
@@ -367,14 +490,14 @@ export async function runBlenderSetup(
   if (!blenderPath) {
     return {
       success: false,
-      message: '没找到 Blender。请在上面选一个 blender 可执行文件再试。',
+      message: '未找到 Blender。请在上方选择 Blender 可执行文件后重试。',
       error: 'no blender executable'
     }
   }
   if (!existsSync(blenderPath)) {
     return {
       success: false,
-      message: `这个位置没有文件：${blenderPath}`,
+      message: `文件不存在：${blenderPath}`,
       error: `blender not found: ${blenderPath}`
     }
   }
@@ -393,14 +516,14 @@ export async function runBlenderSetup(
   )
   if (blocking.length > 0) {
     const missing = describeMissing(blocking)
-    return { success: false, message: `还差这些才能装：${missing}`, error: missing }
+    return { success: false, message: `缺少以下安装条件：${missing}`, error: missing }
   }
 
   const python = prerequisites.find((item) => item.id === 'python')?.path
   if (!python) {
     return {
       success: false,
-      message: '没找到 Python 3.11+，官方 server 装不了。',
+      message: '未找到 Python 3.11+，无法安装官方 server。',
       error: 'no python interpreter'
     }
   }
@@ -413,13 +536,19 @@ export async function runBlenderSetup(
 
   let installerOutput = ''
   try {
-    installerOutput = await install(platform, setupScriptDir(), blenderPath, python)
+    installerOutput = await install(
+      platform,
+      setupScriptDir(),
+      blenderPath,
+      python,
+      environment.sourceArchive
+    )
   } catch (error) {
     const reason = installerMessage(error)
     return {
       success: false,
       // 带上安装目录：脚本自己的那句报错只说「换一个目录」，不说是哪个
-      message: `安装没跑完：${reason}（安装目录：${installRoot}）`,
+      message: `安装未完成：${reason}（安装目录：${installRoot}）`,
       error: reason
     }
   }
@@ -431,14 +560,14 @@ export async function runBlenderSetup(
   } catch (error) {
     return {
       success: false,
-      message: '装完了，但读不到安装脚本写出来的配置，没能自动填进 MCP 设置。',
+      message: '安装已完成，但无法读取安装脚本生成的配置，未能自动写入 MCP 设置。',
       error: `${entryFile}: ${(error as Error).message}`
     }
   }
   if (!entry) {
     return {
       success: false,
-      message: '装完了，但安装脚本写出来的配置不完整，没能自动填进 MCP 设置。',
+      message: '安装已完成，但安装脚本生成的配置不完整，未能自动写入 MCP 设置。',
       error: `${entryFile} has no usable server entry`
     }
   }
@@ -489,9 +618,9 @@ export async function runBlenderSetup(
 function onlineAccessNote(installerOutput: string): string {
   if (!/BLMCP_ONLINE=False/i.test(installerOutput)) return ''
   return (
-    '（另外：Blender 的「允许在线访问」是关的。盒子拉起来的那个不受影响，' +
-    '但你自己双击打开的 Blender 不会开桥 —— 要么让盒子来开，' +
-    '要么在 Blender 的偏好设置 → 系统 → 网络里勾上这一项。）'
+    '（注意：Blender 的「允许在线访问」处于关闭状态。由虚幻盒子启动的 Blender 不受影响，' +
+    '但手动启动的 Blender 不会开启 MCP 桥。请通过虚幻盒子启动 Blender，' +
+    '或在 Blender 的偏好设置 → 系统 → 网络中勾选该选项。）'
   )
 }
 
@@ -541,9 +670,9 @@ async function clearPartialInstall(installRoot: string): Promise<string | undefi
   const unexpected = entries.filter((entry) => !INSTALL_ROOT_ENTRIES.has(entry))
   if (unexpected.length > 0) {
     return (
-      `${installRoot} 里有一份没装完的安装，而且夹着不认识的文件` +
-      `（${unexpected.slice(0, 3).join('、')}），盒子没有动它。` +
-      '请确认这个目录没有你要留的东西，删掉它再点一次。'
+      `${installRoot} 中存在未完成的安装，且包含无法识别的文件` +
+      `（${unexpected.slice(0, 3).join('、')}），虚幻盒子未做改动。` +
+      '请确认该目录中没有需要保留的文件，删除该目录后重试。'
     )
   }
 
@@ -562,7 +691,8 @@ export interface BlenderSetupDeps {
     platform: NodeJS.Platform,
     scriptDir: string,
     blenderPath: string,
-    python: string
+    python: string,
+    sourceArchive?: string
   ) => Promise<string>
 }
 
@@ -571,12 +701,18 @@ async function runInstaller(
   platform: NodeJS.Platform,
   scriptDir: string,
   blenderPath: string,
-  python: string
+  python: string,
+  sourceArchive?: string
 ): Promise<string> {
   if (platform === 'darwin') {
     const { stdout } = await execFileAsync(
       python,
-      [join(scriptDir, 'setup_mcp.py'), '--blender-path', blenderPath],
+      [
+        join(scriptDir, 'setup_mcp.py'),
+        '--blender-path',
+        blenderPath,
+        ...(sourceArchive ? ['--source-archive', sourceArchive] : [])
+      ],
       { timeout: INSTALL_TIMEOUT_MS, maxBuffer: INSTALL_MAX_BUFFER }
     )
     return stdout
@@ -595,7 +731,8 @@ async function runInstaller(
       '-BlenderPath',
       blenderPath,
       '-PythonPath',
-      python
+      python,
+      ...(sourceArchive ? ['-SourceArchive', sourceArchive] : [])
     ],
     { timeout: INSTALL_TIMEOUT_MS, maxBuffer: INSTALL_MAX_BUFFER, windowsHide: true }
   )

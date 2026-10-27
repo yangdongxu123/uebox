@@ -8,7 +8,7 @@ import { describeShellOpenFailure, type ShellOpenResult } from '@renderer/utils/
 /**
  * 「对一条本地/网络路径能做什么」的共用菜单。
  *
- * 两个地方要用同一套动作：聊天正文里右键一条路径（MarkdownRenderer），
+ * 两个地方要用同一套动作：对话正文里右键一条路径（MarkdownRenderer），
  * 以及「本轮改动」里每个文件行的「打开 ▾」（AIBubble）。写两份必然会漂移，
  * 所以菜单项和动作分发都放这里。
  */
@@ -81,7 +81,7 @@ function reportOpenFailure(result: ShellOpenResult | undefined, target: string):
   if (!failure) return
   console.warn('[useFilePathMenu] 打开失败:', target, failure.error)
   message[failure.level](
-    failure.pathNotFound ? `这个路径不存在：${target}` : `打不开：${target}（${failure.error}）`,
+    failure.pathNotFound ? `路径不存在：${target}` : `无法打开：${target}（${failure.error}）`,
     8
   )
 }

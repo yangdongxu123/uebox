@@ -7,9 +7,16 @@
 
 import type { AgentTurnUsage } from '@core/shared/agentUsage'
 import type { AgentReviewResult, AgentReviewTarget } from '@core/shared/agentReview'
-import type { ModelCheckup, TeamStateView } from '@core/shared/agentTeam'
+import type {
+  DismissalErrorCode,
+  ExternalTeamSummary,
+  ModelCheckup,
+  ModelDossier,
+  TeamStateView
+} from '@core/shared/agentTeam'
 import type { AgentQuestion, AgentQuestionAction } from '@core/shared/agentQuestion'
 import type { EditorSnapshotCaptureResult } from '@core/shared/editorSnapshot'
+import type { SharedSkillOrigin } from '@core/shared/share'
 import { unwrapResult } from '@renderer/common/utils'
 import { toSessionProjectPayload } from '@renderer/views/Assistant/composables/sessionProjectBinding'
 
@@ -49,16 +56,16 @@ export type AgentV3Event =
       namespace: string
       risk: string
       args: unknown
-      /** false 时不给「本次会话都允许」——每次都要用户当场看参数再点头 */
+      /** false 时不给「本对话内都允许」——每次都要用户当场看参数再点头 */
       allowAlways?: boolean
     }
   /** agent 反问用户。界面在时间线上长一张选项卡片，答完经 replyQuestion 回传 */
   | { type: 'question-required'; toolCallId: string; questions: AgentQuestion[] }
   /**
-   * 这条会话**真的**空出来了 —— 主进程把它从登记表摘掉、资产锁也放了。
+   * 这条内核 session **真的**空出来了 —— 主进程把它从登记表摘掉、资产锁也放了。
    *
    * 和 `done` 不是一回事：`done` 是事件流里的最后一条，但它发出来时
-   * `prompt()` 还没返回、`finally` 里的 release 还没跑。要接着往同一条会话
+   * `prompt()` 还没返回、`finally` 里的 release 还没跑。要接着往同一条内核 session
    * 派下一轮的（排队的跟进消息就是），等这条。
    */
   | { type: 'released' }
@@ -110,6 +117,8 @@ export interface AgentV3SkillSummary {
   source: 'user' | 'plugin' | 'builtin'
   /** 用户有没有把它关掉。关掉的仍然在清单里 —— 否则「技能」页没法再打开它 */
   enabled: boolean
+  /** 从官网共享库装的 */
+  shared?: SharedSkillOrigin
 }
 
 export const agentV3API = {
@@ -120,7 +129,9 @@ export const agentV3API = {
     approvalMode?: AgentV3ApprovalMode
     /** 思考程度。不传等同 auto —— 不指定，随模型自己的默认 */
     thinkingLevel?: AgentV3ThinkingLevel
-    /** 会话归属的 UE 工程；不传主进程就只能拿当前连接当「这个工程」 */
+    /** 「快速」：Codex 订阅走 priority 档，别的模型忽略 */
+    fastMode?: boolean
+    /** 对话归属的 UE 工程；不传主进程就只能拿当前连接当「这个工程」 */
     sessionProject?: AgentV3SessionProject | null
   }) {
     return window.api.agentV3.execute(args)
@@ -136,8 +147,8 @@ export const agentV3API = {
    * **永远不抛。** 闪存是发送路上顺带的一步，抓不到就是这条消息不带快照，
    * 绝不能因此让消息发不出去 —— 所以 IPC 层的异常也在这里兜成 `ok: false`。
    *
-   * @param runningSessionId 这条会话正在跑时必须传：排队的、插的话最终都落在
-   *   那一轮上，得跟着它盯的那个工程抓，不能自己按会话戳重算（没盖戳的会话
+   * @param runningSessionId 这条对话正在跑时必须传：排队的、插的话最终都落在
+   *   那一轮上，得跟着它盯的那个工程抓，不能自己按对话戳重算（没盖戳的对话
    *   会跟着「最近连上的」走，等待期间新连一个工程就抓错了）。
    */
   async captureEditorSnapshot(args: {
@@ -162,17 +173,17 @@ export const agentV3API = {
   },
 
   /**
-   * 用户在界面上改了这条会话归属哪个工程（顶栏胶囊、侧边栏「归入工程 / 移出项目」）。
+   * 用户在界面上改了这条对话归属哪个工程（顶栏胶囊、侧边栏「归入工程 / 移出项目」）。
    *
    * 归属真正的主人是主进程那张表；随消息捎带的那份戳只在表里还空着时用来初始化。
-   * 所以会话发过第一条消息之后，**只改 store 是改不动归属的** —— 胶囊上写着新
+   * 所以对话发过第一条消息之后，**只改 store 是改不动归属的** —— 胶囊上写着新
    * 工程，引擎命令还发往旧的那个。
    *
    * 失败要抛：主进程把 `{ success: false }` 当正常返回值 resolve，不过
    * `unwrapResult()` 的话 `.catch()` 永远不触发，写失败和写成功在调用方看起来
    * 一模一样 —— 而这里写失败的后果正是界面和引擎对不上。
    *
-   * `project: null` = 移出项目。`sessionId` 是**内核**会话 id。
+   * `project: null` = 移出项目。`sessionId` 是**内核** session id。
    */
   async setSessionProject(args: {
     sessionId: string
@@ -194,7 +205,7 @@ export const agentV3API = {
     )
   },
 
-  /** 这条会话绑定的模型（主进程执行记录里那份）。没绑过为 null */
+  /** 这条对话绑定的模型（主进程执行记录里那份）。没绑过为 null */
   sessionModel(sessionId: string) {
     return window.api.agentV3.sessionModel({ sessionId })
   },
@@ -224,12 +235,12 @@ export const agentV3API = {
   },
 
   /**
-   * 改**某条会话**的审批档位。
+   * 改**某条对话**的审批档位。
    *
    * 跑着的时候也要喊一声：主进程的审批门每次工具调用现读档位，喊了就立刻
    * 生效。不喊的话用户在被确认框拦住时调松档位，本轮一个框都不会少弹。
    *
-   * `sessionId` 是内核会话 id（`chatStore.getAgentSessionId`），不是聊天会话 id。
+   * `sessionId` 是内核 session id（`chatStore.getAgentSessionId`），不是对话 id。
    */
   setApprovalMode(sessionId: string, approvalMode: AgentV3ApprovalMode, mode?: 'agent' | 'ask') {
     return window.api.agentV3.setApprovalMode({ sessionId, approvalMode, mode })
@@ -255,7 +266,7 @@ export const agentV3API = {
   },
 
   /**
-   * 手动压缩这条会话的上下文。
+   * 手动压缩这条对话的上下文。
    *
    * 主进程的处理器（`ipc/agentV3.ts` 的 `agent-v3:compact`）和 preload 的透传
    * 一直都在，缺的只是这一层 —— 于是界面上没有任何东西能调它。
@@ -285,7 +296,7 @@ export const agentV3API = {
   },
 
   /**
-   * 刷新页面后问主进程：这几条会话里，哪些还在跑？
+   * 刷新页面后问主进程：这几条内核 session 里，哪些还在跑？
    *
    * 界面刷新只重启了「显示器」，主进程那台「主机」没停 —— 不问一声就一律
    * 当作中断，是在猜，而且猜错的那一半后台还在改用户的工程。
@@ -384,15 +395,15 @@ export const agentV3API = {
   },
 
   /**
-   * 会话分支：把内核 transcript 复制成一个新 sessionId。
+   * 分支：把内核 transcript 复制成一个新 sessionId。
    *
-   * 返回的新 id 由调用方挂到新会话上 —— 内核按 sessionId 恢复历史，
-   * 新会话下一轮自然带着分支点之前的上下文。
+   * 返回的新 id 由调用方挂到新对话上 —— 内核按 sessionId 恢复历史，
+   * 新对话下一轮自然带着分支点之前的上下文。
    *
-   * `keepUserTurns` 是分叉点：只复制前这么多个用户回合，后面的丢掉。
+   * `keepUserTurns` 是分支点：只复制前这么多个用户轮次，后面的丢掉。
    * 不给就整份复制（从最后一条回复分支时就是这样）。
    *
-   * 会话跑着的时候也能从**更早的一轮**分支，源会话继续输出；整份复制和
+   * 对话跑着的时候也能从**更早的一轮**分支，源对话继续输出；整份复制和
    * 「切点就落在这一轮里」仍然回 `busy`，那时该等它收尾。
    */
   forkSession(
@@ -409,7 +420,7 @@ export const agentV3API = {
   },
 
   /**
-   * 把内核 transcript 截回前 `keepUserTurns` 个用户回合。
+   * 把内核 transcript 截回前 `keepUserTurns` 轮。
    *
    * 「重新生成」「编辑消息」用：界面删掉的是气泡，内核那份历史每轮都从盘上
    * 恢复，不截的话模型看着刚被丢掉的答案再答一遍。
@@ -434,7 +445,7 @@ export const agentV3API = {
    * 只肯从更早的一轮分（切点必须已经收尾），这边要的恰恰是此刻的现场 ——
    * 「它现在在干嘛」这个问题只在跑着的时候才有人问。
    */
-  forkForSideChat(sessionId: string): Promise<{
+  forkForSideQuestion(sessionId: string): Promise<{
     success: boolean
     sessionId?: string
     messageCount?: number
@@ -442,7 +453,7 @@ export const agentV3API = {
     reason?: 'empty' | 'error'
     error?: string
   }> {
-    return window.api.agentV3.forkForSideChat({ sessionId })
+    return window.api.agentV3.forkForSideQuestion({ sessionId })
   },
 
   /**
@@ -455,7 +466,7 @@ export const agentV3API = {
     return window.api.agentV3.reviewChanges({ targets })
   },
 
-  /** 这条会话的目标。没有、或者查不到时给 null */
+  /** 这条内核 session 的目标。没有、或者查不到时给 null */
   async goalState(sessionId: string): Promise<{ objective: string; settled: boolean } | null> {
     const result = await window.api.agentV3.goalState({ sessionId })
     return result?.goal ?? null
@@ -466,10 +477,16 @@ export const agentV3API = {
     return window.api.agentV3.goalEnd({ sessionId })
   },
 
-  /** 工作室模式的任务板。不是工作室的会话、或者查不到时给 null */
+  /** 工作室模式的任务板。不是工作室的内核 session、或者查不到时给 null */
   async teamState(sessionId: string): Promise<TeamStateView | null> {
     const result = await window.api.agentV3.teamState({ sessionId })
     return result?.team ?? null
+  },
+
+  /** 外部团队（Claude Code 当大脑），最近的在前。读不到给空列表 */
+  async externalTeams(): Promise<ExternalTeamSummary[]> {
+    const result = await window.api.agentV3.externalTeams()
+    return result?.teams ?? []
   },
 
   /**
@@ -482,6 +499,10 @@ export const agentV3API = {
     return window.api.agentV3.teamTaskReopen({ sessionId, taskId })
   },
 
+  teamJobReopen(sessionId: string, jobId: string): Promise<{ success: boolean; error?: string }> {
+    return window.api.agentV3.teamJobReopen({ sessionId, jobId })
+  },
+
   /** 任务板上给队员换模型。同上，不走 `unwrapResult()`：失败在面板上就地说 */
   teamMemberModel(
     sessionId: string,
@@ -491,8 +512,31 @@ export const agentV3API = {
     return window.api.agentV3.teamMemberModel({ sessionId, name, ...model })
   },
 
+  /** 任务板上辞退队员。同上，不走 `unwrapResult()`：失败按 errorKey 在面板上就地说 */
+  teamMemberDismiss(
+    sessionId: string,
+    name: string,
+    reason: string
+  ): Promise<{ success: boolean; error?: string; errorKey?: DismissalErrorCode }> {
+    return window.api.agentV3.teamMemberDismiss({ sessionId, name, reason })
+  },
+
   teamEnd(sessionId: string): Promise<{ success: boolean; error?: string; errorKey?: 'running' }> {
     return window.api.agentV3.teamEnd({ sessionId })
+  },
+
+  /** 设置「团队」页的模型档案 */
+  async teamModels(): Promise<ModelDossier[]> {
+    const result = await window.api.agentV3.teamModels()
+    return result?.models ?? []
+  },
+
+  /** 「重新检测」。不走 `unwrapResult()`：结论要显示在那一行上，不抛到全局 */
+  teamModelCheckup(model: {
+    providerId: string
+    modelId: string
+  }): Promise<{ success: boolean; error?: string; checkup?: ModelCheckup }> {
+    return window.api.agentV3.teamModelCheckup(model)
   },
 
   invalidateProviders() {
@@ -516,9 +560,9 @@ export const agentV3API = {
   },
 
   /**
-   * 订阅某个会话的全部事件。返回取消订阅函数。
+   * 订阅某条内核 session 的全部事件。返回取消订阅函数。
    *
-   * 按 sessionId 过滤：多窗口 / 多标签同时开着不同会话时，
+   * 按 sessionId 过滤：多窗口 / 多标签同时开着不同对话时，
    * 不过滤会把别人的消息渲染到自己的对话里。
    */
   subscribe(sessionId: string, handler: (event: AgentV3Event) => void): () => void {
@@ -527,13 +571,15 @@ export const agentV3API = {
         // preload 的 on() 把 IpcRendererEvent 剥掉了，第一个参数就是 payload
         const payload = args[0] as EventPayload | undefined
         if (!payload || payload.sessionId !== sessionId) return
-        // sessionId 只用于路由，不进事件对象 —— 订阅方已经知道自己订的是哪个会话
+        // sessionId 只用于路由，不进事件对象 —— 订阅方已经知道自己订的是哪条内核 session
         const rest = { ...payload }
         delete rest.sessionId
         handler({ type, ...rest } as AgentV3Event)
       }
-      window.api.on(`agent-v3:${type}`, listener)
-      return () => window.api.off(`agent-v3:${type}`, listener)
+      // preload 的 on() 包了一层再挂上去，返回的是那一层；off() 要的是它，不是 listener ——
+      // 传 listener 的话一个都摘不掉，同一条 session 再订一次就会收到两份事件
+      const handle = window.api.on(`agent-v3:${type}`, listener)
+      return () => window.api.off(`agent-v3:${type}`, handle)
     })
 
     return () => disposers.forEach((dispose) => dispose())

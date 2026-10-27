@@ -34,11 +34,15 @@ import { assertInAccessScope } from './accessScope'
 import { assertPathAllowed } from './pathBoundary'
 
 /**
- * 一律跳过的目录。
+ * 默认跳过的目录。
  *
  * 前四个是虚幻工程的生成物（缓存、中间产物、编译输出、日志与自动保存），
  * 后面是通用的版本控制与包管理目录。这些目录的共同点：内容是机器生成的，
- * 用户搜的从来不是它们，但体量能大到把整次搜索拖垮。
+ * 平时搜的不是它们，但体量能大到把整次搜索拖垮。
+ *
+ * 但排查问题时要找的恰恰在这里：`Saved/Logs` 的编辑器日志、`Saved/Crashes` 的崩溃
+ * 报告、`Intermediate` 里 UHT 生成的头文件。所以给一个 `include_ignored` 开关，
+ * 调用方明确要了才进去 —— 默认仍然跳过。
  */
 const ALWAYS_IGNORE = [
   '**/DerivedDataCache/**',
@@ -49,21 +53,51 @@ const ALWAYS_IGNORE = [
   '**/node_modules/**'
 ]
 
-/** 找文件一次最多返回多少条 */
+/** 找文件默认返回多少条 / 调用方最多能要多少条 */
 const MAX_FILES = 200
-/** 搜内容一次最多返回多少行命中 */
+const MAX_FILES_LIMIT = 2000
+/** 搜内容默认返回多少行命中 / 调用方最多能要多少行 */
 const MAX_MATCHES = 100
-/** 单个文件超过这个大小就不搜内容 —— 多半是二进制或日志，搜了也没意义 */
-const MAX_SEARCHABLE_BYTES = 2_000_000
+const MAX_MATCHES_LIMIT = 1000
+/**
+ * 单个文件超过这个大小就不搜内容。
+ *
+ * 原先是 2 MB，挡掉的正是排查时最该搜的东西：长一点的编辑器会话，`Saved/Logs` 里的
+ * 日志轻松过 2 MB。32 MB 整个读进内存跑正则还撑得住；再大的多半是数据转储。
+ */
+const MAX_SEARCHABLE_BYTES = 32 * 1024 * 1024
 /** 命中行超长时截断，避免一行压缩过的 JSON 就占满上下文 */
 const MAX_LINE_CHARS = 300
+/**
+ * 结果大到要存档时（`core/resultArchive.ts`）正文收到多长。存档器还要在后面补一句
+ * 存档编号和查法，所以比存档预算（16K）留出一截
+ */
+const ARCHIVED_BODY_CHARS = 12_000
+
+/** 存档时的正文：抬头加上放得下的那几行，再说清还有几行没列 */
+function renderWithin(header: string, lines: string[], unit: string): string {
+  const out = [header]
+  let used = header.length
+  for (const line of lines) {
+    if (used + line.length + 1 > ARCHIVED_BODY_CHARS) break
+    out.push(line)
+    used += line.length + 1
+  }
+  const rest = lines.length - (out.length - 1)
+  if (rest > 0) out.push(`（这里只列了前 ${out.length - 1} ${unit}，其余 ${rest} ${unit}在存档里）`)
+  return out.join('\n')
+}
 
 const findInput = z.object({
   path: z.string().describe('起始目录的绝对路径，如 "I:/MyProject" 或 "D:/素材"'),
   pattern: z
     .string()
     .describe('glob 模式，相对起始目录。如 "**/*.fbx"、"**/SKILL.md"、"Content/**/*.uasset"'),
-  limit: z.number().optional().describe(`最多返回几条，默认 ${MAX_FILES}`)
+  limit: z.number().optional().describe(`默认 ${MAX_FILES}，最多 ${MAX_FILES_LIMIT}`),
+  include_ignored: z
+    .boolean()
+    .optional()
+    .describe('也搜默认跳过的目录（Saved/Logs、Saved/Crashes 等）')
 })
 
 const grepInput = z.object({
@@ -74,7 +108,8 @@ const grepInput = z.object({
     .optional()
     .describe('可选，只在匹配这个 glob 的文件里搜，如 "**/*.ini"。不给则搜所有文本文件'),
   ignoreCase: z.boolean().optional().describe('可选，忽略大小写，默认 false'),
-  limit: z.number().optional().describe(`最多返回几条命中，默认 ${MAX_MATCHES}`)
+  limit: z.number().optional().describe(`默认 ${MAX_MATCHES}，最多 ${MAX_MATCHES_LIMIT}`),
+  include_ignored: z.boolean().optional().describe('同 find_local_files')
 })
 
 /**
@@ -95,11 +130,12 @@ async function globFiles(
   root: string,
   pattern: string,
   limit: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  includeIgnored = false
 ): Promise<string[]> {
   const hits = await glob(pattern, {
     cwd: root,
-    ignore: ALWAYS_IGNORE,
+    ignore: includeIgnored ? [] : ALWAYS_IGNORE,
     onlyFiles: true,
     dot: false,
     // 跟随符号链接会在某些工程布局里绕回自身，扫到天荒地老
@@ -130,8 +166,8 @@ function createFindTool(): UnrealAgentTool<never> {
       '按文件名模式在用户电脑上找文件（glob）。\n\n' +
       '【什么时候用】「D:/素材 底下所有 fbx 在哪」「这个工程里有哪些 ini 配置」——' +
       '需要跨多层目录找文件时用这个，不要用 list_local_dir 一层层翻。\n' +
-      '【已自动跳过】DerivedDataCache、Intermediate、Binaries、Saved、.git、node_modules。' +
-      '这些目录装的全是引擎生成物（编译产物、着色器缓存、日志），搜进去只有噪音。\n' +
+      '【默认跳过】DerivedDataCache、Intermediate、Binaries、Saved、.git、node_modules；' +
+      '找日志、崩溃报告传 include_ignored。\n' +
       '【模式示例】"**/*.fbx"、"Content/**/*.uasset"、"**/Default*.ini"\n' +
       '【找素材不要用这个】用户导入保管库的素材，落盘是 `assetData/<时间戳>/` 这样的目录，' +
       '文件名早就不是原来那个了 —— 按名字去 glob 一定搜不到，而库里明明有。' +
@@ -139,8 +175,21 @@ function createFindTool(): UnrealAgentTool<never> {
       '【别整盘扫】起始目录不能是盘符根（C:/、D:/）。不知道目标在哪就问用户要路径，' +
       '或者从已知工程所在的目录找起 —— 扫一块盘要几分钟，中途还停不下来。',
     input: findInput,
+    // 一次能回两千个路径、二十万字符，进了上下文之后每一步都要重发
+    archive: {
+      source: 'details',
+      lists: { files: ['path'] },
+      compact: (details) => {
+        const d = details as { files: Array<{ path: string }>; header: string }
+        return renderWithin(
+          d.header,
+          d.files.map((f) => f.path),
+          '个'
+        )
+      }
+    },
     execute: async (args, ctx) => {
-      const limit = Math.max(1, Math.min(args.limit ?? MAX_FILES, MAX_FILES))
+      const limit = Math.max(1, Math.min(args.limit ?? MAX_FILES, MAX_FILES_LIMIT))
 
       // 敏感位置这两个工具原先完全不管，于是 read_local_file 挡着的 ~/.ssh，
       // 换成「从 ~/.ssh 起找 *」照样能把文件名全列出来
@@ -158,13 +207,22 @@ function createFindTool(): UnrealAgentTool<never> {
       if (outOfScope) return { text: outOfScope, isError: true }
 
       try {
-        const hits = await globFiles(args.path, args.pattern, limit, ctx.signal)
+        const hits = await globFiles(
+          args.path,
+          args.pattern,
+          limit,
+          ctx.signal,
+          args.include_ignored === true
+        )
         if (hits.length === 0) {
           return {
             text:
               `在 ${args.path} 下没有匹配 "${args.pattern}" 的文件。\n` +
               '如果确定文件存在，检查一下模式：跨目录要用 ** 开头（如 "**/*.fbx"），' +
-              '而且这几个目录是跳过的：DerivedDataCache、Intermediate、Binaries、Saved。'
+              (args.include_ignored
+                ? ''
+                : '而且这几个目录默认跳过：DerivedDataCache、Intermediate、Binaries、Saved' +
+                  '（要搜它们传 include_ignored: true）。')
           }
         }
 
@@ -196,7 +254,9 @@ function createFindTool(): UnrealAgentTool<never> {
             pattern: args.pattern,
             count: shown.length,
             truncated,
-            recursive: !shallow
+            recursive: !shallow,
+            header,
+            files: shown.map((file) => ({ path: file }))
           }
         }
       } catch (error) {
@@ -259,10 +319,23 @@ function createGrepTool(): UnrealAgentTool<never> {
       '需要按内容而不是文件名找东西时用。\n' +
       '【只搜文本】含 NUL 字节的文件（.uasset、.fbx 等二进制）自动跳过，' +
       '要查虚幻资产请用 ue_content_search / ue_content_describe。\n' +
-      '【建议先收窄】用 glob 限定范围（如 "**/*.ini"），全盘搜既慢又吵。',
+      '【先收窄】用 glob 限定范围（如 "**/*.ini"）。',
     input: grepInput,
+    // 同 find_local_files：命中上限一千行，十几万字符
+    archive: {
+      source: 'details',
+      lists: { hits: ['file', 'line', 'text'] },
+      compact: (details) => {
+        const d = details as { hits: Match[]; header: string }
+        return renderWithin(
+          d.header,
+          d.hits.map((m) => `${m.file}:${m.line}: ${m.text}`),
+          '条'
+        )
+      }
+    },
     execute: async (args, ctx) => {
-      const limit = Math.max(1, Math.min(args.limit ?? MAX_MATCHES, MAX_MATCHES))
+      const limit = Math.max(1, Math.min(args.limit ?? MAX_MATCHES, MAX_MATCHES_LIMIT))
 
       // 这一条在整个边界里最要紧：grep 回的是**文件内容**。
       // 少了它，`{ path: '~/.ssh', pattern: 'PRIVATE KEY' }` 会把私钥正文
@@ -293,7 +366,13 @@ function createGrepTool(): UnrealAgentTool<never> {
       }
 
       try {
-        const files = await globFiles(args.path, args.glob ?? '**/*', 5000, ctx.signal)
+        const files = await globFiles(
+          args.path,
+          args.glob ?? '**/*',
+          5000,
+          ctx.signal,
+          args.include_ignored === true
+        )
         const matches: Match[] = []
 
         for (let i = 0; i < files.length; i++) {
@@ -334,7 +413,9 @@ function createGrepTool(): UnrealAgentTool<never> {
             pattern: args.pattern,
             scanned: files.length,
             matches: matches.length,
-            truncated: matches.length >= limit
+            truncated: matches.length >= limit,
+            header,
+            hits: matches
           }
         }
       } catch (error) {
@@ -354,7 +435,10 @@ export function createLocalSearchTools(): UnrealAgentTool<never>[] {
 export const __testing = {
   ALWAYS_IGNORE,
   MAX_FILES,
+  MAX_FILES_LIMIT,
   MAX_MATCHES,
+  MAX_MATCHES_LIMIT,
+  MAX_SEARCHABLE_BYTES,
   MAX_LINE_CHARS,
   grepFile,
   isFilesystemRoot

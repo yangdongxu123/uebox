@@ -22,13 +22,16 @@ import {
 import { classifyProviderError } from './providerError'
 import type { ToolRisk } from '../tools/defineTool'
 import {
+  PLAN_LINE_BUSY,
   creatorPlanChatError,
   isPlanProvider,
+  isPlanUpstreamUnavailable,
   type CreatorPlanChatErrorCode
 } from '../../../shared/creatorPlan'
 import { notifyAgentRun, toRunSignal } from './runObserver'
 import { rememberRunOwner } from './runOwners'
 import { stripEditorSnapshotBlock } from '../core/editorSnapshot'
+import { detailsForRenderer } from '../core/resultArchive'
 import { stripAttachmentBlock } from '../core/promptAttachments'
 import { parseMediaRef } from '../core/promptMedia'
 import { stripSteerContextBlock } from './steerQueue'
@@ -94,10 +97,11 @@ export type AgentV3Event =
         detail?: string
         /**
          * 调的是 Box Plan、且服务端回的是套餐类错误（没订阅、额度用完、
-         * 套餐不含这个角色、Key 失效）。渲染层据此给一条可点的提示，而不是通用错误。
+         * 套餐不含这个角色、Key 失效），或失败不扣费的模型线路全挂（`line_busy`）。
+         * 渲染层据此给一条专门的提示，而不是通用错误。
          * 别的来源永远不带这个字段。
          */
-        planError?: CreatorPlanChatErrorCode
+        planError?: CreatorPlanChatErrorCode | typeof PLAN_LINE_BUSY
       }
     }
   /** 上下文用量条。V2 没有 —— 用户不知道离压缩还有多远 */
@@ -125,7 +129,7 @@ export type AgentV3Event =
         namespace: string
         risk: string
         args: unknown
-        /** false 时界面不给「本次会话都允许」，见 `core/approval.ts` */
+        /** false 时界面不给「本对话内都允许」，见 `core/approval.ts` */
         allowAlways: boolean
       }
     }
@@ -179,7 +183,7 @@ function extractResultText(result: unknown): string {
  *
  * 除了助手消息自己的用量，还要把工具结果上挂的用量加进来 —— `task` 工具是
  * 一个子 agent，它烧掉的 token 记在工具结果上而不是主循环的助手消息里。
- * 只看助手消息的话，一个「派个子任务去改十个材质」的回合会显示成几百 token，
+ * 只看助手消息的话，「派个子任务去改十个材质」这样的一轮会显示成几百 token，
  * 而账单上是几万。
  */
 function turnUsageOf(event: Extract<AgentEvent, { type: 'turn_end' }>): AgentTurnUsage {
@@ -205,6 +209,8 @@ export interface ProjectionState {
   streamedText: string
   /** 同上，推理内容。终稿里没有推理，它只用于跨消息复位 */
   streamedThinking: string
+  /** 「失败不扣费」的套餐模型（见 `AgentModelRuntime.freeOnFailure`）。它线路全挂时报 `line_busy` */
+  freeOnFailure?: (model: { provider: string; id: string }) => boolean
 }
 
 export function createProjectionState(): ProjectionState {
@@ -284,6 +290,7 @@ export function projectEvent(
         errorMessage?: string
         /** pi 的 Model.provider，即我们的来源 id（见 piModel.ts 的 toPiModel） */
         provider?: string
+        model?: string
       }
       if (message?.role !== 'assistant') {
         // 用户消息单发一个通道：渲染层拿它给插话打「已生效」回执，
@@ -332,10 +339,14 @@ export function projectEvent(
         // error 对象压扁了）。抠出来发上去，渲染层那套按状态码分类的友好文案才有得用 ——
         // 不抠的话用户看到的是 `错误: 401: {"error":{"message":"Incorrect API key…"}}`
         const facts = classifyProviderError(raw)
-        const planError =
-          message.provider && isPlanProvider(message.provider)
-            ? creatorPlanChatError(facts.statusCode, facts.code)
-            : null
+        const provider =
+          message.provider && isPlanProvider(message.provider) ? message.provider : ''
+        const planError = provider ? creatorPlanChatError(facts.statusCode, facts.code) : null
+        // 失败不扣费的模型线路全挂：卡死重发已经重试过一次，提示稍后重试或换回默认模型
+        const lineBusy =
+          !!provider &&
+          isPlanUpstreamUnavailable(facts.statusCode, facts.code) &&
+          state.freeOnFailure?.({ provider, id: message.model ?? '' }) === true
         return [
           {
             channel: 'agent-v3:error',
@@ -343,7 +354,7 @@ export function projectEvent(
               sessionId,
               message: raw,
               ...facts,
-              ...(planError ? { planError } : {})
+              ...(planError ? { planError } : lineBusy ? { planError: PLAN_LINE_BUSY } : {})
             }
           }
         ]
@@ -394,7 +405,9 @@ export function projectEvent(
             toolName: event.toolName,
             isError: event.isError,
             text: extractResultText(event.result),
-            details: (event.result as { details?: unknown } | undefined)?.details
+            details: detailsForRenderer(
+              (event.result as { details?: unknown } | undefined)?.details
+            )
           }
         }
       ]
@@ -442,12 +455,14 @@ export function createEventBridge(
      * 渲染层只有按工具名定级的静态表，看不见 `riskFor`
      */
     riskOf?: (toolName: string, args: unknown) => ToolRisk | undefined
+    /** 见 `ProjectionState.freeOnFailure` */
+    freeOnFailure?: (model: { provider: string; id: string }) => boolean
   }
 ) {
-  const state = createProjectionState()
+  const state = { ...createProjectionState(), freeOnFailure: hooks?.freeOnFailure }
 
-  // 记下这条会话属于谁。系统通知点开时要拉的是**这个**窗口，
-  // 不是「主窗口」—— MiniChat 里跑的会话拉主窗口等于拉错了（见 runOwners.ts）
+  // 记下这条对话属于谁。系统通知点开时要拉的是**这个**窗口，
+  // 不是「主窗口」—— MiniChat 里跑的对话拉主窗口等于拉错了（见 runOwners.ts）
   rememberRunOwner(sessionId, sender.id)
 
   return (event: AgentEvent): void => {

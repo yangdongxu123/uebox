@@ -53,10 +53,14 @@
 #include "RenderingThread.h"
 #include "UObject/Package.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "Engine/UserInterfaceSettings.h"
 #include "IImageWrapperModule.h"
 #include "IImageWrapper.h"
 #include "Misc/FileHelper.h"
+#include "Misc/PackageName.h"
 #include "HAL/PlatformFileManager.h"
+// widget.set_property 表外的属性按反射写，值走 JSON ↔ 属性转换
+#include "JsonObjectConverter.h"
 
 // 仅编辑器模式 (UMGEditor 模块)
 #if WITH_EDITOR
@@ -65,6 +69,20 @@
 #include "AssetToolsModule.h"
 #include "IAssetTools.h"
 #include "FileHelpers.h"
+// widget.make_variable 改名要连带图表引用一起改
+#include "Kismet2/Kismet2NameValidators.h"
+#include "K2Node_Variable.h"
+#include "K2Node_ComponentBoundEvent.h"
+#include "Animation/WidgetAnimation.h"
+#include "Blueprint/WidgetNavigation.h"
+#include "MovieScene.h"
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
+#include "WidgetBlueprintOperationUtils.h"
+#elif ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 6
+// 改名时同步 UI Component 扩展里记的控件名（5.6/5.7 引擎 RenameWidget 里的 FUIComponentUtils::OnWidgetRenamed）
+#include "WidgetBlueprintExtension.h"
+#include "UIComponentWidgetBlueprintExtension.h"
+#endif
 #endif
 
 DEFINE_LOG_CATEGORY_STATIC(LogUALWidget, Log, All);
@@ -104,6 +122,16 @@ static FName MakeUniqueWidgetName(UWidgetTree* WidgetTree, const FString& Desire
 	return NAME_None;
 }
 
+#if WITH_EDITOR
+/** 把控件蓝图自己（或它的子类）放进自己的树里，编译时无限递归 */
+static bool UAL_WouldNestSelf(const UWidgetBlueprint* WidgetBP, const UClass* Class)
+{
+	return WidgetBP && Class
+		&& ((WidgetBP->GeneratedClass && Class->IsChildOf(WidgetBP->GeneratedClass))
+			|| (WidgetBP->SkeletonGeneratedClass && Class->IsChildOf(WidgetBP->SkeletonGeneratedClass)));
+}
+#endif
+
 // ============================================================================
 // 命令注册
 // ============================================================================
@@ -130,8 +158,12 @@ void FUAL_WidgetCommands::RegisterCommands(TMap<FString, TFunction<void(const TS
 	// Phase 5: 事件绑定
 	CommandMap.Add(TEXT("widget.make_variable"), &Handle_MakeVariable);
 	CommandMap.Add(TEXT("widget.set_property"), &Handle_SetProperty);
-	
-	UE_LOG(LogUALWidget, Log, TEXT("FUAL_WidgetCommands: Registered %d widget commands"), 8);
+
+	// Phase 6: 改现成的界面
+	CommandMap.Add(TEXT("widget.replace"), &Handle_Replace);
+	CommandMap.Add(TEXT("widget.remove"), &Handle_Remove);
+
+	UE_LOG(LogUALWidget, Log, TEXT("FUAL_WidgetCommands: Registered %d widget commands"), 10);
 }
 
 // ============================================================================
@@ -610,11 +642,17 @@ void FUAL_WidgetCommands::Handle_AddChild(const TSharedPtr<FJsonObject>& Payload
 	}
 	
 	// 创建新控件
-	UClass* WidgetClass = FindWidgetClass(ControlType);
+	FString ClassError;
+	UClass* WidgetClass = ResolveWidgetClass(ControlType, ClassError);
 	if (!WidgetClass)
 	{
-		UAL_CommandUtils::SendError(RequestId, 400, 
-			FString::Printf(TEXT("Unknown control type: %s"), *ControlType));
+		UAL_CommandUtils::SendError(RequestId, 400, ClassError);
+		return;
+	}
+	if (UAL_WouldNestSelf(WidgetBP, WidgetClass))
+	{
+		UAL_CommandUtils::SendError(RequestId, 400, FString::Printf(
+			TEXT("%s cannot contain itself"), *WidgetBP->GetName()));
 		return;
 	}
 	
@@ -1021,7 +1059,14 @@ void FUAL_WidgetCommands::Handle_Preview(const TSharedPtr<FJsonObject>& Payload,
 	int32 Height = 1080;
 	Payload->TryGetNumberField(TEXT("width"), Width);
 	Payload->TryGetNumberField(TEXT("height"), Height);
-	
+	// InitAutoFormat 里是 check(尺寸 > 0)：传 0 直接把编辑器带崩，负数会变成超大的无符号尺寸
+	if (Width <= 0 || Height <= 0 || Width > 8192 || Height > 8192)
+	{
+		UAL_CommandUtils::SendError(RequestId, 400, FString::Printf(
+			TEXT("width/height must be between 1 and 8192 (got %d x %d)"), Width, Height));
+		return;
+	}
+
 	FString Error;
 	UWidgetBlueprint* WidgetBP = LoadWidgetBlueprint(Path, Error);
 	if (!WidgetBP)
@@ -1061,11 +1106,16 @@ void FUAL_WidgetCommands::Handle_Preview(const TSharedPtr<FJsonObject>& Payload,
 	RenderTarget->InitAutoFormat(Width, Height);
 	RenderTarget->UpdateResourceImmediate();
 
+	// 游戏里 UMG 会按项目「用户界面」设置的 DPI 曲线缩放（默认按短边），1920x1080 的布局放到 1280x720
+	// 会整体缩小。按 1 倍画出来的预览和实际游戏对不上，所以这里用同一条曲线算出缩放再画。
+	// 带 Scale 的 DrawWidget 在 5.0~5.8 都是：根几何逻辑尺寸 = 像素尺寸 / Scale，再按 Scale 放大到像素。
+	const float DPIScale = GetDefault<UUserInterfaceSettings>()->GetDPIScaleBasedOnSize(FIntPoint(Width, Height));
+
 	// 使用 FWidgetRenderer 渲染到 RenderTarget；渲染器和 Slate 控件限定在块内，画完即释放
 	{
 		FWidgetRenderer WidgetRenderer(true);
 		TSharedRef<SWidget> SlateWidget = TempWidget->TakeWidget();
-		WidgetRenderer.DrawWidget(RenderTarget, SlateWidget, FVector2D(Width, Height), 0.0f);
+		WidgetRenderer.DrawWidget(RenderTarget, SlateWidget, DPIScale, FVector2D(Width, Height), 0.0f);
 		FlushRenderingCommands();
 	}
 
@@ -1111,8 +1161,9 @@ void FUAL_WidgetCommands::Handle_Preview(const TSharedPtr<FJsonObject>& Payload,
 	Result->SetStringField(TEXT("path"), OutputPath);
 	Result->SetNumberField(TEXT("width"), Width);
 	Result->SetNumberField(TEXT("height"), Height);
+	Result->SetNumberField(TEXT("dpi_scale"), DPIScale);
 	
-	UE_LOG(LogUALWidget, Log, TEXT("widget.preview: path=%s, output=%s"), *Path, *OutputPath);
+	UE_LOG(LogUALWidget, Log, TEXT("widget.preview: path=%s, output=%s, dpi_scale=%.3f"), *Path, *OutputPath, DPIScale);
 	
 	UAL_CommandUtils::SendResponse(RequestId, 200, Result);
 #else
@@ -1123,6 +1174,139 @@ void FUAL_WidgetCommands::Handle_Preview(const TSharedPtr<FJsonObject>& Payload,
 // ============================================================================
 // Phase 5: 事件绑定
 // ============================================================================
+
+#if WITH_EDITOR
+/** 这个节点是不是在用本蓝图上叫 Name 的控件变量：变量读写节点，或绑在控件上的事件（OnClicked 之类） */
+static bool UAL_NodeRefsWidgetVariable(const UEdGraphNode* Node, const UWidgetBlueprint* WidgetBP, const FName Name)
+{
+	if (const UK2Node_ComponentBoundEvent* BoundEvent = Cast<UK2Node_ComponentBoundEvent>(Node))
+	{
+		return BoundEvent->ComponentPropertyName == Name;
+	}
+	const UK2Node_Variable* VarNode = Cast<UK2Node_Variable>(Node);
+	if (!VarNode || VarNode->GetVarName() != Name || VarNode->VariableReference.IsLocalScope())
+	{
+		return false;
+	}
+	UClass* SelfClass = WidgetBP->GeneratedClass;
+	UClass* Owner = VarNode->VariableReference.GetMemberParentClass(SelfClass);
+	return Owner && ((SelfClass && Owner->IsChildOf(SelfClass))
+		|| (WidgetBP->SkeletonGeneratedClass && Owner->IsChildOf(WidgetBP->SkeletonGeneratedClass)));
+}
+
+/**
+ * 编辑器改控件名那一套，不依赖打开的蓝图编辑器。
+ * 5.8 起引擎有公开的 FWidgetBlueprintOperationUtils::RenameWidget，直接用；更早的版本里
+ * 对应的 FWidgetBlueprintEditorUtils::RenameWidget 在 Private 头里，还要传一个打开着的
+ * 编辑器，只能照 5.0 引擎那份实现抄关键步骤：改对象名、改图表里的变量/事件引用、
+ * 属性绑定、动画绑定、导航绑定、子蓝图撞名检查，最后标记结构变更让骨架类重编。
+ * 后续版本引擎多出来的步骤按版本补上：5.3 起的默认焦点控件名，5.6 起的变量 GUID 表和 UI Component。
+ * 名字已经由调用方验过（不撞控件树、不撞蓝图成员）。
+ */
+static bool UAL_RenameWidgetLikeEditor(UWidgetBlueprint* WidgetBP, UWidget* Widget, const FName NewName)
+{
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
+	return FWidgetBlueprintOperationUtils::RenameWidget(WidgetBP, Widget, NewName.ToString());
+#else
+	const FName OldName = Widget->GetFName();
+	const FString OldNameStr = OldName.ToString();
+	const FString NewNameStr = NewName.ToString();
+
+	WidgetBP->Modify();
+	Widget->Modify();
+	Widget->SetDisplayLabel(NewNameStr);
+	if (!Widget->Rename(*NewNameStr))
+	{
+		return false;
+	}
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 6
+	// 5.6 起控件变量名 → GUID 的表（WidgetVariableNameToGuidMap）要跟着改，
+	// 不然编译时 ValidateAndFixUpVariableGuids 连报两个 ensure，还给它换个新 GUID，外部引用就断了
+	WidgetBP->OnVariableRenamed(OldName, NewName);
+#endif
+
+	FBlueprintEditorUtils::ReplaceVariableReferences(WidgetBP, OldName, NewName);
+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+	// 5.3 起引擎会顺手改 CDO 上记的默认焦点控件名（ReplaceDesiredFocus，私有头里），照它的效果改
+	if (WidgetBP->GeneratedClass)
+	{
+		if (UUserWidget* WidgetCDO = WidgetBP->GeneratedClass->GetDefaultObject<UUserWidget>())
+		{
+			if (WidgetCDO->GetDesiredFocusWidgetName() == OldName)
+			{
+				WidgetCDO->SetFlags(RF_Transactional);
+				WidgetCDO->Modify();
+				WidgetCDO->SetDesiredFocusWidget(NewName);
+			}
+		}
+	}
+#endif
+
+	for (FDelegateEditorBinding& Binding : WidgetBP->Bindings)
+	{
+		if (Binding.ObjectName == OldNameStr)
+		{
+			Binding.ObjectName = NewNameStr;
+		}
+	}
+
+	for (UWidgetAnimation* WidgetAnimation : WidgetBP->Animations)
+	{
+		if (!WidgetAnimation)
+		{
+			continue;
+		}
+		for (FWidgetAnimationBinding& AnimBinding : WidgetAnimation->AnimationBindings)
+		{
+			if (AnimBinding.WidgetName != OldName)
+			{
+				continue;
+			}
+			AnimBinding.WidgetName = NewName;
+			if (WidgetAnimation->MovieScene)
+			{
+				WidgetAnimation->MovieScene->Modify();
+				if (AnimBinding.SlotWidgetName == NAME_None)
+				{
+					if (FMovieScenePossessable* Possessable = WidgetAnimation->MovieScene->FindPossessable(AnimBinding.AnimationGuid))
+					{
+						Possessable->SetName(NewNameStr);
+					}
+				}
+			}
+		}
+	}
+
+	WidgetBP->WidgetTree->ForEachWidget([OldName, NewName](UWidget* Each)
+	{
+		if (Each && Each->Navigation)
+		{
+			Each->Navigation->SetFlags(RF_Transactional);
+			Each->Navigation->Modify();
+			Each->Navigation->TryToRenameBinding(OldName, NewName);
+		}
+	});
+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 6
+	// UI Component 扩展里按控件名记着挂了哪些组件，要跟着改（FUIComponentUtils::OnWidgetRenamed 的蓝图那一半，
+	// 它要一个打开的编辑器，预览那一半这里没有）。5.7 这个类没导出 StaticClass，只能按类路径找
+	if (UClass* ComponentExtClass = FindObject<UClass>(nullptr, TEXT("/Script/UMGEditor.UIComponentWidgetBlueprintExtension")))
+	{
+		UWidgetBlueprintExtension* Extension = UWidgetBlueprintExtension::GetExtension(WidgetBP, ComponentExtClass);
+		if (Extension && Extension->IsA(ComponentExtClass))
+		{
+			static_cast<UUIComponentWidgetBlueprintExtension*>(Extension)->RenameWidget(OldName, NewName);
+		}
+	}
+#endif
+
+	FBlueprintEditorUtils::ValidateBlueprintChildVariables(WidgetBP, NewName);
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBP);
+	return true;
+#endif
+}
+#endif
 
 void FUAL_WidgetCommands::Handle_MakeVariable(const TSharedPtr<FJsonObject>& Payload, const FString RequestId)
 {
@@ -1163,27 +1347,140 @@ void FUAL_WidgetCommands::Handle_MakeVariable(const TSharedPtr<FJsonObject>& Pay
 		return;
 	}
 	
-	const FUAL_ScopedTransaction Transaction(NSLOCTEXT("UAL", "MakeVariable", "Agent Make Variable"));
-	WidgetBP->Modify();
-	
-	// 设置控件为变量
-	Widget->bIsVariable = true;
-	
-	// 重命名控件（变量名）- 使用安全重命名防止重名崩溃
+	// 改名前先把名字验完：和编辑器的改名框一样，撞了就拒绝，不偷偷加后缀——
+	// 调用方接下来要按自己给的名字去连图表，换个名字等于让它连错
+	const FName OldName = Widget->GetFName();
+	FName NewName = OldName;
 	if (VariableName != WidgetName)
 	{
-		FName SafeName = GenerateUniqueWidgetName(WidgetBP->WidgetTree, VariableName);
-		Widget->Rename(*SafeName.ToString());
+		const FString Slug = SlugStringForValidName(VariableName);
+		if (Slug.IsEmpty())
+		{
+			UAL_CommandUtils::SendError(RequestId, 400,
+				FString::Printf(TEXT("variable_name '%s' has no characters usable in a variable name"), *VariableName));
+			return;
+		}
+		NewName = FName(*Slug);
 	}
-	
-	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBP);
-	
+	const bool bWantsRename = NewName != OldName;
+	if (bWantsRename)
+	{
+		const UWidget* Holder = WidgetBP->WidgetTree->FindWidget(NewName);
+		if ((Holder && Holder != Widget) || StaticFindObject(nullptr, Widget->GetOuter(), *NewName.ToString()))
+		{
+			UAL_CommandUtils::SendError(RequestId, 409, Holder
+				? FString::Printf(TEXT("Name '%s' is already used by widget %s (%s); pick another variable_name"),
+					*NewName.ToString(), *Holder->GetName(), *Holder->GetClass()->GetName())
+				: FString::Printf(TEXT("Name '%s' is already used by another object in this Widget Blueprint; pick another variable_name"),
+					*NewName.ToString()));
+			return;
+		}
+
+		// 父类里同名的 BindWidget 属性是给这个控件留的位子，可以占
+		bool bBindWidgetSlot = false;
+		if (WidgetBP->ParentClass)
+		{
+			const FObjectPropertyBase* Existing = CastField<FObjectPropertyBase>(WidgetBP->ParentClass->FindPropertyByName(NewName));
+			bBindWidgetSlot = Existing && (Existing->HasMetaData(TEXT("BindWidget")) || Existing->HasMetaData(TEXT("BindWidgetOptional")))
+				&& Widget->IsA(Existing->PropertyClass);
+		}
+		FKismetNameValidator Validator(WidgetBP, OldName);
+		const EValidatorResult Validity = Validator.IsValid(NewName);
+		if (Validity != EValidatorResult::Ok && !bBindWidgetSlot)
+		{
+			UAL_CommandUtils::SendError(RequestId, 409,
+				FString::Printf(TEXT("Cannot rename widget %s to '%s': %s"), *OldName.ToString(), *NewName.ToString(),
+					*INameValidatorInterface::GetErrorString(NewName.ToString(), Validity)));
+			return;
+		}
+	}
+
+	const FUAL_ScopedTransaction Transaction(NSLOCTEXT("UAL", "MakeVariable", "Agent Make Variable"));
+	WidgetBP->Modify();
+	Widget->Modify();
+
+	// 设置控件为变量
+	Widget->bIsVariable = true;
+
+	// 改名前记下图表里哪些节点在用旧名，改完逐个读回去看是不是跟着变了
+	TArray<TWeakObjectPtr<UEdGraphNode>> ReferencingNodes;
+	if (bWantsRename)
+	{
+		TArray<UEdGraph*> Graphs;
+		WidgetBP->GetAllGraphs(Graphs);
+		for (const UEdGraph* Graph : Graphs)
+		{
+			if (!Graph)
+			{
+				continue;
+			}
+			for (UEdGraphNode* Node : Graph->Nodes)
+			{
+				if (Node && UAL_NodeRefsWidgetVariable(Node, WidgetBP, OldName))
+				{
+					ReferencingNodes.Add(Node);
+				}
+			}
+		}
+	}
+
+	const bool bRenamed = bWantsRename && UAL_RenameWidgetLikeEditor(WidgetBP, Widget, NewName);
+	if (bWantsRename && !bRenamed)
+	{
+		UAL_CommandUtils::SendError(RequestId, 500,
+			FString::Printf(TEXT("Engine refused to rename widget %s to '%s'"), *OldName.ToString(), *NewName.ToString()));
+		return;
+	}
+	if (!bRenamed)
+	{
+		// 改名那条路自己会标记结构变更；没改名时由这里让骨架类长出这个变量
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBP);
+	}
+
+	int32 UpdatedRefs = 0;
+	TArray<TSharedPtr<FJsonValue>> StaleRefs;
+	for (const TWeakObjectPtr<UEdGraphNode>& Weak : ReferencingNodes)
+	{
+		const UEdGraphNode* Node = Weak.Get();
+		if (!Node)
+		{
+			continue; // 节点在重建里被换掉了，下面 found/updated 对不上就会显出来
+		}
+		if (UAL_NodeRefsWidgetVariable(Node, WidgetBP, Widget->GetFName()))
+		{
+			++UpdatedRefs;
+		}
+		else
+		{
+			const UEdGraph* Graph = Node->GetGraph();
+			StaleRefs.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("%s: %s"),
+				Graph ? *Graph->GetName() : TEXT("?"), *Node->GetNodeTitle(ENodeTitleType::ListView).ToString())));
+		}
+	}
+	const int32 FoundRefs = ReferencingNodes.Num();
+	const int32 NotUpdated = FoundRefs - UpdatedRefs;
+
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	if (NotUpdated > 0)
+	{
+		Result->SetNumberField(TEXT("failed_count"), NotUpdated);
+	}
 	Result->SetBoolField(TEXT("ok"), true);
 	Result->SetStringField(TEXT("widget_name"), Widget->GetName());
+	Result->SetStringField(TEXT("old_name"), OldName.ToString());
+	Result->SetBoolField(TEXT("renamed"), Widget->GetFName() != OldName);
 	Result->SetBoolField(TEXT("is_variable"), Widget->bIsVariable);
-	
-	UE_LOG(LogUALWidget, Log, TEXT("widget.make_variable: widget=%s"), *Widget->GetName());
+	// 图表里用旧名的节点（变量读写、绑定事件）是不是都跟着改了；没改名时没有可改的
+	Result->SetNumberField(TEXT("graph_references_found"), FoundRefs);
+	Result->SetNumberField(TEXT("graph_references_renamed"), UpdatedRefs);
+	Result->SetBoolField(TEXT("graph_references_updated"), NotUpdated == 0);
+	if (StaleRefs.Num() > 0)
+	{
+		Result->SetArrayField(TEXT("stale_graph_references"), StaleRefs);
+	}
+
+	UE_LOG(LogUALWidget, Log, TEXT("widget.make_variable: widget=%s old=%s refs=%d/%d"),
+		*Widget->GetName(), *OldName.ToString(), UpdatedRefs, FoundRefs);
 	
 	UAL_CommandUtils::SendResponse(RequestId, 200, Result);
 #else
@@ -1317,6 +1614,109 @@ static FString UAL_SupportedPropertiesFor(UWidget* Widget)
 
 	return FString::Join(Names, TEXT(" / "));
 }
+
+#if WITH_EDITOR
+/**
+ * 细节面板里这个控件实例上能改的属性：勾了「可编辑」、没关「实例可编辑」、不是只读，
+ * 也不是 Slot / Navigation 那种内嵌子对象（整个换掉会把布局和导航丢掉）。
+ */
+static bool UAL_IsInstanceEditable(const FProperty* Property)
+{
+	return Property
+		&& Property->HasAnyPropertyFlags(CPF_Edit)
+		&& !Property->HasAnyPropertyFlags(CPF_DisableEditOnInstance | CPF_EditConst | CPF_InstancedReference | CPF_ContainsInstancedReference);
+}
+
+/** 按名字找属性：先精确，再忽略大小写比对内部名、蓝图里写的名字和显示名 */
+static FProperty* UAL_FindWidgetProperty(UClass* Class, const FString& Name)
+{
+	if (FProperty* Exact = FindFProperty<FProperty>(Class, *Name))
+	{
+		return Exact;
+	}
+	for (TFieldIterator<FProperty> It(Class, EFieldIteratorFlags::IncludeSuper); It; ++It)
+	{
+		if (It->GetName().Equals(Name, ESearchCase::IgnoreCase)
+			|| It->GetAuthoredName().Equals(Name, ESearchCase::IgnoreCase)
+			|| It->GetMetaData(TEXT("DisplayName")).Equals(Name, ESearchCase::IgnoreCase))
+		{
+			return *It;
+		}
+	}
+	return nullptr;
+}
+
+/**
+ * 这个控件类自己（UWidget 基类以下）声明的、实例上能改的属性。
+ * 用户控件蓝图里勾了「实例可编辑」的变量（WB_Text_Button 的 InText）就在这里。
+ */
+static FString UAL_InstanceEditableNamesFor(UWidget* Widget)
+{
+	TArray<FString> Names;
+	for (TFieldIterator<FProperty> It(Widget->GetClass(), EFieldIteratorFlags::IncludeSuper); It; ++It)
+	{
+		const UClass* Owner = It->GetOwnerClass();
+		if (!Owner || Owner == UWidget::StaticClass() || !Owner->IsChildOf(UWidget::StaticClass()) || !UAL_IsInstanceEditable(*It))
+		{
+			continue;
+		}
+		Names.Add(It->GetAuthoredName());
+		if (Names.Num() >= 40)
+		{
+			Names.Add(TEXT("…"));
+			break;
+		}
+	}
+	return Names.Num() ? FString::Join(Names, TEXT(" / ")) : FString(TEXT("(none)"));
+}
+
+/**
+ * 表外的属性按反射写，和在细节面板里改一样：PreEditChange → 写值 → PostEditChangeProperty。
+ *
+ * 原来 set_property 只有一张写死的属性表。用户控件上的「实例可编辑」变量（CommonUI 按钮的
+ * 文字 InText、图标、样式）一个都设不了，调用方只能放一个没有文字的按钮了事。
+ *
+ * 值先按 JSON 转（字符串给文本 / 名字 / 枚举，数字、布尔，对象给结构体），转不了而传的是
+ * 字符串时再按 UE 文本格式导入，`(R=1,G=0,B=0,A=1)`、对象路径这类都走这条。
+ */
+static bool UAL_SetWidgetPropertyByReflection(UWidget* Widget, FProperty* Property, const TSharedPtr<FJsonValue>& Value,
+	TSharedPtr<FJsonValue>& OutReadBack, FString& OutError)
+{
+	if (!Value.IsValid() || Value->IsNull())
+	{
+		OutError = FString::Printf(TEXT("缺少 value（%s 是 %s）"), *Property->GetAuthoredName(), *Property->GetCPPType());
+		return false;
+	}
+
+	void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Widget);
+	Widget->SetFlags(RF_Transactional);
+	Widget->Modify();
+	Widget->PreEditChange(Property);
+
+	bool bOk = FJsonObjectConverter::JsonValueToUProperty(Value, Property, ValuePtr, 0, 0);
+	FString AsString;
+	if (!bOk && Value->TryGetString(AsString))
+	{
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1
+		bOk = Property->ImportText_Direct(*AsString, ValuePtr, Widget, PPF_None) != nullptr;
+#else
+		bOk = Property->ImportText(*AsString, ValuePtr, PPF_None, Widget) != nullptr;
+#endif
+	}
+
+	FPropertyChangedEvent ChangedEvent(Property, EPropertyChangeType::ValueSet);
+	Widget->PostEditChangeProperty(ChangedEvent);
+
+	if (!bOk)
+	{
+		OutError = FString::Printf(TEXT("%s 是 %s，收到的%s写不进去"),
+			*Property->GetAuthoredName(), *Property->GetCPPType(), *UAL_JsonTypeName(Value));
+		return false;
+	}
+	OutReadBack = FJsonObjectConverter::UPropertyToJsonValue(Property, ValuePtr, 0, 0);
+	return true;
+}
+#endif
 
 void FUAL_WidgetCommands::Handle_SetProperty(const TSharedPtr<FJsonObject>& Payload, const FString RequestId)
 {
@@ -1625,6 +2025,36 @@ void FUAL_WidgetCommands::Handle_SetProperty(const TSharedPtr<FJsonObject>& Payl
 		}
 	}
 	
+	// 表里没办成的，按反射找这个控件类上的同名属性再试一次（用户控件的实例可编辑变量、
+	// 引擎控件表外的属性都走这里）。属性不能在实例上改时说清楚是哪一步挡住的
+	FString ReflectionNote;
+	if (!bSuccess)
+	{
+		if (FProperty* Property = UAL_FindWidgetProperty(Widget->GetClass(), PropertyName))
+		{
+			if (!UAL_IsInstanceEditable(Property))
+			{
+				ReflectionNote = FString::Printf(
+					TEXT("%s 上有 '%s'，但它不能在实例上改（没勾「可编辑」/「实例可编辑」，或是只读）。")
+					TEXT("如果它是 %s 里的蓝图变量，在那个蓝图里给它勾上「实例可编辑」再设。"),
+					*Widget->GetClass()->GetName(), *Property->GetAuthoredName(), *Widget->GetClass()->GetName());
+			}
+			else
+			{
+				FString ReflectionError;
+				if (UAL_SetWidgetPropertyByReflection(Widget, Property, Payload->TryGetField(TEXT("value")), ReadBackValue, ReflectionError))
+				{
+					bSuccess = true;
+					ResultMessage = FString::Printf(TEXT("Set %s (%s) by reflection"), *Property->GetAuthoredName(), *Property->GetCPPType());
+				}
+				else
+				{
+					ReflectionNote = ReflectionError;
+				}
+			}
+		}
+	}
+
 	if (!bSuccess)
 	{
 		/**
@@ -1635,7 +2065,9 @@ void FUAL_WidgetCommands::Handle_SetProperty(const TSharedPtr<FJsonObject>& Payl
 		 * 2026-09-16 的反馈里，一次 BrushColor 失败回给模型的全部信息就是
 		 * 「设置属性失败」六个字。拼好的诊断必须发出去。
 		 */
-		FString Detail = ResultMessage;
+		FString Detail = ReflectionNote.IsEmpty() ? ResultMessage
+			: ResultMessage.IsEmpty() ? ReflectionNote
+			: ResultMessage + TEXT(" ") + ReflectionNote;
 		if (Detail.IsEmpty())
 		{
 			/**
@@ -1647,8 +2079,9 @@ void FUAL_WidgetCommands::Handle_SetProperty(const TSharedPtr<FJsonObject>& Payl
 			 * 自相矛盾，调用方会判定整张清单不可信（2026-09-17 复测时点出来的）。
 			 */
 			Detail = FString::Printf(
-				TEXT("%s 这个控件不支持 '%s'。它能设的是：%s。"),
-				*Widget->GetClass()->GetName(), *PropertyName, *UAL_SupportedPropertiesFor(Widget));
+				TEXT("%s 这个控件没有 '%s'。它能设的是：%s；以及这个类自己的可编辑属性：%s。"),
+				*Widget->GetClass()->GetName(), *PropertyName, *UAL_SupportedPropertiesFor(Widget),
+				*UAL_InstanceEditableNamesFor(Widget));
 		}
 
 		UAL_CommandUtils::SendError(RequestId, 400,
@@ -1674,6 +2107,730 @@ void FUAL_WidgetCommands::Handle_SetProperty(const TSharedPtr<FJsonObject>& Payl
 	UAL_CommandUtils::SendResponse(RequestId, 200, Result);
 #else
 	UAL_CommandUtils::SendError(RequestId, 501, TEXT("widget.set_property is only available in editor mode"));
+#endif
+}
+
+// ============================================================================
+// Phase 6: 改现成的界面 —— 替换、删除
+//
+// 前五期都是照「从零搭一个新界面」做的：建、加、摆、设、预览。用户拿来的
+// 却多半是现成的界面（商城模板、CommonUI 项目），要的是「把这个按钮换成导航
+// 那种」「把这块删了」—— 没有这两步，调用方只能在旁边再加一个，然后让用户
+// 自己去编辑器里删旧的、连事件。
+// ============================================================================
+
+#if WITH_EDITOR
+/** 报告里一个节点的样子：「图名: 节点标题」 */
+static FString UAL_NodeLabel(const UEdGraphNode* Node)
+{
+	const UEdGraph* Graph = Node ? Node->GetGraph() : nullptr;
+	return FString::Printf(TEXT("%s: %s"),
+		Graph ? *Graph->GetName() : TEXT("?"),
+		Node ? *Node->GetNodeTitle(ENodeTitleType::ListView).ToString() : TEXT("?"));
+}
+
+/** 图表里用到这个控件的节点，分成绑在它上面的事件和其余（变量读写） */
+static void UAL_CollectWidgetGraphRefs(UWidgetBlueprint* WidgetBP, const FName Name,
+	TArray<UK2Node_ComponentBoundEvent*>& OutEvents, TArray<UEdGraphNode*>& OutOthers)
+{
+	TArray<UEdGraph*> Graphs;
+	WidgetBP->GetAllGraphs(Graphs);
+	for (UEdGraph* Graph : Graphs)
+	{
+		if (!Graph)
+		{
+			continue;
+		}
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!Node || !UAL_NodeRefsWidgetVariable(Node, WidgetBP, Name))
+			{
+				continue;
+			}
+			if (UK2Node_ComponentBoundEvent* BoundEvent = Cast<UK2Node_ComponentBoundEvent>(Node))
+			{
+				OutEvents.Add(BoundEvent);
+			}
+			else
+			{
+				OutOthers.Add(Node);
+			}
+		}
+	}
+}
+
+/** 控件类上蓝图能绑的事件（OnClicked 这类 BlueprintAssignable 委托） */
+static TMap<FName, FMulticastDelegateProperty*> UAL_BindableWidgetEvents(UClass* Class)
+{
+	TMap<FName, FMulticastDelegateProperty*> Events;
+	for (TFieldIterator<FMulticastDelegateProperty> It(Class, EFieldIteratorFlags::IncludeSuper); It; ++It)
+	{
+		if (It->HasAnyPropertyFlags(CPF_BlueprintAssignable))
+		{
+			Events.Add(It->GetFName(), *It);
+		}
+	}
+	return Events;
+}
+
+static FString UAL_JoinEventNames(const TMap<FName, FMulticastDelegateProperty*>& Events)
+{
+	TArray<FString> Names;
+	for (const TPair<FName, FMulticastDelegateProperty*>& Pair : Events)
+	{
+		Names.Add(Pair.Key.ToString());
+	}
+	Names.Sort();
+	return Names.Num() ? FString::Join(Names, TEXT(", ")) : FString(TEXT("(none)"));
+}
+
+/** 被删掉的控件在报告里的样子。TextBlock 带上字 —— 换按钮时调用方要把「登录」两个字搬到新按钮上 */
+static TSharedPtr<FJsonObject> UAL_DescribeWidgetBrief(UWidget* Widget)
+{
+	TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+	Obj->SetStringField(TEXT("name"), Widget->GetName());
+	Obj->SetStringField(TEXT("class"), Widget->GetClass()->GetName());
+	if (const UTextBlock* Text = Cast<UTextBlock>(Widget))
+	{
+		Obj->SetStringField(TEXT("text"), Text->GetText().ToString());
+	}
+	return Obj;
+}
+
+static FString UAL_DescribeWidgetsInline(const TArray<UWidget*>& Widgets)
+{
+	TArray<FString> Parts;
+	for (const UWidget* Widget : Widgets)
+	{
+		const UTextBlock* Text = Cast<UTextBlock>(Widget);
+		Parts.Add(Text
+			? FString::Printf(TEXT("%s (%s \"%s\")"), *Widget->GetName(), *Widget->GetClass()->GetName(), *Text->GetText().ToString())
+			: FString::Printf(TEXT("%s (%s)"), *Widget->GetName(), *Widget->GetClass()->GetName()));
+	}
+	return FString::Join(Parts, TEXT(", "));
+}
+
+/**
+ * 控件离开这棵树时，蓝图里挂在它名字上的东西一并拆掉，和编辑器删控件一样：
+ * 图表里的变量节点和绑定事件、属性绑定、默认焦点，5.6 起还有变量 GUID 表。
+ * 返回拆掉的图表节点。事件后面接的逻辑节点留在图里，只是断开了。
+ */
+static TArray<FString> UAL_DetachWidgetName(UWidgetBlueprint* WidgetBP, const FName Name)
+{
+	TArray<FString> RemovedNodes;
+	TArray<UK2Node_ComponentBoundEvent*> Events;
+	TArray<UEdGraphNode*> Others;
+	UAL_CollectWidgetGraphRefs(WidgetBP, Name, Events, Others);
+	TArray<UEdGraphNode*> ToRemove(Others);
+	ToRemove.Append(Events);
+	for (UEdGraphNode* Node : ToRemove)
+	{
+		RemovedNodes.Add(UAL_NodeLabel(Node));
+		FBlueprintEditorUtils::RemoveNode(WidgetBP, Node, /*bDontRecompile=*/true);
+	}
+
+	const FString NameStr = Name.ToString();
+	for (int32 Index = WidgetBP->Bindings.Num() - 1; Index >= 0; --Index)
+	{
+		if (WidgetBP->Bindings[Index].ObjectName == NameStr)
+		{
+			WidgetBP->Bindings.RemoveAt(Index);
+		}
+	}
+
+#if (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3) || ENGINE_MAJOR_VERSION > 5
+	if (WidgetBP->GeneratedClass)
+	{
+		if (UUserWidget* WidgetCDO = WidgetBP->GeneratedClass->GetDefaultObject<UUserWidget>())
+		{
+			if (WidgetCDO->GetDesiredFocusWidgetName() == Name)
+			{
+				WidgetCDO->SetFlags(RF_Transactional);
+				WidgetCDO->Modify();
+				WidgetCDO->SetDesiredFocusWidget(NAME_None);
+			}
+		}
+	}
+#endif
+#if (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 6) || ENGINE_MAJOR_VERSION > 5
+	// 不清的话这个名字的 GUID 一直留在表里，下次编译 ValidateAndFixUpVariableGuids 报 ensure
+	WidgetBP->OnVariableRemoved(Name);
+#endif
+	return RemovedNodes;
+}
+
+/** 控件换类时原样带过去的 UWidget 基类属性：显隐、可用、提示、透明度、渲染变换 */
+static TArray<FString> UAL_CarryBaseWidgetProperties(const UWidget* From, UWidget* To)
+{
+	static const TCHAR* Carried[] = {
+		TEXT("Visibility"), TEXT("bIsEnabled"), TEXT("ToolTipText"),
+		TEXT("RenderOpacity"), TEXT("RenderTransform"), TEXT("RenderTransformPivot")
+	};
+	TArray<FString> Done;
+	for (const TCHAR* Name : Carried)
+	{
+		if (const FProperty* Property = UWidget::StaticClass()->FindPropertyByName(Name))
+		{
+			if (!Property->Identical_InContainer(From, To))
+			{
+				Property->CopyCompleteValue_InContainer(To, From);
+				Done.Add(Name);
+			}
+		}
+	}
+	return Done;
+}
+#endif
+
+void FUAL_WidgetCommands::Handle_Replace(const TSharedPtr<FJsonObject>& Payload, const FString RequestId)
+{
+#if WITH_EDITOR
+	FString Path;
+	FString WidgetName;
+	FString NewType;
+	if (!Payload->TryGetStringField(TEXT("path"), Path))
+	{
+		UAL_CommandUtils::SendError(RequestId, 400, TEXT("Missing required field: path"));
+		return;
+	}
+	if (!Payload->TryGetStringField(TEXT("widget_name"), WidgetName))
+	{
+		UAL_CommandUtils::SendError(RequestId, 400, TEXT("Missing required field: widget_name"));
+		return;
+	}
+	if (!Payload->TryGetStringField(TEXT("new_type"), NewType))
+	{
+		UAL_CommandUtils::SendError(RequestId, 400, TEXT("Missing required field: new_type"));
+		return;
+	}
+	bool bDropChildren = false;
+	Payload->TryGetBoolField(TEXT("drop_children"), bDropChildren);
+
+	// event_map：旧控件上的事件名 → 新类上的事件名。对象和「被序列化成字符串的对象」都收
+	// （理由同 UAL_TryReadColorValue）
+	TMap<FName, FName> EventMap;
+	{
+		TSharedPtr<FJsonObject> MapObj;
+		const TSharedPtr<FJsonObject>* ObjField = nullptr;
+		FString MapString;
+		if (Payload->TryGetObjectField(TEXT("event_map"), ObjField) && ObjField)
+		{
+			MapObj = *ObjField;
+		}
+		else if (Payload->TryGetStringField(TEXT("event_map"), MapString) && !MapString.IsEmpty())
+		{
+			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(MapString);
+			FJsonSerializer::Deserialize(Reader, MapObj);
+		}
+		if (Payload->HasField(TEXT("event_map")) && !MapObj.IsValid())
+		{
+			UAL_CommandUtils::SendError(RequestId, 400,
+				TEXT("event_map must be an object like {\"OnClicked\": \"OnButtonBaseClicked\"}"));
+			return;
+		}
+		if (MapObj.IsValid())
+		{
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : MapObj->Values)
+			{
+				FString To;
+				if (!Pair.Value.IsValid() || !Pair.Value->TryGetString(To) || To.IsEmpty())
+				{
+					UAL_CommandUtils::SendError(RequestId, 400, FString::Printf(
+						TEXT("event_map[\"%s\"] must be the name of an event on the new class"), *Pair.Key));
+					return;
+				}
+				EventMap.Add(FName(*Pair.Key), FName(*To));
+			}
+		}
+	}
+
+	FString Error;
+	UWidgetBlueprint* WidgetBP = LoadWidgetBlueprint(Path, Error);
+	if (!WidgetBP)
+	{
+		UAL_CommandUtils::SendError(RequestId, 404, Error);
+		return;
+	}
+	UWidgetTree* WidgetTree = WidgetBP->WidgetTree;
+	if (!WidgetTree)
+	{
+		UAL_CommandUtils::SendError(RequestId, 500, TEXT("WidgetBlueprint has no WidgetTree"));
+		return;
+	}
+	UWidget* OldWidget = FindWidgetByName(WidgetTree, WidgetName);
+	if (!OldWidget)
+	{
+		UAL_CommandUtils::SendError(RequestId, 404, FString::Printf(TEXT("Widget not found: %s"), *WidgetName));
+		return;
+	}
+
+	FString ClassError;
+	UClass* NewClass = ResolveWidgetClass(NewType, ClassError);
+	if (!NewClass)
+	{
+		UAL_CommandUtils::SendError(RequestId, 400, ClassError);
+		return;
+	}
+	if (UAL_WouldNestSelf(WidgetBP, NewClass))
+	{
+		UAL_CommandUtils::SendError(RequestId, 400, FString::Printf(TEXT("%s cannot contain itself"), *WidgetBP->GetName()));
+		return;
+	}
+	if (OldWidget->GetClass() == NewClass)
+	{
+		UAL_CommandUtils::SendError(RequestId, 400, FString::Printf(
+			TEXT("%s is already a %s"), *OldWidget->GetName(), *NewClass->GetName()));
+		return;
+	}
+
+	UPanelWidget* Parent = OldWidget->GetParent();
+	const bool bIsRoot = WidgetTree->RootWidget == OldWidget;
+	if (!Parent && !bIsRoot)
+	{
+		UAL_CommandUtils::SendError(RequestId, 400, FString::Printf(
+			TEXT("%s sits in a named slot, not in a panel; replacing it there is not supported"), *OldWidget->GetName()));
+		return;
+	}
+	const FName OldName = OldWidget->GetFName();
+	UClass* OldClass = OldWidget->GetClass();
+
+	// ── 1. 事件：绑在旧控件上的每个事件，新类上都得有去处。有一个没着落就一个都不动 ──
+	TArray<UK2Node_ComponentBoundEvent*> OldEvents;
+	TArray<UEdGraphNode*> VariableNodes;
+	UAL_CollectWidgetGraphRefs(WidgetBP, OldName, OldEvents, VariableNodes);
+	const TMap<FName, FMulticastDelegateProperty*> NewEvents = UAL_BindableWidgetEvents(NewClass);
+
+	struct FUAL_EventMove
+	{
+		TWeakObjectPtr<UK2Node_ComponentBoundEvent> Node;
+		FName From;
+		FName To;
+	};
+	TArray<FUAL_EventMove> Moves;
+	TArray<FString> Unplaced;
+	TSet<FName> Taken;
+	for (UK2Node_ComponentBoundEvent* Node : OldEvents)
+	{
+		const FName From = Node->DelegatePropertyName;
+		const FName* Mapped = EventMap.Find(From);
+		const FName To = Mapped ? *Mapped : From;
+		if (!NewEvents.Contains(To))
+		{
+			Unplaced.Add(Mapped
+				? FString::Printf(TEXT("%s → %s (%s has no %s)"), *From.ToString(), *To.ToString(), *NewClass->GetName(), *To.ToString())
+				: From.ToString());
+			continue;
+		}
+		if (Taken.Contains(To))
+		{
+			Unplaced.Add(FString::Printf(TEXT("%s → %s (another event is already going there)"), *From.ToString(), *To.ToString()));
+			continue;
+		}
+		Taken.Add(To);
+		Moves.Add({ Node, From, To });
+	}
+	if (Unplaced.Num() > 0)
+	{
+		UAL_CommandUtils::SendError(RequestId, 409, FString::Printf(
+			TEXT("Nothing replaced: %s has events bound in the graph that %s does not have: %s. ")
+			TEXT("Pass event_map {\"<old event>\": \"<new event>\"} to move each one; the logic wired after it stays connected. ")
+			TEXT("Events %s can bind: %s"),
+			*OldName.ToString(), *NewClass->GetName(), *FString::Join(Unplaced, TEXT("; ")),
+			*NewClass->GetName(), *UAL_JoinEventNames(NewEvents)));
+		return;
+	}
+
+	// ── 2. 子控件：新控件装得下的搬过去；装不下的连同子孙要调用方点头才删 ──
+	TArray<UWidget*> OldChildren;
+	if (UPanelWidget* OldPanel = Cast<UPanelWidget>(OldWidget))
+	{
+		for (int32 Index = 0; Index < OldPanel->GetChildrenCount(); ++Index)
+		{
+			if (UWidget* Child = OldPanel->GetChildAt(Index))
+			{
+				OldChildren.Add(Child);
+			}
+		}
+	}
+	int32 Capacity = 0;
+	if (NewClass->IsChildOf(UPanelWidget::StaticClass()))
+	{
+		const UPanelWidget* PanelCDO = NewClass->GetDefaultObject<UPanelWidget>();
+		Capacity = PanelCDO && PanelCDO->CanHaveMultipleChildren() ? MAX_int32 : 1;
+	}
+	TArray<UWidget*> KeptChildren;
+	for (UWidget* Child : OldChildren)
+	{
+		if (KeptChildren.Num() < Capacity)
+		{
+			KeptChildren.Add(Child);
+		}
+	}
+	// 留不下的：旧控件的全部子孙（含具名插槽里的内容）去掉搬走的那几支
+	TArray<UWidget*> AllDescendants;
+	UWidgetTree::GetChildWidgets(OldWidget, AllDescendants);
+	TSet<UWidget*> KeptSet;
+	for (UWidget* Child : KeptChildren)
+	{
+		KeptSet.Add(Child);
+		TArray<UWidget*> Sub;
+		UWidgetTree::GetChildWidgets(Child, Sub);
+		KeptSet.Append(Sub);
+	}
+	TArray<UWidget*> Dropped;
+	for (UWidget* Each : AllDescendants)
+	{
+		if (!KeptSet.Contains(Each))
+		{
+			Dropped.Add(Each);
+		}
+	}
+	if (Dropped.Num() > 0 && !bDropChildren)
+	{
+		UAL_CommandUtils::SendError(RequestId, 409, FString::Printf(
+			TEXT("Nothing replaced: %s cannot hold what is inside %s, so these would be deleted: %s. ")
+			TEXT("Pass drop_children: true to delete them with the old widget (carry their text over with widget_set_property afterwards), ")
+			TEXT("or pick a type that can hold them."),
+			*NewClass->GetName(), *OldName.ToString(), *UAL_DescribeWidgetsInline(Dropped)));
+		return;
+	}
+
+	// ── 3. 动手 ──
+	const FUAL_ScopedTransaction Transaction(NSLOCTEXT("UAL", "ReplaceWidget", "Agent Replace Widget"));
+	WidgetBP->Modify();
+	WidgetTree->SetFlags(RF_Transactional);
+	WidgetTree->Modify();
+	OldWidget->SetFlags(RF_Transactional);
+	OldWidget->Modify();
+	if (Parent)
+	{
+		Parent->SetFlags(RF_Transactional);
+		Parent->Modify();
+	}
+
+	// 先用临时名建，旧控件让出名字后再改回原名：变量名、图表引用、动画和导航绑定都按名字认
+	UWidget* NewWidget = WidgetTree->ConstructWidget<UWidget>(NewClass, NAME_None);
+	if (!NewWidget)
+	{
+		UAL_CommandUtils::SendError(RequestId, 500, TEXT("Failed to construct the new widget"));
+		return;
+	}
+	NewWidget->SetFlags(RF_Transactional);
+	NewWidget->SetDesignerFlags(EWidgetDesignFlags::Designing);
+
+	// 原地换：槽位对象不动，位置、锚点、尺寸、对齐、边距全留着
+	if (Parent)
+	{
+		if (!Parent->ReplaceChild(OldWidget, NewWidget))
+		{
+			UAL_CommandUtils::SendError(RequestId, 500, FString::Printf(
+				TEXT("Engine refused to swap %s out of %s"), *OldName.ToString(), *Parent->GetName()));
+			return;
+		}
+	}
+	else
+	{
+		WidgetTree->RootWidget = NewWidget;
+	}
+
+	TArray<TSharedPtr<FJsonValue>> MovedJson;
+	if (UPanelWidget* NewPanel = Cast<UPanelWidget>(NewWidget))
+	{
+		for (UWidget* Child : KeptChildren)
+		{
+			Child->SetFlags(RF_Transactional);
+			Child->Modify();
+			// AddChild 会先把它从旧控件上摘下来
+			if (NewPanel->AddChild(Child))
+			{
+				MovedJson.Add(MakeShared<FJsonValueString>(Child->GetName()));
+			}
+		}
+	}
+
+	const TArray<FString> Carried = UAL_CarryBaseWidgetProperties(OldWidget, NewWidget);
+	NewWidget->bIsVariable = OldWidget->bIsVariable || Moves.Num() > 0 || VariableNodes.Num() > 0;
+
+	// 属性绑定（Text 绑到函数那种）：新类上没有这个可绑属性的就去掉，不然编译报错
+	TArray<TSharedPtr<FJsonValue>> DroppedBindings;
+	for (int32 Index = WidgetBP->Bindings.Num() - 1; Index >= 0; --Index)
+	{
+		const FDelegateEditorBinding& Binding = WidgetBP->Bindings[Index];
+		if (Binding.ObjectName == OldName.ToString()
+			&& !FindFProperty<FDelegateProperty>(NewClass, FName(*(Binding.PropertyName.ToString() + TEXT("Delegate")))))
+		{
+			DroppedBindings.Add(MakeShared<FJsonValueString>(Binding.PropertyName.ToString()));
+			WidgetBP->Bindings.RemoveAt(Index);
+		}
+	}
+
+	// 删掉的子孙：先拆图表引用，再挪去临时包把名字让出来
+	TArray<TSharedPtr<FJsonValue>> DroppedJson;
+	TArray<TSharedPtr<FJsonValue>> RemovedNodesJson;
+	for (UWidget* Each : Dropped)
+	{
+		DroppedJson.Add(MakeShared<FJsonValueObject>(UAL_DescribeWidgetBrief(Each)));
+		for (const FString& Label : UAL_DetachWidgetName(WidgetBP, Each->GetFName()))
+		{
+			RemovedNodesJson.Add(MakeShared<FJsonValueString>(Label));
+		}
+		Each->SetFlags(RF_Transactional);
+		Each->Modify();
+		Each->Rename(nullptr, GetTransientPackage());
+	}
+
+	const FString DisplayLabel = OldWidget->GetDisplayLabel();
+	OldWidget->Rename(nullptr, GetTransientPackage());
+	NewWidget->Rename(*OldName.ToString(), WidgetTree);
+	if (!DisplayLabel.IsEmpty())
+	{
+		NewWidget->SetDisplayLabel(DisplayLabel);
+	}
+
+	// 骨架类重建后，同名变量的类型才是新类，事件节点才能挂上去
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBP);
+
+	FObjectProperty* WidgetProperty = nullptr;
+	for (UClass* Candidate : { WidgetBP->SkeletonGeneratedClass.Get(), WidgetBP->GeneratedClass.Get() })
+	{
+		if (Candidate && !WidgetProperty)
+		{
+			WidgetProperty = FindFProperty<FObjectProperty>(Candidate, OldName);
+		}
+	}
+
+	int32 FailedEvents = 0;
+	TArray<TSharedPtr<FJsonValue>> EventsJson;
+	for (const FUAL_EventMove& Move : Moves)
+	{
+		TSharedPtr<FJsonObject> EventObj = MakeShared<FJsonObject>();
+		EventObj->SetStringField(TEXT("from"), Move.From.ToString());
+		EventObj->SetStringField(TEXT("to"), Move.To.ToString());
+		UK2Node_ComponentBoundEvent* Node = Move.Node.Get();
+		if (!Node || !WidgetProperty)
+		{
+			++FailedEvents;
+			EventObj->SetBoolField(TEXT("ok"), false);
+			EventObj->SetStringField(TEXT("error"), Node
+				? TEXT("the widget has no variable on the skeleton class; compile the blueprint and bind the event again")
+				: TEXT("the event node disappeared during the rebuild"));
+			EventsJson.Add(MakeShared<FJsonValueObject>(EventObj));
+			continue;
+		}
+		Node->Modify();
+		Node->InitializeComponentBoundEventParams(WidgetProperty, NewEvents.FindChecked(Move.To));
+		Node->ReconstructNode();
+
+		// 新事件没有的参数引脚，原来连着线的会变成孤儿引脚，编译报错 —— 点名出来
+		TArray<TSharedPtr<FJsonValue>> Orphans;
+		for (const UEdGraphPin* Pin : Node->Pins)
+		{
+			if (Pin && Pin->bOrphanedPin)
+			{
+				Orphans.Add(MakeShared<FJsonValueString>(Pin->PinName.ToString()));
+			}
+		}
+		const bool bMoved = Node->DelegatePropertyName == Move.To && Node->ComponentPropertyName == OldName;
+		if (!bMoved || Orphans.Num() > 0)
+		{
+			++FailedEvents;
+		}
+		EventObj->SetBoolField(TEXT("ok"), bMoved && Orphans.Num() == 0);
+		EventObj->SetStringField(TEXT("node"), UAL_NodeLabel(Node));
+		if (Orphans.Num() > 0)
+		{
+			EventObj->SetArrayField(TEXT("orphaned_pins"), Orphans);
+		}
+		EventsJson.Add(MakeShared<FJsonValueObject>(EventObj));
+	}
+
+	// 读写这个控件的节点按新类型重建引脚；新类上没有的函数会在编译时报出来
+	TArray<TSharedPtr<FJsonValue>> VariableRefsJson;
+	for (UEdGraphNode* Node : VariableNodes)
+	{
+		if (Node)
+		{
+			Node->ReconstructNode();
+			VariableRefsJson.Add(MakeShared<FJsonValueString>(UAL_NodeLabel(Node)));
+		}
+	}
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBP);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	if (FailedEvents > 0)
+	{
+		Result->SetNumberField(TEXT("failed_count"), FailedEvents);
+	}
+	Result->SetBoolField(TEXT("ok"), true);
+	Result->SetStringField(TEXT("widget_name"), NewWidget->GetName());
+	Result->SetStringField(TEXT("old_class"), OldClass->GetName());
+	Result->SetStringField(TEXT("new_class"), NewWidget->GetClass()->GetName());
+	Result->SetStringField(TEXT("new_class_path"), NewWidget->GetClass()->GetPathName());
+	Result->SetStringField(TEXT("parent"), Parent ? Parent->GetName() : TEXT("(root)"));
+	if (NewWidget->Slot)
+	{
+		Result->SetStringField(TEXT("slot_type"), NewWidget->Slot->GetClass()->GetName());
+	}
+	Result->SetBoolField(TEXT("is_variable"), NewWidget->bIsVariable);
+	Result->SetArrayField(TEXT("moved_children"), MovedJson);
+	Result->SetArrayField(TEXT("dropped_widgets"), DroppedJson);
+	if (RemovedNodesJson.Num() > 0)
+	{
+		Result->SetArrayField(TEXT("removed_graph_nodes"), RemovedNodesJson);
+	}
+	Result->SetArrayField(TEXT("events_moved"), EventsJson);
+	if (VariableRefsJson.Num() > 0)
+	{
+		Result->SetArrayField(TEXT("variable_references"), VariableRefsJson);
+	}
+	if (DroppedBindings.Num() > 0)
+	{
+		Result->SetArrayField(TEXT("dropped_bindings"), DroppedBindings);
+	}
+	TArray<TSharedPtr<FJsonValue>> CarriedJson;
+	for (const FString& Name : Carried)
+	{
+		CarriedJson.Add(MakeShared<FJsonValueString>(Name));
+	}
+	Result->SetArrayField(TEXT("carried_properties"), CarriedJson);
+	TArray<FString> EventNames;
+	for (const TPair<FName, FMulticastDelegateProperty*>& Pair : NewEvents)
+	{
+		EventNames.Add(Pair.Key.ToString());
+	}
+	EventNames.Sort();
+	TArray<TSharedPtr<FJsonValue>> EventNamesJson;
+	for (const FString& Name : EventNames)
+	{
+		EventNamesJson.Add(MakeShared<FJsonValueString>(Name));
+	}
+	Result->SetArrayField(TEXT("bindable_events"), EventNamesJson);
+	// 实例上能设的属性：换成用户控件后，按钮文字这类东西就在这里
+	Result->SetStringField(TEXT("editable_properties"), UAL_InstanceEditableNamesFor(NewWidget));
+
+	UE_LOG(LogUALWidget, Log, TEXT("widget.replace: %s %s -> %s, moved=%d dropped=%d events=%d failed=%d"),
+		*OldName.ToString(), *OldClass->GetName(), *NewClass->GetName(), MovedJson.Num(), Dropped.Num(), Moves.Num(), FailedEvents);
+	UAL_CommandUtils::SendResponse(RequestId, 200, Result);
+#else
+	UAL_CommandUtils::SendError(RequestId, 501, TEXT("widget.replace is only available in editor mode"));
+#endif
+}
+
+void FUAL_WidgetCommands::Handle_Remove(const TSharedPtr<FJsonObject>& Payload, const FString RequestId)
+{
+#if WITH_EDITOR
+	FString Path;
+	FString WidgetName;
+	if (!Payload->TryGetStringField(TEXT("path"), Path))
+	{
+		UAL_CommandUtils::SendError(RequestId, 400, TEXT("Missing required field: path"));
+		return;
+	}
+	if (!Payload->TryGetStringField(TEXT("widget_name"), WidgetName))
+	{
+		UAL_CommandUtils::SendError(RequestId, 400, TEXT("Missing required field: widget_name"));
+		return;
+	}
+	bool bForce = false;
+	Payload->TryGetBoolField(TEXT("force"), bForce);
+
+	FString Error;
+	UWidgetBlueprint* WidgetBP = LoadWidgetBlueprint(Path, Error);
+	if (!WidgetBP)
+	{
+		UAL_CommandUtils::SendError(RequestId, 404, Error);
+		return;
+	}
+	UWidgetTree* WidgetTree = WidgetBP->WidgetTree;
+	if (!WidgetTree)
+	{
+		UAL_CommandUtils::SendError(RequestId, 500, TEXT("WidgetBlueprint has no WidgetTree"));
+		return;
+	}
+	UWidget* Widget = FindWidgetByName(WidgetTree, WidgetName);
+	if (!Widget)
+	{
+		UAL_CommandUtils::SendError(RequestId, 404, FString::Printf(TEXT("Widget not found: %s"), *WidgetName));
+		return;
+	}
+
+	TArray<UWidget*> Doomed = { Widget };
+	UWidgetTree::GetChildWidgets(Widget, Doomed);
+
+	// 图表里还在用的，默认不删，列出来；force 才连节点一起删（和删 Actor 查引用是同一个规矩）
+	TArray<FString> InUse;
+	for (UWidget* Each : Doomed)
+	{
+		TArray<UK2Node_ComponentBoundEvent*> Events;
+		TArray<UEdGraphNode*> Others;
+		UAL_CollectWidgetGraphRefs(WidgetBP, Each->GetFName(), Events, Others);
+		for (const UEdGraphNode* Node : Others)
+		{
+			InUse.Add(UAL_NodeLabel(Node));
+		}
+		for (const UK2Node_ComponentBoundEvent* Node : Events)
+		{
+			InUse.Add(UAL_NodeLabel(Node));
+		}
+	}
+	if (InUse.Num() > 0 && !bForce)
+	{
+		UAL_CommandUtils::SendError(RequestId, 409, FString::Printf(
+			TEXT("Nothing removed: the graph still uses %s or its children: %s. ")
+			TEXT("Pass force: true to remove them together with these nodes (logic wired after a removed event stays, disconnected), ")
+			TEXT("or move the logic first."),
+			*Widget->GetName(), *FString::Join(InUse, TEXT("; "))));
+		return;
+	}
+
+	const FUAL_ScopedTransaction Transaction(NSLOCTEXT("UAL", "RemoveWidget", "Agent Remove Widget"));
+	WidgetBP->Modify();
+	WidgetTree->SetFlags(RF_Transactional);
+	WidgetTree->Modify();
+	UPanelWidget* Parent = Widget->GetParent();
+	const FString ParentName = Parent ? Parent->GetName() : (WidgetTree->RootWidget == Widget ? TEXT("(root)") : TEXT("(named slot)"));
+	if (Parent)
+	{
+		Parent->SetFlags(RF_Transactional);
+		Parent->Modify();
+	}
+	Widget->SetFlags(RF_Transactional);
+	Widget->Modify();
+
+	if (!WidgetTree->RemoveWidget(Widget))
+	{
+		UAL_CommandUtils::SendError(RequestId, 500, FString::Printf(TEXT("Engine refused to remove %s"), *Widget->GetName()));
+		return;
+	}
+
+	TArray<TSharedPtr<FJsonValue>> RemovedJson;
+	TArray<TSharedPtr<FJsonValue>> RemovedNodesJson;
+	for (UWidget* Each : Doomed)
+	{
+		RemovedJson.Add(MakeShared<FJsonValueObject>(UAL_DescribeWidgetBrief(Each)));
+		for (const FString& Label : UAL_DetachWidgetName(WidgetBP, Each->GetFName()))
+		{
+			RemovedNodesJson.Add(MakeShared<FJsonValueString>(Label));
+		}
+		Each->SetFlags(RF_Transactional);
+		Each->Modify();
+		// 挪去临时包，名字让给以后的新控件
+		Each->Rename(nullptr, GetTransientPackage());
+	}
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBP);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("ok"), true);
+	Result->SetStringField(TEXT("widget_name"), WidgetName);
+	Result->SetStringField(TEXT("parent"), ParentName);
+	Result->SetArrayField(TEXT("removed"), RemovedJson);
+	Result->SetArrayField(TEXT("removed_graph_nodes"), RemovedNodesJson);
+
+	UE_LOG(LogUALWidget, Log, TEXT("widget.remove: %s (+%d children), graph nodes removed=%d"),
+		*WidgetName, Doomed.Num() - 1, RemovedNodesJson.Num());
+	UAL_CommandUtils::SendResponse(RequestId, 200, Result);
+#else
+	UAL_CommandUtils::SendError(RequestId, 501, TEXT("widget.remove is only available in editor mode"));
 #endif
 }
 
@@ -1783,6 +2940,20 @@ UWidget* FUAL_WidgetCommands::FindWidgetByName(UWidgetTree* WidgetTree, const FS
 
 UClass* FUAL_WidgetCommands::FindWidgetClass(const FString& ClassName)
 {
+	FString Ignored;
+	return ResolveWidgetClass(ClassName, Ignored);
+}
+
+/**
+ * 控件类型名 → 类。原生类名、控件蓝图名、资产路径都认。
+ *
+ * 原来只有一张 24 项的表，表外按 `U<名字>` 去找 —— 而类对象的名字本来就不带
+ * U 前缀（UButton 的类对象叫 Button），所以那一步从来没找到过东西；工程自己
+ * 做的控件蓝图（WB_Text_Button 这类，CommonUI 项目里按钮全是它）更是完全够不着。
+ * 用户说「把登录按钮换成导航那种」，第一步就卡在这里。
+ */
+UClass* FUAL_WidgetCommands::ResolveWidgetClass(const FString& InName, FString& OutError)
+{
 	// 常见控件类型映射
 	static TMap<FString, UClass*> WidgetClassMap;
 	if (WidgetClassMap.Num() == 0)
@@ -1813,24 +2984,141 @@ UClass* FUAL_WidgetCommands::FindWidgetClass(const FString& ClassName)
 		WidgetClassMap.Add(TEXT("UniformGridPanel"), UUniformGridPanel::StaticClass());
 	}
 	
-	UClass** FoundClass = WidgetClassMap.Find(ClassName);
-	if (FoundClass)
+	const FString Name = InName.TrimStartAndEnd();
+	if (Name.IsEmpty())
+	{
+		OutError = TEXT("Control type is empty");
+		return nullptr;
+	}
+
+	if (UClass** FoundClass = WidgetClassMap.Find(Name))
 	{
 		return *FoundClass;
 	}
-	
-	// 尝试动态查找
-	FString FullClassName = FString::Printf(TEXT("U%s"), *ClassName);
-#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1
-	UClass* DynamicClass = FindFirstObject<UClass>(*FullClassName, EFindFirstObjectOptions::None);
-#else
-	UClass* DynamicClass = FindObject<UClass>(ANY_PACKAGE, *FullClassName);
-#endif
-	if (DynamicClass && DynamicClass->IsChildOf(UWidget::StaticClass()))
+
+	auto AcceptClass = [&OutError, &Name](UClass* Class) -> UClass*
 	{
-		return DynamicClass;
+		if (!Class->IsChildOf(UWidget::StaticClass()))
+		{
+			OutError = FString::Printf(TEXT("'%s' is %s, which is not a widget class"), *Name, *Class->GetPathName());
+			return nullptr;
+		}
+		if (Class->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
+		{
+			OutError = FString::Printf(TEXT("'%s' (%s) is abstract or deprecated and cannot be placed; use a concrete subclass"),
+				*Name, *Class->GetName());
+			return nullptr;
+		}
+		return Class;
+	};
+
+#if WITH_EDITOR
+	// 控件蓝图 → 它的生成类。还没编译过的蓝图没有生成类，放不进去
+	auto ClassOfWidgetBlueprint = [&OutError, &AcceptClass](UWidgetBlueprint* WidgetBP) -> UClass*
+	{
+		if (!WidgetBP->GeneratedClass)
+		{
+			OutError = FString::Printf(TEXT("Widget Blueprint %s has never been compiled; compile it first"), *WidgetBP->GetPathName());
+			return nullptr;
+		}
+		return AcceptClass(WidgetBP->GeneratedClass);
+	};
+#endif
+
+	// 1. 路径：/Script/CommonUI.CommonButtonBase，或控件蓝图 /Game/UI/WB_X（带不带 .WB_X、_C 都行）
+	if (Name.StartsWith(TEXT("/")))
+	{
+		if (Name.StartsWith(TEXT("/Script/")))
+		{
+			if (UClass* Native = LoadObject<UClass>(nullptr, *Name, nullptr, LOAD_NoWarn | LOAD_Quiet))
+			{
+				return AcceptClass(Native);
+			}
+			OutError = FString::Printf(TEXT("No class at '%s' (is its module or plugin enabled?)"), *Name);
+			return nullptr;
+		}
+#if WITH_EDITOR
+		FString ObjectPath = Name;
+		ObjectPath.RemoveFromEnd(TEXT("_C"));
+		if (!ObjectPath.Contains(TEXT(".")))
+		{
+			ObjectPath += TEXT(".") + FPackageName::GetShortName(ObjectPath);
+		}
+		if (UWidgetBlueprint* WidgetBP = LoadObject<UWidgetBlueprint>(nullptr, *ObjectPath, nullptr, LOAD_NoWarn | LOAD_Quiet))
+		{
+			return ClassOfWidgetBlueprint(WidgetBP);
+		}
+#endif
+		OutError = FString::Printf(TEXT("No Widget Blueprint at '%s'"), *Name);
+		return nullptr;
 	}
-	
+
+	// 2. 原生类。类对象的名字不带 U 前缀；调用方写了 U 前缀（UCommonButtonBase）也认
+	TArray<FString> NativeCandidates = { Name };
+	if (Name.Len() > 2 && Name[0] == TEXT('U') && FChar::IsUpper(Name[1]))
+	{
+		NativeCandidates.Add(Name.Mid(1));
+	}
+	for (const FString& Candidate : NativeCandidates)
+	{
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1
+		UClass* Native = FindFirstObject<UClass>(*Candidate, EFindFirstObjectOptions::None);
+#else
+		UClass* Native = FindObject<UClass>(ANY_PACKAGE, *Candidate);
+#endif
+		if (Native && Native->HasAnyClassFlags(CLASS_Native) && Native->IsChildOf(UWidget::StaticClass()))
+		{
+			return AcceptClass(Native);
+		}
+	}
+
+#if WITH_EDITOR
+	// 3. 控件蓝图按资产名（WB_Text_Button / WB_Text_Button_C）。重名就让调用方给路径，不替它挑
+	FString AssetName = Name;
+	AssetName.RemoveFromEnd(TEXT("_C"));
+	IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
+	FARFilter Filter;
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1
+	Filter.ClassPaths.Add(UWidgetBlueprint::StaticClass()->GetClassPathName());
+#else
+	Filter.ClassNames.Add(UWidgetBlueprint::StaticClass()->GetFName());
+#endif
+	Filter.bRecursiveClasses = true;
+	TArray<FAssetData> AllWidgetBPs;
+	AssetRegistry.GetAssets(Filter, AllWidgetBPs);
+
+	TArray<FAssetData> Matches;
+	for (const FAssetData& AssetData : AllWidgetBPs)
+	{
+		if (AssetData.AssetName.ToString().Equals(AssetName, ESearchCase::IgnoreCase))
+		{
+			Matches.Add(AssetData);
+		}
+	}
+	if (Matches.Num() == 1)
+	{
+		if (UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(Matches[0].GetAsset()))
+		{
+			return ClassOfWidgetBlueprint(WidgetBP);
+		}
+	}
+	if (Matches.Num() > 1)
+	{
+		TArray<FString> Paths;
+		for (const FAssetData& Match : Matches)
+		{
+			Paths.Add(Match.PackageName.ToString());
+		}
+		OutError = FString::Printf(TEXT("'%s' matches %d Widget Blueprints, pass the full path instead: %s"),
+			*Name, Matches.Num(), *FString::Join(Paths, TEXT(", ")));
+		return nullptr;
+	}
+#endif
+
+	OutError = FString::Printf(
+		TEXT("Unknown control type '%s': not a widget class and no Widget Blueprint has that name. ")
+		TEXT("Native classes go without the U prefix (Button, CommonButtonBase); project widgets by asset name (WB_Text_Button) or path (/Game/UI/WB_Text_Button)."),
+		*Name);
 	return nullptr;
 }
 
@@ -2133,38 +3421,4 @@ FVector2D FUAL_WidgetCommands::ParseVector2D(const TSharedPtr<FJsonObject>& Obj)
 	}
 	
 	return FVector2D(X, Y);
-}
-
-// ============================================================================
-// 辅助函数: 唯一名称生成（防止重名崩溃）
-// ============================================================================
-
-FName FUAL_WidgetCommands::GenerateUniqueWidgetName(UWidgetTree* WidgetTree, const FString& DesiredName)
-{
-	if (!WidgetTree || DesiredName.IsEmpty())
-	{
-		return NAME_None;
-	}
-	
-	// 先检查期望名称是否可用
-	if (!WidgetTree->FindWidget(FName(*DesiredName)))
-	{
-		return FName(*DesiredName);
-	}
-	
-	// 名称已存在，追加后缀递增
-	UE_LOG(LogUALWidget, Warning, TEXT("Widget name '%s' already exists, generating unique name"), *DesiredName);
-	
-	for (int32 i = 1; i < 1000; i++)
-	{
-		FString Candidate = FString::Printf(TEXT("%s_%d"), *DesiredName, i);
-		if (!WidgetTree->FindWidget(FName(*Candidate)))
-		{
-			UE_LOG(LogUALWidget, Log, TEXT("Using unique name: %s"), *Candidate);
-			return FName(*Candidate);
-		}
-	}
-	
-	// 极端情况 fallback：使用 MakeUniqueObjectName
-	return MakeUniqueObjectName(WidgetTree, UWidget::StaticClass(), FName(*DesiredName));
 }

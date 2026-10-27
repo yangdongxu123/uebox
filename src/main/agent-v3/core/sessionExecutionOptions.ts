@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { z } from 'zod'
 
 import { writeSessionFile } from './atomicSessionFile'
+import { goalCheckSchema } from './goalLoop'
 import { safeSessionFileBase, sessionsDir } from './transcriptStore'
 
 const optionsSchema = z.object({
@@ -10,6 +11,8 @@ const optionsSchema = z.object({
   thinkingLevel: z
     .enum(['auto', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
     .optional(),
+  /** 「快速」开关，续跑沿用这一轮的。见 `supportsFastMode` */
+  fastMode: z.boolean().optional(),
   skillLearning: z.enum(['off', 'ask', 'auto']).optional(),
   /**
    * 这条会话绑定的模型。第一轮开始时记下，之后一直用它 —— 用户在别的会话里
@@ -79,7 +82,8 @@ const optionsSchema = z.object({
        */
       latestRequest: z.string().optional(),
       rounds: z.number().int().min(0),
-      lastFailReason: z.string(),
+      // 复核清单，见 `goalLoop.ts` 文件头。老记录里是一句 `lastFailReason`，读回来丢掉、清单从空开始
+      checklist: z.array(goalCheckSchema).default([]),
       mutations: z.array(z.string()),
       settled: z.boolean()
     })
@@ -92,6 +96,8 @@ const optionsSchema = z.object({
   team: z
     .object({
       objective: z.string().min(1),
+      // 开团之后用户最近那句话，见 `TeamState.latestRequest`。`/team` 那一轮和老记录里没有
+      latestRequest: z.string().optional(),
       verdict: z.enum(['pass', 'fail', 'blocked']).nullable(),
       deliveries: z.number().int().min(0),
       nudges: z.number().int().min(0),
@@ -136,7 +142,12 @@ export async function deleteExecutionOptions(sessionId: string): Promise<void> {
 
 export async function copyExecutionOptions(source: string, target: string): Promise<void> {
   const options = await loadExecutionOptions(source)
-  if (options) await saveExecutionOptions(target, options)
+  if (!options) return
+  // 分支、侧边问一句都不带走目标：目标是原会话那条主线的，分支可能切在定目标之前，
+  // 侧边问一句是只读的，带过去每句都会报「目标不可能达成」
+  const rest = { ...options }
+  delete rest.goal
+  await saveExecutionOptions(target, rest)
 }
 
 export function resumeExecutionOptions(

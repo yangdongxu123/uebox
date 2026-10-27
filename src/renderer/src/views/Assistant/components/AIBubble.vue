@@ -123,6 +123,11 @@
         :streaming="status === 'typing'"
         @resize="emit('resize')"
       />
+      <!--
+        任务清单。跑着的时候挂在最底下跟着进度走；跑完全勾上了就不再占地方
+        （上面那行「用时 · 步数」已经交代了），还有没做完的才留着 —— 那正是用户该知道的。
+      -->
+      <PlanChecklist v-if="showPlan" :items="planItems" :live="status === 'typing'" />
       <!-- 归不到时间线上任何一段的产出（V2 老消息的 toolResults）只能挂在最后 -->
       <GeneratedArtifacts
         :music="unplacedArtifacts.music"
@@ -516,7 +521,7 @@
       <PhCopy v-else-if="status === 'done'" class="tool" @click="emitCopy" />
       <PhArrowClockwise v-if="status === 'done'" class="tool" @click="emitRetry" />
       <AppTooltip v-if="status === 'done'" :title="t('assistant.branch.tooltip')">
-        <PhGitBranch class="tool" @click="emitFork" />
+        <PhGitBranch class="tool" @click="emitBranch" />
       </AppTooltip>
       <AppTooltip v-if="status === 'done'" :title="readAloud.label.value">
         <AppButton
@@ -557,6 +562,25 @@
         <span class="loading-dot"></span>
         <span class="loading-dot"></span>
       </div>
+      <!--
+        Agent 自己用 wrap_up 交代了「接下来要你定的事」：那一问放上面，按钮换成它给的。
+        猜的那次建议调用这时不会发（`agentCompletionHandlers.ts`），两套按钮不会同时出现。
+      -->
+      <template v-else-if="wrapUp">
+        <div class="wrap-up-ask">{{ wrapUp.ask }}</div>
+        <AppButton
+          v-for="(action, index) in wrapUp.actions"
+          :key="`${index}:${action.label}`"
+          size="small"
+          shape="round"
+          class="chip"
+          :class="{ 'is-primary': index === 0 }"
+          @click="emitSuggest(wrapUpActionMessage(action))"
+        >
+          <span>{{ action.label }}</span>
+          <PhCaretRight />
+        </AppButton>
+      </template>
       <!-- 建议列表 -->
       <template v-else>
         <AppButton
@@ -604,6 +628,8 @@ import GeneratedArtifacts from './GeneratedArtifacts.vue'
 import AssetList from './AssetList.vue'
 import MessageSources from './MessageSources.vue'
 import NavigationButton from './NavigationButton.vue'
+import PlanChecklist from './PlanChecklist.vue'
+import { readLatestPlan, readWrapUp, wrapUpActionMessage } from '../composables/agentTurnReport'
 import type { ResponseMetadata } from '@renderer/store/modules/chatMessages'
 import {
   PhArrowClockwise,
@@ -809,7 +835,7 @@ function onToggleRunFold(): void {
  * sessionId 从条目里取，不从 props 传：这张卡片嵌在时间线的第三层，
  * 靠 props 层层往下传的话中间每一层都要为它加一个自己用不上的参数
  * （见 `shared/agentQuestion.ts` 的说明）。取不到就只能放弃 ——
- * 主进程那边会等到超时按取消处理，但至少不会把答案送错会话。
+ * 主进程那边会等到超时按取消处理，但至少不会把答案送错对话。
  */
 function onQuestionAnswer(
   question: AgentQuestionItem,
@@ -918,7 +944,7 @@ const emit = defineEmits<{
   (e: 'stop', payload: { id: string }): void
   (e: 'suggest', payload: { id: string; text: string }): void
   (e: 'copy', payload: { id: string; content: string }): void
-  (e: 'fork', payload: { id: string }): void
+  (e: 'branch', payload: { id: string }): void
   (e: 'followups-ready', payload: { id: string }): void
   (e: 'resize'): void
   (e: 'open-location', folderKey: string, assetKey?: string): void
@@ -1133,7 +1159,7 @@ const navigationResult = computed<{
       if (result && result.action === 'navigate' && result.target) {
         console.log('[AIBubble] 从 toolResults 检测到导航结果:', result)
         return {
-          buttonText: result.buttonText || '🚀 带我过去',
+          buttonText: result.buttonText || '前往',
           description: result.description || '',
           target: result.target
         }
@@ -1160,7 +1186,7 @@ const navigationResult = computed<{
                   nestedResult
                 )
                 return {
-                  buttonText: nestedResult.buttonText || '🚀 带我过去',
+                  buttonText: nestedResult.buttonText || '前往',
                   description: nestedResult.description || '',
                   target: nestedResult.target
                 }
@@ -1173,7 +1199,7 @@ const navigationResult = computed<{
         if (result && result.action === 'navigate' && result.target) {
           console.log('[AIBubble] 从 agentProcess (直接工具) 检测到导航结果:', result)
           return {
-            buttonText: result.buttonText || '🚀 带我过去',
+            buttonText: result.buttonText || '前往',
             description: result.description || '',
             target: result.target
           }
@@ -1201,13 +1227,24 @@ const suggestions = computed<string[]>(() => {
   return props.externalSuggestions || []
 })
 const showFollowUps = computed<boolean>(() => !!props.showFollowUps)
+const planItems = computed(() => readLatestPlan(props.agentProcess))
+const showPlan = computed(
+  () =>
+    planItems.value.length > 0 &&
+    (props.status === 'typing' || planItems.value.some((item) => item.status !== 'completed'))
+)
+const wrapUp = computed(() => readWrapUp(props.agentProcess))
 const toolsMode = computed<'hover' | 'always'>(() => props.toolsMode || 'always')
 
 /**
  * 当跟进建议准备好并显示时，通知上层进行滚动处理。
  */
 function notifyFollowupsReady(): void {
-  if (props.status === 'done' && showFollowUps.value && suggestions.value.length) {
+  if (
+    props.status === 'done' &&
+    showFollowUps.value &&
+    (suggestions.value.length || wrapUp.value)
+  ) {
     emit('followups-ready', { id: props.id })
   }
 }
@@ -1217,7 +1254,7 @@ onMounted(async () => {
   notifyFollowupsReady()
 })
 
-watch([() => props.status, showFollowUps, () => suggestions.value.length], () => {
+watch([() => props.status, showFollowUps, () => suggestions.value.length, wrapUp], () => {
   notifyFollowupsReady()
 })
 
@@ -1250,11 +1287,11 @@ function emitCopy(): void {
 }
 
 /**
- * 触发会话分支事件。分的是整个会话（内核 transcript），不是这条消息，
- * payload 里的 id 只是将来做「从某一轮分叉」时留下的锚点。
+ * 触发分支事件。payload 里的 id 就是分支点：从这条回复分出一条新对话，
+ * 它之后的消息不带过去（截在哪见 `chatBranch.ts` 的 `resolveBranchPoint`）。
  */
-function emitFork(): void {
-  emit('fork', { id: props.id })
+function emitBranch(): void {
+  emit('branch', { id: props.id })
 }
 
 /**
@@ -1650,9 +1687,9 @@ function waitForSessionProject(waitMs: number): Promise<boolean> {
 }
 
 /**
- * 引擎没连上时问一句要不要打开这条会话的工程；用户同意就打开并等它连上。
+ * 引擎没连上时问一句要不要打开这条对话的工程；用户同意就打开并等它连上。
  *
- * 不知道该开哪个工程（会话没绑工程、库里没有 .uproject）、或者工程其实连着
+ * 不知道该开哪个工程（对话没绑工程、库里没有 .uproject）、或者工程其实连着
  * （那是引擎那边跑失败了，再开一个也没用）时不问，照旧显示「只做了命名检查」。
  * 返回 true 表示工程已经连上，可以重新审查。
  */
@@ -1834,9 +1871,15 @@ async function openInEditor(group: ChangeGroup): Promise<void> {
  * 完整原文挂在 title 里，鼠标停上去能看全。
  */
 function displayDetail(detail: string | undefined): string {
-  const firstLine = String(detail ?? '')
-    .split('\n')[0]
-    .trim()
+  // 脚本原文的头几行是 import 和注释，取第一行就是一溜 `import unreal`。
+  // 跳到第一句真干活的；全是这些（不可能，但别显示空）就还用第一行
+  const lines = String(detail ?? '')
+    .split('\n')
+    .map((line) => line.trim())
+  const firstLine =
+    lines.find((line) => line && !/^(#|import\s|from\s+\S+\s+import\s)/.test(line)) ??
+    lines[0] ??
+    ''
   return firstLine.length > 80 ? `${firstLine.slice(0, 80)}…` : firstLine
 }
 
@@ -2212,6 +2255,23 @@ function toggleChanges(): void {
   flex-direction: column;
   align-items: flex-start;
   gap: 8px;
+}
+
+.wrap-up-ask {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+/* wrap_up 的第一个按钮是 agent 推荐的那个，压一档实色，和其余的分开 */
+.chip.is-primary {
+  background: var(--color-text-primary) !important;
+  color: var(--color-bg-page);
+
+  &:hover {
+    background: var(--color-text-primary) !important;
+    opacity: 0.9;
+  }
 }
 
 .chip {

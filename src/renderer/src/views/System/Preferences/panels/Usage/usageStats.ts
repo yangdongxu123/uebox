@@ -22,7 +22,7 @@
  *
  * ## 为什么要如实报告「算不出来的那部分」
  *
- * 老会话没有用量字段，报错中断的那一轮也没有。把它们悄悄跳过的话，总数会
+ * 老对话没有用量字段，报错中断的那一轮也没有。把它们悄悄跳过的话，总数会
  * 偏小，而用户拿它去对厂商账单只会更困惑。所以单独数出来摆在旁边。
  *
  * ## 为什么不只有 token
@@ -30,7 +30,7 @@
  * 「这台电脑跑掉了多少 token」回答不了用户真正会问的三个问题：**哪个工具在拖后腿、
  * AI 到底动了我多少东西、钱花在哪个工程上**。这三样在对话记录里本来就全有 ——
  * 工具调用带着成败和时间戳，改动台账（`responseMetadata.changes`）带着风险等级和
- * 可撤销性，会话带着它归属的 UE 工程。只数 token 等于把这些一起扔了。
+ * 可撤销性，对话带着它归属的 UE 工程。只数 token 等于把这些一起扔了。
  */
 
 import type { ChatMessage } from '@renderer/store/modules/chatMessages'
@@ -115,7 +115,7 @@ export interface UsageTotals {
   output: number
   cacheRead: number
   cacheWrite: number
-  /** 工具调用总次数。它不依赖用量字段，老会话也数得出来 */
+  /** 工具调用总次数。它不依赖用量字段，老对话也数得出来 */
   toolCalls: number
 }
 
@@ -188,7 +188,7 @@ export interface UsageChanges {
   byTool: UsageCount[]
 }
 
-/** 一个 UE 工程上花掉的东西。`name` 为空串表示这些会话没绑工程 */
+/** 一个 UE 工程上花掉的东西。`name` 为空串表示这些对话没绑工程 */
 export interface UsageProject {
   name: string
   tokens: number
@@ -210,7 +210,7 @@ export interface UsageReport {
   /** 按 UE 工程分组，按 token 降序 */
   projects: UsageProject[]
   /**
-   * 窗口内有多少轮回复算不出用量（老会话没这个字段、或者那一轮中断了）。
+   * 窗口内有多少轮回复算不出用量（老对话没这个字段、或者那一轮中断了）。
    * 摆出来让用户知道上面的总数不是全部。
    */
   /**
@@ -392,12 +392,51 @@ export interface BuildUsageReportOptions {
   /** 现在几点。传进来而不是读 `Date.now()`，这样这个函数可测 */
   now: number
   /**
-   * 会话 id → 它归属的 UE 工程名。
+   * 对话 id → 它归属的 UE 工程名。
    *
-   * 传一张表而不是整个会话数组：这一页只需要名字，不该为了一个字符串把会话
-   * 的类型（连同草稿、图片、权限档）拖进统计层。查不到的会话归到「没绑工程」。
+   * 传一张表而不是整个对话数组：这一页只需要名字，不该为了一个字符串把对话
+   * 的类型（连同草稿、图片、权限档）拖进统计层。查不到的对话归到「没绑工程」。
    */
   projectBySid?: Record<string, string>
+}
+
+/**
+ * 统计只用得到这些字段。对话正文是用到才读的，算全部历史时要把每个对话都从盘上
+ * 读一遍 —— 读完先削成这样，免得面板开着时把上百 MB 正文压在内存里。
+ */
+export function slimForUsage(messages: unknown): ChatMessage[] {
+  if (!Array.isArray(messages)) return []
+  const out: ChatMessage[] = []
+  for (const message of messages as ChatMessage[]) {
+    if (message?.role !== 'assistant') continue
+    out.push({
+      id: message.id,
+      role: 'assistant',
+      content: '',
+      status: message.status,
+      startTime: message.startTime,
+      responseMetadata: message.responseMetadata,
+      agentProcess: (message.agentProcess ?? []).flatMap((item): AgentProcessItem[] => {
+        if (item?.type === 'tool-call') {
+          return [
+            { type: item.type, timestamp: item.timestamp, data: { name: readToolName(item) } }
+          ]
+        }
+        if (item?.type === 'tool-result') {
+          const data = item.data as { toolName?: unknown; isError?: unknown } | undefined
+          return [
+            {
+              type: item.type,
+              timestamp: item.timestamp,
+              data: { toolName: data?.toolName, isError: data?.isError }
+            }
+          ]
+        }
+        return []
+      })
+    })
+  }
+  return out
 }
 
 /**
@@ -462,7 +501,7 @@ export function buildUsageReport(
       const bucket = byDate.get(date)!
       const project = projectBucket(projectStats, projectName)
 
-      // 工具、技能、改动都不依赖用量字段 —— 老会话没有 usage，但这些记录还在，
+      // 工具、技能、改动都不依赖用量字段 —— 老对话没有 usage，但这些记录还在，
       // 那部分统计照样成立
       totals.toolCalls += collectToolStats(message.agentProcess ?? [], toolStats)
 

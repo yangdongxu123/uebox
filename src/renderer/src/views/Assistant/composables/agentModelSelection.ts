@@ -1,5 +1,7 @@
 import {
   ROLE_KIND,
+  modelAllowsRole,
+  modelLabelWithBadge,
   type ModelBinding,
   type ProviderView,
   type SettingsView
@@ -12,6 +14,9 @@ export interface AgentModelOption {
   modelId: string
   modelName: string
   fullLabel: string
+  /** 名字旁的小标签、悬停说明：套餐清单给的，原样显示 */
+  badge?: string
+  description?: string
 }
 
 export interface AgentModelGroup {
@@ -24,7 +29,7 @@ export interface AgentModelCatalog {
   groups: AgentModelGroup[]
   options: AgentModelOption[]
   /**
-   * 这一轮实际会用的绑定：会话绑定的模型优先，没有才看全局。
+   * 这一轮实际会用的绑定：对话绑定的模型优先，没有才看全局。
    * Agent 没有单独绑定时，内核会沿用 chat 角色；这里必须显示同一个实际结果。
    */
   binding: ModelBinding | null
@@ -61,19 +66,25 @@ export function buildAgentModelCatalog(
       return {
         providerId: provider.id,
         providerName,
-        options: provider.models.map((model): AgentModelOption => {
-          const name = modelName(model)
-          return {
-            key: agentModelOptionKey(provider.id, model.id),
-            providerId: provider.id,
-            providerName,
-            modelId: model.id,
-            modelName: name,
-            fullLabel: modelFullLabel(providerName, name)
-          }
-        })
+        // 选中的写进主模型那一格（chat，Agent 已并进去），对话钉住的按 agent 校验：两个都得允许
+        options: provider.models
+          .filter((model) => modelAllowsRole(model, 'chat') && modelAllowsRole(model, 'agent'))
+          .map((model): AgentModelOption => {
+            const name = modelName(model)
+            return {
+              key: agentModelOptionKey(provider.id, model.id),
+              providerId: provider.id,
+              providerName,
+              modelId: model.id,
+              modelName: name,
+              fullLabel: modelFullLabel(providerName, modelLabelWithBadge(name, model.badge)),
+              ...(model.badge ? { badge: model.badge } : {}),
+              ...(model.description ? { description: model.description } : {})
+            }
+          })
       }
     })
+    .filter((group) => group.options.length > 0)
 
   const options = groups.flatMap((group) => group.options)
   const globalBinding = settings.roles.agent ?? settings.roles.chat ?? null
@@ -84,7 +95,7 @@ export function buildAgentModelCatalog(
         ) ?? null)
       : null
 
-  // 会话绑的模型被删了：主进程这一轮会退回全局默认，界面也显示那一个
+  // 对话绑的模型被删了：主进程这一轮会退回全局默认，界面也显示那一个
   const sessionSelected = find(sessionBinding ?? null)
   if (sessionBinding && sessionSelected) {
     return { groups, options, binding: sessionBinding, selected: sessionSelected }

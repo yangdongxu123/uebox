@@ -50,25 +50,25 @@ const STRINGS: Record<Lang, Record<string, string>> = {
     // 点了到插件连上来之间的那几十秒：还点不得，但得告诉用户它没在装死
     'tray.launching': '{name}（启动中）',
     'tray.quit': '退出',
-    // 数的是会话操作：AI 轮次和分叉 / 截断 / 压缩这类历史操作都算，
+    // 数的是 Agent session 的操作：AI 轮次和分叉 / 截断 / 压缩这类历史操作都算，
     // 但不是全部后台任务 —— 别让用户以为连导入也算
-    'tray.quitConfirm': '有 {count} 项会话操作尚未完成，退出会中断它们。',
+    'tray.quitConfirm': 'AI 仍有 {count} 项操作正在进行，退出将中断这些操作。',
     'tray.quitConfirmOk': '仍然退出',
-    // 安装更新撞上会话操作没收摊：同一个框，按钮说清楚是重启装包
+    // 安装更新撞上 session 操作没收摊：同一个框，按钮说清楚是重启装包
     'tray.updateConfirmOk': '仍然重启安装',
     'tray.quitConfirmCancel': '取消',
-    'tray.openFailedTitle': '打不开项目',
+    'tray.openFailedTitle': '无法打开项目',
     'tray.openFailedBody': '{name}：{error}',
-    'tray.openFailedMissing': '「{name}」的工程文件已经不在了',
-    'tray.alreadyRunningTitle': '项目已经开着了',
-    'tray.alreadyRunningBody': '「{name}」已经在虚幻编辑器里打开',
-    'tray.pluginFailedTitle': '项目已打开，但 AI 暂时连不上',
-    'tray.pluginFailedBody': 'UnrealAgentLink 没有装上，点这里查看原因',
+    'tray.openFailedMissing': '「{name}」的工程文件不存在',
+    'tray.alreadyRunningTitle': '项目已打开',
+    'tray.alreadyRunningBody': '「{name}」已在虚幻编辑器中打开',
+    'tray.pluginFailedTitle': '项目已打开，AI 连接失败',
+    'tray.pluginFailedBody': 'UnrealAgentLink 插件安装失败，点击查看原因',
 
     'startup.failedTitle': '虚幻盒子启动失败',
     // {reason} 是原始异常，{logDir} 是日志目录 —— 这两样是用户唯一能拿去求助的东西
     'startup.failedBody':
-      '启动时发生错误，应用无法继续运行。\n\n原因：{reason}\n\n日志在：{logDir}',
+      '启动时发生错误，应用无法继续运行。\n\n原因：{reason}\n\n日志目录：{logDir}',
 
     /*
      * 系统文件对话框的标题。
@@ -99,7 +99,7 @@ const STRINGS: Record<Lang, Record<string, string>> = {
   'en-US': {
     'tray.tooltip': 'Unreal Box',
     'tray.open': 'Open Unreal Box',
-    'tray.newChat': 'New AI Chat',
+    'tray.newChat': 'New chat',
     'tray.recentChats': 'Recent chats',
     'tray.untitledChat': 'Untitled chat',
     'tray.recentProjects': 'Recent projects',
@@ -107,7 +107,7 @@ const STRINGS: Record<Lang, Record<string, string>> = {
     'tray.launching': '{name} (starting)',
     'tray.quit': 'Quit',
     'tray.quitConfirm':
-      '{count} session operation(s) are still unfinished — quitting will interrupt them.',
+      'The AI still has {count} operation(s) in progress — quitting will interrupt them.',
     'tray.quitConfirmOk': 'Quit anyway',
     'tray.updateConfirmOk': 'Restart and install anyway',
     'tray.quitConfirmCancel': 'Cancel',
@@ -116,12 +116,12 @@ const STRINGS: Record<Lang, Record<string, string>> = {
     'tray.openFailedMissing': 'The project file for "{name}" no longer exists',
     'tray.alreadyRunningTitle': 'Project already open',
     'tray.alreadyRunningBody': '"{name}" is already open in Unreal Editor',
-    'tray.pluginFailedTitle': 'Project opened, but the AI cannot connect yet',
-    'tray.pluginFailedBody': 'UnrealAgentLink was not installed — click to see why',
+    'tray.pluginFailedTitle': 'Project opened, but the AI could not connect',
+    'tray.pluginFailedBody': 'UnrealAgentLink failed to install. Click to view details.',
 
     'startup.failedTitle': 'Unreal Box failed to start',
     'startup.failedBody':
-      'An error occurred during startup and the app cannot continue.\n\nReason: {reason}\n\nLogs are in: {logDir}',
+      'An error occurred during startup and the app cannot continue.\n\nReason: {reason}\n\nLog directory: {logDir}',
 
     'dialog.open': 'Choose files or folders',
     'dialog.save': 'Save file',

@@ -27,6 +27,7 @@ import { aigcTools } from './aigc'
 import { taskVideoTools } from './builtin/taskVideo'
 import { engineTools } from './builtin/engines'
 import { projectPackageTools } from './builtin/projectPackage'
+import { createProjectUpdatePluginTool } from './adapted/project/updatePlugin'
 import { createWebTools } from './builtin/web'
 import { createLocalFileTools } from './builtin/localFiles'
 import { createInspectUassetTool } from './builtin/inspectUasset'
@@ -34,7 +35,11 @@ import { createLocalSearchTools } from './builtin/localSearch'
 import { createAddNotebookSourceTool } from './builtin/addNotebookSource'
 import { createSearchNotebookSourcesTool, type NotebookScope } from './builtin/notebookSources'
 import { createBoxTools } from './builtin/box'
-import { createProjectListTool, createProjectWriteTool } from './adapted/project/splitByRisk'
+import {
+  createProjectListTool,
+  createProjectWriteTool,
+  projectManageRisk
+} from './adapted/project/splitByRisk'
 import { createOrganizeProjectsTool } from './adapted/project/organizeProjects'
 import { createLocalWriteTools, createShellTool } from './builtin/localShell'
 import { mcpTools } from './builtin/mcpConnect'
@@ -53,7 +58,9 @@ import {
   extractPackagePaths,
   getLockOwner,
   locksOwnedBy,
-  sameTeam
+  releasePaths,
+  sameTeam,
+  teamRootOf
 } from '../core/assetLock'
 import { enforceAfterWrite, suspendForWrite } from '../core/assetLockEnforcement'
 import { effectiveConnectionId } from '../core/projectTargetContext'
@@ -65,7 +72,9 @@ import {
   SET_SESSION_PROJECT_TOOL_NAME,
   rewriteCrossReferences
 } from './toolNames'
-import type { ToolRisk, UnrealAgentTool } from './defineTool'
+import { UPDATE_PLAN_TOOL_NAME, WRAP_UP_TOOL_NAME } from '../../../shared/agentTurnReport'
+import type { ArchiveSpec, ToolRisk, UnrealAgentTool } from './defineTool'
+import { effectiveRisk } from './defineTool'
 import { materialTools } from './ue-material'
 import { meshTools } from './ue-mesh'
 import { landscapeTools } from './ue-landscape'
@@ -75,6 +84,7 @@ import { assetGuidelinesTool } from './adapted/ue-editor/assetGuidelines'
 import { pcgTools } from './ue-pcg'
 import { sequencerTools } from './ue-sequencer'
 import { inspectTools } from './ue-inspect'
+import { dataTableTools } from './ue-datatable'
 
 // ── V2 工具工厂 ──────────────────────────────────────────────────────────
 import * as noteTools from '../../agent-v3/tools/adapted/note'
@@ -116,7 +126,15 @@ interface Registration {
    */
   needsSender?: boolean
   concurrency?: 'sequential' | 'parallel'
+  /** 按这次的参数降风险（见 `ToolMeta.riskFor`）。工具自己带了的话这里优先 */
+  riskFor?: (args: unknown) => ToolRisk
+  /** 结果太大时存档、只给目录页（见 `ArchiveSpec`） */
+  archive?: ArchiveSpec
 }
+
+/** 带着 `force: true`（丢弃未保存的改动）才算 destructive；不带时插件有未保存就拒绝 */
+const destructiveOnlyWithForce = (args: unknown): ToolRisk =>
+  (args as { force?: unknown } | null)?.force === true ? 'destructive' : 'mutating'
 
 /**
  * 写完一个 SKILL.md 就地体检，报告贴在写入工具的返回值里。
@@ -156,10 +174,13 @@ export function allToolNames(): Set<string> {
   for (const name of BROWSER_TOOL_NAMES) names.add(name)
   // 反问用户同理：在 `resolveTools` 里现造，不进 `buildAllTools()`
   names.add(ASK_USER_TOOL_NAME)
-  // 换会话归属同理。系统提示词和 `open_project` 的返回里都写着让模型调它，
+  // 换对话归属同理。系统提示词和 `open_project` 的返回里都写着让模型调它，
   // 名字不在这儿的话，第一个把这套流程写进 SKILL.md 的人会被体检告知
   // 「引用了不存在的工具」，然后把唯一正确的那句删掉
   names.add(SET_SESSION_PROJECT_TOOL_NAME)
+  // 任务清单、收尾提问同理
+  names.add(UPDATE_PLAN_TOOL_NAME)
+  names.add(WRAP_UP_TOOL_NAME)
   return names
 }
 
@@ -204,7 +225,9 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
     name: 'ue_get_actor',
     namespace: 'ue.actor',
     risk: 'safe',
-    make: () => ueActor.createGetActorTool()
+    make: () => ueActor.createGetActorTool(),
+    // 整关列 Actor 一次就是几百行、六万字符；目录页给名字和类型，属性按编号取
+    archive: { lists: { actors: ['name', 'class', 'path'] } }
   },
   {
     name: 'ue_set_property',
@@ -230,13 +253,25 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
     name: 'blueprint_get_graph',
     namespace: 'ue.blueprint',
     risk: 'safe',
-    make: () => ueBlueprint.createGetBlueprintGraphTool()
+    make: () => ueBlueprint.createGetBlueprintGraphTool(),
+    archive: ueBlueprint.BLUEPRINT_GRAPH_ARCHIVE
   },
   {
     name: 'blueprint_search_nodes',
     namespace: 'ue.blueprint',
     risk: 'safe',
     make: () => ueBlueprint.createSearchBlueprintNodesTool()
+  },
+  /**
+   * 全项目搜「哪些蓝图用了这个名字」（引擎的 Find in Blueprints，不加载蓝图）。
+   * 只读；index_unindexed 只是请编辑器弹它自己的「Index All」确认框，加不加载由用户在框里定。
+   * 分组见 toolSearch.ts：自成按需子组 ue.blueprint.usages，由 C++ 和蓝图编辑两个技能点名
+   */
+  {
+    name: 'blueprint_find_usages',
+    namespace: 'ue.blueprint',
+    risk: 'safe',
+    make: () => ueBlueprint.createFindBlueprintUsagesTool()
   },
   /**
    * 蓝图的写工具**一律 sequential**。
@@ -283,9 +318,10 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
    * 它们不和 apply_graph 争「怎么写一片逻辑」，所以不构成当初要避免的选择负担。
    */
   {
+    // 插件端删节点开在事务里（进 agent 那条撤销栈），ue_undo 撤得回来
     name: 'blueprint_delete_node',
     namespace: 'ue.blueprint',
-    risk: 'destructive',
+    risk: 'mutating',
     concurrency: 'sequential',
     make: () => ueBlueprint.createDeleteBlueprintNodeTool()
   },
@@ -330,6 +366,13 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
     make: () => ueBlueprint.createCreateBlueprintFunctionTool()
   },
   {
+    name: 'blueprint_create_event_graph',
+    namespace: 'ue.blueprint',
+    risk: 'mutating',
+    concurrency: 'sequential',
+    make: () => ueBlueprint.createBlueprintCreateEventGraphTool()
+  },
+  {
     name: 'blueprint_add_variable',
     namespace: 'ue.blueprint',
     risk: 'mutating',
@@ -346,7 +389,7 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
     make: () => ueBlueprint.createSetBlueprintVariableMetaTool()
   },
   {
-    // 删变量不可逆，且会让引用它的节点变成孤儿
+    // 删变量不可逆（插件端没开事务，ue_undo 撤不回），且会让引用它的节点变成孤儿
     name: 'blueprint_remove_variable',
     namespace: 'ue.blueprint',
     risk: 'destructive',
@@ -374,6 +417,9 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
     name: 'blueprint_function_signature',
     namespace: 'ue.blueprint',
     risk: 'destructive',
+    // 加参数只往上加；删参数、删函数没有事务撤不回，仍按 destructive 问
+    riskFor: (args) =>
+      (args as { action?: unknown } | null)?.action === 'add_param' ? 'mutating' : 'destructive',
     concurrency: 'sequential',
     make: () => ueBlueprint.createBlueprintFunctionSignatureTool()
   },
@@ -418,13 +464,17 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
     name: 'ue_content_search',
     namespace: 'ue.content',
     risk: 'safe',
-    make: () => ueContent.createSearchAssetsTool()
+    make: () => ueContent.createSearchAssetsTool(),
+    // 盘点大工程时目录清单和资产列表各能上万字符，留在上下文里之后每一步都要重发
+    archive: { lists: { folders: ['path', 'assets'], results: ['path', 'class'] } }
   },
   {
     name: 'ue_content_describe',
     namespace: 'ue.content',
     risk: 'safe',
-    make: () => ueContent.createDescribeAssetTool()
+    make: () => ueContent.createDescribeAssetTool(),
+    // 一个关卡的依赖动辄两三百个
+    archive: { lists: { dependencies: ['path', 'class'], referencers: ['path', 'class'] } }
   },
   {
     name: 'ue_content_audit_optimization',
@@ -559,15 +609,14 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
    * 插件端给 agent 单开了一条撤销栈（换掉 `GEditor->Trans`），所以这里的
    * 「全撤」是「把 AI 干的全撤了」，撤不到用户手动做的任何操作。
    *
-   * 标 destructive 而不是 mutating：虽然有 redo 可以走回来，但它会一次性
-   * 丢掉用户可能已经认可的一整轮产出。这种事不该在 auto-edit 模式下不问就做。
+   * 标 mutating：只撤 agent 自己的事务，撤错了有 redo 走回来，本身就是可撤销的改动。
    *
    * sequential：并发撤销同一条栈会互相打架。
    */
   {
     name: 'ue_undo',
     namespace: 'ue.editor',
-    risk: 'destructive',
+    risk: 'mutating',
     concurrency: 'sequential',
     make: () => ueEditor.createUndoTool()
   },
@@ -590,7 +639,8 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
    * 重启会丢掉全部未保存改动；清理重定向器会删资产并重写一批引用者。
    * 两个都不可撤销，auto-edit 模式下也要先问一句。
    *
-   * 插件端对重启还有一道脏检查（有未保存就回 409），这里的风险等级是第二道。
+   * 插件端对重启还有一道脏检查（有未保存就回 409），所以重启只在带 force 时
+   * 按 destructive 问；不带 force 时丢不了东西，按 mutating 走。
    */
   /**
    * 试玩：把游戏跑起来看它到底能不能跑。
@@ -624,6 +674,17 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
     concurrency: 'sequential',
     make: () => ueInput.createInjectInputTool()
   },
+  /**
+   * 加按键映射：写 IMC / InputAction 资产，或旧输入系统的 DefaultInput.ini。
+   * sequential —— 两次并发写同一个 IMC，后存的那次会把前一次的映射盖掉。
+   */
+  {
+    name: 'ue_input_add_mapping',
+    namespace: 'ue.input',
+    risk: 'mutating',
+    concurrency: 'sequential',
+    make: () => ueInput.createInputAddMappingTool()
+  },
   {
     name: 'ue_playtest',
     namespace: 'ue.editor',
@@ -648,6 +709,8 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
     name: 'ue_restart_editor',
     namespace: 'ue.editor',
     risk: 'destructive',
+    // 不带 force 时有未保存插件就拒绝，丢不了东西
+    riskFor: destructiveOnlyWithForce,
     concurrency: 'sequential',
     make: () => ueEditor.createRestartEditorTool()
   },
@@ -655,7 +718,7 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
     name: 'ue_fixup_redirectors',
     namespace: 'ue.content',
     risk: 'destructive',
-    // dry_run 按 safe 算（工具自己的 riskFor），预演上点的「本次会话都允许」放不过真正的那次
+    // dry_run 按 safe 算（工具自己的 riskFor），预演上点的「本对话内都允许」放不过真正的那次
     concurrency: 'sequential',
     make: () => ueEditor.createFixupRedirectorsTool()
   },
@@ -687,16 +750,17 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
     make: () => ueLevel.createSaveLevelTool()
   },
   /**
-   * 打开 / 新建关卡标 destructive。
+   * 打开 / 新建关卡声明 destructive（最坏情况），实际按参数算。
    *
-   * 它们会丢弃全部未保存的改动，且**无法撤销** —— 这是整套工具里少数几个
-   * 能让用户直接损失工作的操作。插件端在有脏改动时默认拒绝并回 409，
-   * 这里的风险等级保证 auto-edit 模式下也会先问一句。
+   * 带 force 时它们会丢弃全部未保存的改动，且**无法撤销**。不带 force 时插件端
+   * 在有脏改动时拒绝并回 409，丢不了东西 —— 所以只有 force 那次按 destructive 问。
    */
   {
     name: 'ue_open_level',
     namespace: 'ue.level',
     risk: 'destructive',
+    // 不带 force 时有未保存插件就拒绝（409），丢不了东西
+    riskFor: destructiveOnlyWithForce,
     concurrency: 'sequential',
     make: () => ueLevel.createOpenLevelTool()
   },
@@ -704,6 +768,11 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
     name: 'ue_new_level',
     namespace: 'ue.level',
     risk: 'destructive',
+    // 同上；但 save_as 会直接盖掉同路径的已有关卡（插件不查），给了就仍按 destructive 问
+    riskFor: (args) =>
+      (args as { save_as?: unknown } | null)?.save_as
+        ? 'destructive'
+        : destructiveOnlyWithForce(args),
     concurrency: 'sequential',
     make: () => ueLevel.createNewLevelTool()
   },
@@ -878,13 +947,38 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
     concurrency: 'sequential',
     make: () => ueWidget.setPropertyTool()
   },
+  /**
+   * 改现成的界面：原地换控件、删控件。
+   *
+   * 控件工具原来只有「往里加」，用户说「把登录按钮换成导航那种」时，调用方只能
+   * 在旁边再加一个，然后让用户自己去编辑器里删旧的、接事件。
+   *
+   * 两个都是 mutating：插件端开在事务里，ue_undo 撤得回来；删除碰到图表引用
+   * 默认拒绝，替换碰到接不上的事件也拒绝，都要调用方显式确认。
+   */
+  {
+    name: 'widget_replace',
+    namespace: 'ue.widget',
+    risk: 'mutating',
+    concurrency: 'sequential',
+    make: () => ueWidget.replaceWidgetTool()
+  },
+  {
+    name: 'widget_remove',
+    namespace: 'ue.widget',
+    risk: 'mutating',
+    concurrency: 'sequential',
+    make: () => ueWidget.removeWidgetTool()
+  },
 
   // ── 资产库（盒子本地，不依赖引擎连接）────────────────────────────────
   {
     name: 'search_assets',
     namespace: 'asset',
     risk: 'safe',
-    make: () => assetTools.createSearchAssetsTool()
+    make: () => assetTools.createSearchAssetsTool(),
+    // 一页最多几百个资产、每行十来个字段，真实会话里单次到过 17.8 万字符
+    archive: { lists: { assets: ['name', 'type', 'path', 'vault', 'engineVersion'] } }
   },
   // 「我库里有什么」不能靠翻页去数。几十万个资产的库里，search_assets 一页 100 个，
   // 调用方拿到的只会是按名字排在最前的那一百个，然后拿它们总结全库 —— 错得看不出来。
@@ -898,7 +992,7 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
   // 读跨库、写不跨库（见 adapted/asset/vaultScope.ts）。于是「东西在另一个库里，
   // 但改动只能在活跃库做」这一幕必然会撞上，出路只有换库 —— 而换库是用户的决定：
   // 应用整个界面会跟着换。所以定成 mutating 走审批门，用户可以放行一次，
-  // 也可以点「本会话都允许」让它以后自己切。
+  // 也可以点「本对话内都允许」让它以后自己切。
   {
     name: 'switch_vault',
     namespace: 'asset',
@@ -1008,13 +1102,12 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
     risk: 'destructive',
     make: () => assetTools.createDeleteTagsTool()
   },
-  // 软删除（进回收站、能恢复、不动磁盘文件），但仍然登记成 destructive：
-  // auto-edit 档位下也要问一次。删错的代价不是「改回来」而是用户得自己去
-  // 回收站里认哪条是他的 —— 而 assetKey 认错人的时候，名字看起来是一样的。
+  // 软删除（进回收站、能恢复、不动磁盘文件），restore_assets 就能原样捞回来，
+  // 是可撤销的改动，登记成 mutating。
   {
     name: 'delete_assets',
     namespace: 'asset',
-    risk: 'destructive',
+    risk: 'mutating',
     make: () => assetTools.createDeleteAssetsTool()
   },
   // 恢复和删除必须同时存在。只给删不给恢复，等于让用户在没有撤销键的编辑器里
@@ -1043,11 +1136,11 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
     risk: 'mutating',
     make: () => assetTools.createRenameFolderTool()
   },
-  // 删文件夹连里面的资产一起软删 —— 影响面比删单个资产大，永远要问
+  // 删文件夹连里面的资产一起软删，restore_folders 连目录树一起恢复 —— 同样可撤销
   {
     name: 'delete_folders',
     namespace: 'asset',
-    risk: 'destructive',
+    risk: 'mutating',
     make: () => assetTools.createDeleteFoldersTool()
   },
   // delete_folders 的撤销键。删文件夹连里面的资产一起带走，而 restore_assets
@@ -1073,12 +1166,21 @@ const REGISTRATIONS: readonly Registration[] = Object.freeze([
     name: 'project_list',
     namespace: 'project',
     risk: 'safe',
-    make: () => createProjectListTool()
+    make: () => createProjectListTool(),
+    // list_templates 一次回 300 个模板（约 10 万字符），模型只挑其中一个
+    archive: {
+      lists: {
+        templates: ['name', 'templateKey', 'category', 'engineVersion'],
+        projects: ['name', 'projectKey', 'engineVersion', 'path']
+      }
+    }
   },
   {
     name: 'project_manage',
     namespace: 'project',
     risk: 'destructive',
+    // 只往外加东西的动作按 mutating 走，见 `splitByRisk.ts` 的 projectManageRisk
+    riskFor: projectManageRisk,
     /*
      * 串行，因为 `open_project` 会**改掉这一轮的目标工程**
      * （见 `adapted/project/awaitProjectLive.ts`）。
@@ -1164,6 +1266,10 @@ export function listToolRisks(): Record<string, ToolRisk> {
     table[tool.name] = tool.unrealBox.risk
   }
 
+  for (const tool of dataTableTools()) {
+    table[tool.name] = tool.unrealBox.risk
+  }
+
   table[assetGuidelinesTool.name] = assetGuidelinesTool.unrealBox.risk
 
   for (const tool of engineTools) {
@@ -1177,6 +1283,9 @@ export function listToolRisks(): Record<string, ToolRisk> {
   for (const tool of projectPackageTools()) {
     table[tool.name] = tool.unrealBox.risk
   }
+  // 装 / 更新插件会关掉再重开编辑器，同样不在 REGISTRATIONS 里
+  const updatePlugin = createProjectUpdatePluginTool()
+  table[updatePlugin.name] = updatePlugin.unrealBox.risk
 
   for (const tool of aigcTools()) {
     table[tool.name] = tool.unrealBox.risk
@@ -1266,9 +1375,9 @@ const VALID_TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/
 export interface BuildToolsDeps {
   sender?: WebContents
   /**
-   * 这条会话绑着的知识库。
+   * 这条对话绑着的知识库。
    *
-   * 只有绑了才注册检索工具：没绑的会话给出这个工具，模型调了只能拿到
+   * 只有绑了才注册检索工具：没绑的对话给出这个工具，模型调了只能拿到
    * 一句「没有知识库」—— 那是白费一步，而且看上去像功能坏了。
    * `'all'` 是全盒子范围（外部 MCP 会话），见 `NotebookScope`。
    */
@@ -1306,6 +1415,8 @@ export function buildAllTools(deps: BuildToolsDeps = {}): UnrealAgentTool<never>
       name: reg.name,
       namespace: reg.namespace,
       risk: reg.risk,
+      ...(reg.riskFor ? { riskFor: reg.riskFor } : {}),
+      ...(reg.archive ? { archive: reg.archive } : {}),
       description: rewriteCrossReferences(v2.description ?? reg.name),
       ...(reg.concurrency ? { concurrency: reg.concurrency } : {})
     })
@@ -1332,6 +1443,8 @@ export function buildAllTools(deps: BuildToolsDeps = {}): UnrealAgentTool<never>
     // 内容浏览器整理（content.naming_audit / batch_move / dependencies / migrate）。
     // 同样走 C++；ue_content_move 从 REGISTRATIONS 里的单资产适配件换成了这里的批量版
     ...contentOrganizeTools(),
+    // 数据表（datatable.*）：读列和行、批量改格子 / 加删改名行。走 C++，不让模型现写 Python
+    ...dataTableTools(),
     // 资产自带的「资产指南」（CitySample 那几个「缺失项目设置」弹框）：查 + 一次改好
     assetGuidelinesTool as unknown as UnrealAgentTool<never>,
     // C++ 工作流（cpp.*）。目前只有两个只读工具：探测编译能力、列模块。
@@ -1341,6 +1454,8 @@ export function buildAllTools(deps: BuildToolsDeps = {}): UnrealAgentTool<never>
     ...engineTools,
     // 打包成可执行文件、拿打包版冒烟。不依赖编辑器，所以不在 ue.* 下（断开引擎时也能用）
     ...projectPackageTools(),
+    // 装 / 更新工程里的插件。插件太旧或没装上时引擎正连不上，所以同样不在 ue.* 下
+    createProjectUpdatePluginTool() as unknown as UnrealAgentTool<never>,
     // 会话体检。命名空间在 `ue.system` 下，但它**不依赖引擎连接** ——
     // 进程检测在盒子这一侧做，所以它同时进了 `createAgent.ts` 的
     // `OFFLINE_UE_TOOLS` 豁免名单：连不上的时候正是最需要它的时候。
@@ -1363,7 +1478,7 @@ export function buildAllTools(deps: BuildToolsDeps = {}): UnrealAgentTool<never>
     // 外部 MCP 客户端靠它看见盒子，见 builtin/box.ts
     ...createBoxTools(),
     // 检索只能搜当前绑定的知识库（外部会话是全部）；存来源在未绑定时会新建知识库。
-    // 两者都不进 cache —— 每条会话绑的库不一样；存来源还需要 sender 通知界面刷新。
+    // 两者都不进 cache —— 每条对话绑的库不一样；存来源还需要 sender 通知界面刷新。
     ...((deps.notebook
       ? [createSearchNotebookSourcesTool(deps.notebook)]
       : []) as unknown as UnrealAgentTool<never>[]),
@@ -1452,6 +1567,10 @@ function withAssetLock(tool: UnrealAgentTool<never>): UnrealAgentTool<never> {
       // 没人释放，那才是真会卡死用户的东西
       const owner = getLockOwner()
       if (!owner) return inner(toolCallId, params, signal, onUpdate)
+      // 这一次调用只读（riskFor 降成 safe，比如只查不改）：不占锁、不翻只读位
+      if (effectiveRisk(tool.unrealBox, params) === 'safe') {
+        return inner(toolCallId, params, signal, onUpdate)
+      }
 
       /*
        * 工作室模式（`editorKeyActive()`）两处不一样，都是 2026-09-26 真机反馈逼出来的：
@@ -1490,8 +1609,32 @@ function withAssetLock(tool: UnrealAgentTool<never>): UnrealAgentTool<never> {
       //
       // 走**软锁**：只挡另一条 AI 会话、只出提示，不翻只读位。用户在主视口里
       // 干活是常态，把关卡的手动保存也拦下来，代价和收益完全不成比例。
-      if (LEVEL_SCOPED_NAMESPACES.has(tool.unrealBox.namespace)) {
-        await lock([CURRENT_LEVEL_LOCK], true)
+      const levelScoped = LEVEL_SCOPED_NAMESPACES.has(tool.unrealBox.namespace)
+      if (levelScoped) {
+        try {
+          await lock([CURRENT_LEVEL_LOCK], true)
+        } catch (error) {
+          // 制作人的锁只占这一次调用（见下）：关卡锁没拿到、这次不调了，先拿到的路径锁一并放掉
+          if (team && teamRootOf(owner) === owner) {
+            releasePaths(effectiveConnectionId(), owner, paths)
+          }
+          throw error
+        }
+      }
+
+      // 工作室模式的制作人：它那一轮就是整局，锁跟着一轮走的话，它碰过的资产和「当前关卡」
+      // 到交付前队友都改不了（撞上去等 90 秒再失败）。制作人的锁只占这一次调用；
+      // 队员照旧占到这件活交回（`releaseAll` 在派活的 finally 里）。团队里全是软锁，
+      // 不翻只读位，所以这里不用管下面那一开一合
+      if (team && teamRootOf(owner) === owner) {
+        try {
+          return await inner(toolCallId, params, signal, onUpdate)
+        } finally {
+          releasePaths(effectiveConnectionId(), owner, [
+            ...paths,
+            ...(levelScoped ? [CURRENT_LEVEL_LOCK] : [])
+          ])
+        }
       }
 
       // 开合的范围是**这条会话手上的全部锁**，不是这次调用参数里那几个 ——

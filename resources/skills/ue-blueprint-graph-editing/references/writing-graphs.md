@@ -1,8 +1,8 @@
 # Writing graphs — wiring, layout, atomicity, repair
 
-Details behind step 4 of the chain in `SKILL.md`. Read this when a write is more than a
-single fresh graph: inserting into existing logic, or a call came back with warnings or
-compile errors.
+Details behind "Writing" in `SKILL.md`. Read this when a write is more than a single fresh
+graph: inserting into existing logic, a call came back with warnings or compile errors, or
+the logic compiles and nothing happens in play.
 
 ## Contents
 
@@ -13,6 +13,7 @@ compile errors.
 - All or nothing
 - Read the warnings
 - Compiling and repairing
+- Compiled, but nothing happens
 
 ---
 
@@ -151,6 +152,35 @@ Fix the named node and re-send the complete graph. Do not re-send unchanged inpu
 
 Warnings alone are fine — the Blueprint compiles and saves. Relay the warning to the
 user rather than trying to "fix" something that is not an error. `InputAction` nodes
-warn when the action is not in the project's input settings; either ask the user to add
-the mapping, or drive the logic from an event that needs no configuration
-(`ReceiveBeginPlay`, an overlap event) and say why you switched.
+warn when the action is not in the project's input settings: add the mapping with
+`ue_input_add_mapping` (`system: "legacy"`, `name` = the node's action name) instead of
+handing it to the user. For Enhanced Input use an `EnhancedInputAction` node and add the
+key to the project's IMC with the same tool.
+
+## Compiled, but nothing happens
+
+Find the hop that fails before changing any logic.
+
+1. **Probe every hop in one run.** In one `blueprint_apply_graph` call, add a `PrintString`
+   with a distinct string at the event's entry, on each Branch outcome and just before the
+   action (`"door: overlap"`, `"door: not player"`, `"door: opening"`). One `ue_playtest` —
+   or `ue_autoplay` when a key press starts it — shows how far execution got. One probe per
+   run costs a whole playtest per hop.
+2. **The entry never prints — the event never fired.** Usual causes:
+   - Overlap: *both* components need Generate Overlap Events, and neither collision preset
+     may Ignore the other's object type. Read both sides with `ue_inspect_components`
+     (collision preset, `bGenerateOverlapEvents`); one side being right is not enough.
+   - Hit on a physics-simulated body: needs Simulation Generates Hit Events
+     (`BodyInstance.bNotifyRigidBodyCollision`).
+   - Input on an actor that is neither the possessed pawn nor the PlayerController: it
+     receives nothing until `Actor.EnableInput` runs with the player controller.
+   - Enhanced Input: an Input Action only fires while its Input Mapping Context is added to
+     the local player — check that something calls Add Mapping Context at runtime.
+   - The actor is not in the level, or the placed one is another class: `ue_get_actor` with
+     `filter.class`.
+3. **Entry prints, a later probe does not** — the Branch in between went the other way.
+   Print the condition's inputs; a failed Cast (the overlapping actor is not the class you
+   expected) is the common one.
+4. **`errors` has "Accessed None"** — a reference was empty at runtime, typically an
+   instance-editable reference never set on the placed actor (`ue_get_actor` with
+   `properties` reads it).

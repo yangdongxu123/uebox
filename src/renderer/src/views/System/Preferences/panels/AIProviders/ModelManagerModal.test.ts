@@ -42,7 +42,7 @@ function makeState(
     models: [...models]
   })
 
-  return {
+  const state = {
     draft,
     providers: computed(() => [
       {
@@ -70,6 +70,7 @@ function makeState(
     testing: ref(false),
     selectedId: ref('p1'),
     configPath: computed(() => '/tmp/models.json'),
+    catalog: ref([]),
     selectProvider: vi.fn(),
     cancelEdit: vi.fn(),
     save: vi.fn(),
@@ -78,6 +79,15 @@ function makeState(
     importModels: vi.fn(),
     ...overrides
   } as unknown as AiProvidersState
+  // 树列的是启用加停用的；没单独给就跟 providers 一样，全部启用
+  return Object.assign(
+    {
+      managedProviders: state.providers,
+      disabledIds: computed(() => new Set<string>()),
+      setEnabled: vi.fn(async () => ({ ok: true }))
+    },
+    state
+  )
 }
 
 function mountManager(state: AiProvidersState): VueWrapper {
@@ -88,6 +98,21 @@ function mountManager(state: AiProvidersState): VueWrapper {
 }
 
 describe('ModelManagerModal 的树', () => {
+  it('停用的来源仍在树上，开关关着；拨开关调 setEnabled', async () => {
+    const state = makeState([], { disabledIds: computed(() => new Set(['p2'])) })
+    const wrapper = mountManager(state)
+
+    const rows = wrapper.findAll('.tree-provider-row')
+    expect(rows.map((row) => row.find('.tree-provider').classes('off'))).toEqual([false, true])
+    expect(rows.map((row) => row.find('[role="switch"]').attributes('aria-checked'))).toEqual([
+      'true',
+      'false'
+    ])
+
+    await rows[1].find('[role="switch"]').trigger('click')
+    expect(state.setEnabled).toHaveBeenCalledWith('p2', true)
+  })
+
   it('默认显示 Provider 面板，不是某个模型', () => {
     const wrapper = mountManager(makeState([{ id: 'a' }]))
 
@@ -153,6 +178,33 @@ describe('ModelManagerModal 的树', () => {
 
     expect(state.draft.value!.models).toHaveLength(2)
     expect(wrapper.find('.model-pane').text()).toBe('1')
+  })
+
+  it('目录里新出的预置模型给一行，点了加进草稿、聚焦到第一个', async () => {
+    const state = makeState([{ id: 'old' }], {
+      catalog: ref([
+        {
+          id: 'p1',
+          displayName: 'P1',
+          group: 'cloud',
+          kind: 'chat',
+          protocol: 'openai-completions',
+          baseUrl: 'https://a/v1',
+          requiresApiKey: true,
+          hasLogo: false,
+          models: [{ id: 'new', displayName: 'New' }, { id: 'old' }]
+        }
+      ])
+    })
+    const wrapper = mountManager(state)
+
+    const rows = wrapper.findAll('.tree-add')
+    expect(rows).toHaveLength(2)
+    await rows[1].trigger('click')
+
+    expect(state.draft.value!.models.map((m) => m.id)).toEqual(['new', 'old'])
+    expect(wrapper.find('.model-pane').text()).toBe('0')
+    expect(wrapper.findAll('.tree-add')).toHaveLength(1)
   })
 
   /** 树上没填 id 的新模型不能是一行空白，否则根本点不着 */
@@ -352,6 +404,8 @@ describe('ModelManagerModal 的删除按钮', () => {
   })
 
   it('选中 Provider 时，删除按钮才删整条 Provider', async () => {
+    // 删之前先问主进程有几个对话在用它（确认框里要说），这里没有对话在用
+    vi.stubGlobal('api', { aiProvider: { usage: vi.fn().mockResolvedValue(0) } })
     const state = makeState([{ id: 'a' }], {
       remove: vi.fn().mockResolvedValue({ ok: true })
     })
@@ -359,9 +413,11 @@ describe('ModelManagerModal 的删除按钮', () => {
     const confirm = captureConfirm()
 
     await wrapper.find('.detail-actions .app-button--danger').trigger('click')
+    await flushPromises()
     await confirm.ok()
 
     expect(state.remove).toHaveBeenCalledWith('p1')
+    vi.unstubAllGlobals()
   })
 
   /** 文案得写明删的是谁，否则两个确认框长得一样，用户凭位置猜 */

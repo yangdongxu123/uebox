@@ -1,5 +1,5 @@
 /**
- * 主窗口 ⇄ 独立聊天窗口的对话同步（接线部分；计算在 `chatWindowSyncCore.ts`）。
+ * 主窗口 ⇄ 独立对话窗口的对话同步（接线部分；计算在 `chatWindowSyncCore.ts`）。
  *
  * ## 分工
  *
@@ -9,7 +9,7 @@
  * - 落盘只由主窗口写。独立窗口的对话存储是只读的，它的改动靠补丁交给主窗口去存。
  *
  * 所以两边都能显示、都能发消息（谁发谁就成了那一轮的发起者），也都能停止和审批
- * （主进程按会话找，不认窗口）。
+ * （停止按内核 session 找，审批按工具调用 id 找，主进程都不认窗口）。
  *
  * ## 同步哪些对话
  *
@@ -149,24 +149,30 @@ export function createChatWindowSync(options: ChatWindowSyncOptions): { flushAll
   /**
    * 独立窗口拿到主窗口那份全量之前**一个补丁都不发**。
    *
-   * 它此刻手里的是盘上读来的，最多落后主窗口两秒；页面挂载时随手改一下会话
+   * 它此刻手里的是盘上读来的，最多落后主窗口两秒；页面挂载时随手改一下对话
    * （开关模式、建消息容器），就会把这份旧的当成改动发过去，盖掉主窗口里正在打字的
    * 那条。全量一到，这边被整份换掉，之前攒的改动也就不算数了。
    */
   let ready = role === 'main'
 
-  function track(sid: string): SidState {
+  function track(sid: string, initialDirty: SidState['dirty'] = 'all'): SidState {
     let state = tracked.get(sid)
     if (!state) {
-      state = { known: emptyKnownState(), dirty: 'all', timer: null }
+      state = { known: emptyKnownState(), dirty: initialDirty, timer: null }
       tracked.set(sid, state)
     }
     return state
   }
 
-  /** 独立窗口管的对话：它开着的那条，加上那通电话派生的任务对话 */
+  /**
+   * 独立窗口里新建的对话（分支就是这么来的）。主窗口手里没有它，这边的就是唯一一份，
+   * 和自己开着的那条一样整份同步过去，不然存盘和主窗口都看不到它
+   */
+  const createdHere = new Set<string>()
+
+  /** 独立窗口管的对话：它开着的那条，加上那通电话派生的任务对话，以及在这里新建的 */
   function owns(sid: string): boolean {
-    return role === 'chat-window' && belongsToChat(sid, ownSid)
+    return role === 'chat-window' && (belongsToChat(sid, ownSid) || createdHere.has(sid))
   }
 
   /**
@@ -179,8 +185,14 @@ export function createChatWindowSync(options: ChatWindowSyncOptions): { flushAll
   function syncable(sid: unknown): sid is string {
     if (typeof sid !== 'string' || !sid) return false
     if (tracked.has(sid)) return true
-    if (!owns(sid) && !(role === 'chat-window' && streamStore.getStream(sid))) return false
-    track(sid)
+    if (owns(sid)) {
+      track(sid)
+      return true
+    }
+    if (!(role === 'chat-window' && streamStore.getStream(sid))) return false
+    // 不归这个窗口的对话：它手里那份是开窗时从盘上读的旧样子，不能整份发过去当真相，
+    // 只发这一轮动到的那几条（见 flush 里对它的裁剪）
+    track(sid, new Set())
     return true
   }
 
@@ -218,6 +230,17 @@ export function createChatWindowSync(options: ChatWindowSyncOptions): { flushAll
     const dirty = state.dirty
     state.dirty = new Set()
     const patch = buildPatch(sid, localState(sid), state.known, dirty, full)
+    if (patch && role === 'chat-window' && !owns(sid)) {
+      // 顺序、会话记录、草稿都以主窗口为准：带过去会把主窗口新加的消息和改动冲掉
+      delete patch.full
+      delete patch.order
+      delete patch.session
+      delete patch.permissionMode
+      delete patch.draft
+      delete patch.historySummary
+      delete patch.compressedUserCount
+      if (!patch.messages?.length) return
+    }
     if (patch) bridge.push(patch)
   }
 
@@ -239,7 +262,7 @@ export function createChatWindowSync(options: ChatWindowSyncOptions): { flushAll
   }
 
   /**
-   * 只有会话记录、档位、草稿这些变了：消息一条都不用比。
+   * 只有对话记录、档位、草稿这些变了：消息一条都不用比。
    *
    * 草稿每敲一个字变一次，这时候把一条长对话的每条消息都序列化一遍纯属浪费。
    */
@@ -267,14 +290,21 @@ export function createChatWindowSync(options: ChatWindowSyncOptions): { flushAll
 
   chatStore.$onAction(({ name, args, after }) => {
     if (applying || READ_ONLY_ACTIONS.test(name) || name === 'applySyncSession') return
+    if (role === 'chat-window' && name === 'createSession' && typeof args[0] === 'string') {
+      createdHere.add(args[0])
+    }
+    // 删的是哪几条只看参数本身。认不出时的「每条都比一遍」不能拿来判删除：
+    // 独立窗口里还没发过消息的新对话本来就没有会话记录，会被当成删掉的关掉
+    const removing =
+      name === 'removeSession' || name === 'removeSessions'
+        ? new Set(
+            (Array.isArray(args[0]) ? args[0] : [args[0]]).filter((id) => typeof id === 'string')
+          )
+        : null
     after(() => {
       for (const sid of sessionActionTargets(args)) {
         // 主窗口把开在独立窗口里的那条删了：告诉那边，它会关掉自己
-        if (
-          role === 'main' &&
-          (name === 'removeSession' || name === 'removeSessions') &&
-          !chatStore.sessionById(sid)
-        ) {
+        if (role === 'main' && removing?.has(sid) && !chatStore.sessionById(sid)) {
           bridge.push({ sid, deleted: true })
           untrack(sid)
           continue
@@ -285,17 +315,17 @@ export function createChatWindowSync(options: ChatWindowSyncOptions): { flushAll
   })
 
   /**
-   * 会话这边的 action 动到了哪几条被同步的对话。
+   * 对话这边的 action 动到了哪几条被同步的对话。
    *
-   * 大多数第一个参数就是会话 id；也有按别的东西批量改的（`renameProject` 按工程名），
-   * 认不出来就每条都比一遍 —— 没变的不会发，比一遍也只比会话记录那几个字段。
+   * 大多数第一个参数就是对话 id；也有按别的东西批量改的（`renameProject` 按工程名），
+   * 认不出来就每条都比一遍 —— 没变的不会发，比一遍也只比对话记录那几个字段。
    */
   function sessionActionTargets(args: unknown[]): string[] {
     const first = args[0]
     if (Array.isArray(first)) return first.filter(syncable)
     if (typeof first === 'string') {
       if (syncable(first)) return [first]
-      // 别的、没被同步的会话
+      // 别的、没被同步的对话
       if (chatStore.sessionById(first)) return []
     }
     return [...tracked.keys()]
@@ -385,9 +415,9 @@ export function createChatWindowSync(options: ChatWindowSyncOptions): { flushAll
   installBusyElsewhere()
 
   /**
-   * 独立窗口把自己那条对话的内核会话 id 报给主进程。
+   * 独立窗口把自己那条对话的内核 session id 报给主进程。
    *
-   * 主进程只认内核会话 id：审批该多弹给谁，要靠它找到这个窗口。这个 id 第一条消息
+   * 主进程只认内核 session id：审批该多弹给谁，要靠它找到这个窗口。这个 id 第一条消息
    * 发出去才有、清空对话会换，所以盯着它变。第一次拿到时顺带要一遍待审批 ——
    * 拖出来那一刻主窗口那边可能正弹着确认框。
    */
@@ -407,7 +437,7 @@ export function createChatWindowSync(options: ChatWindowSyncOptions): { flushAll
   /**
    * 「这条对话在别的窗口里跑着」。
    *
-   * 主进程报的是内核会话 id，判忙按的是对话 id，所以在这里对一下。会话记录里的
+   * 主进程报的是内核 session id，判忙按的是对话 id，所以在这里对一下。对话记录里的
    * 内核 id 也会变（同步过来的、刚发出第一条的），一起盯着。
    */
   function installBusyElsewhere(): void {

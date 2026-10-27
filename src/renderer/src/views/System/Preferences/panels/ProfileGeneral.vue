@@ -14,7 +14,7 @@ const language = ref<'zh-CN' | 'en-US'>(getLocale() as 'zh-CN' | 'en-US')
  * 同步到主进程的那一步在 `setLocale()` 里面做，这里不用再推一遍。
  *
  * 原来是在这里推的，于是首次启动的语言门（它只调 setLocale）就漏了 —— 新用户
- * 选了 English，第一次会话的托盘和原生对话框仍是中文。挪进 setLocale 之后，
+ * 选了 English，首次运行时的托盘和原生对话框仍是中文。挪进 setLocale 之后，
  * 任何调用方都不会再漏。
  */
 watch(language, async (newLocale) => {
@@ -28,7 +28,7 @@ watch(language, async (newLocale) => {
   )
 })
 
-const autoLaunch = ref(true)
+const autoLaunch = ref(false)
 /**
  * 通知三项。真相源在主进程（`appSettingsManager`）——判定发生在那边的
  * `services/agentNotifications`，渲染层这份只是给控件做双向绑定用的镜像。

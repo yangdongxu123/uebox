@@ -83,7 +83,8 @@
         <AppAlert
           v-if="
             libraryStore.isServer &&
-            (libraryStore.signedOut || libraryStore.activeStatus?.online === false)
+            (libraryStore.signedOut ||
+              (libraryStore.activeStatus?.online === false && !libraryCaps.team))
           "
           type="warning"
           show-icon
@@ -94,9 +95,11 @@
           <template #message>
             <div class="server-library-banner-row">
               <span>{{
-                libraryStore.signedOut
-                  ? t('catalogLibrary.view.signedOut')
-                  : t('catalogLibrary.view.offlineBanner')
+                libraryCaps.team
+                  ? t('teamProject.state.signedOut')
+                  : libraryStore.signedOut
+                    ? t('catalogLibrary.view.signedOut')
+                    : t('catalogLibrary.view.offlineBanner')
               }}</span>
               <AppButton
                 size="small"
@@ -112,6 +115,9 @@
             </div>
           </template>
         </AppAlert>
+
+        <!-- 团队工程的横幅：一次一条（连不上 > 在看旧版 > 冻结中 > 工程不在本机），方案 2.11 -->
+        <TeamBanner v-if="libraryCaps.team && !libraryStore.signedOut" />
 
         <AppAlert
           v-if="pendingImportRecoveryNotice"
@@ -213,12 +219,8 @@
                   displayBreadcrumbItems.last.name
                 }}</span>
               </div>
-              <div v-if="assetViewStore.mode === 'baiduyun'" class="current-dir-text">
-                {{ t('assetLib.ui.currentDir') }}{{ baiduyunStore.currentDir }}
-              </div>
-              <div v-if="assetViewStore.mode === 'tagManagement'" class="current-dir-text">
-                {{ t('assetLib.ui.tagManagement') }}
-              </div>
+              <!-- 团队工程：面包屑右端按需出现「主线 ▾」「最新 ▾」（方案 4.5） -->
+              <TeamVersionPill v-if="libraryCaps.team" />
             </div>
 
             <!--
@@ -229,7 +231,7 @@
             <!-- 有关键词就一直摊开：正在生效的筛选不能藏在图标后面 -->
             <div
               class="search-controls"
-              :class="{ expanded: searchExpanded || !!filterForm.keyword }"
+              :class="{ expanded: searchExpanded || !!filterForm.keyword || teamPageActive }"
             >
               <button
                 class="search-icon-btn"
@@ -238,7 +240,20 @@
               >
                 <PhMagnifyingGlass />
               </button>
-              <div v-if="canQueryCurrentList" class="search-field">
+              <div v-if="teamPageActive" class="search-field">
+                <a-input
+                  v-model:value="teamStore.query"
+                  :placeholder="t('teamProject.activity.searchPlaceholder')"
+                  class="search-input"
+                  allow-clear
+                  data-testid="team-search"
+                >
+                  <template #prefix>
+                    <PhMagnifyingGlass />
+                  </template>
+                </a-input>
+              </div>
+              <div v-else-if="canQueryCurrentList" class="search-field">
                 <a-input
                   ref="searchInputRef"
                   v-model:value="filterForm.keyword"
@@ -259,7 +274,8 @@
 
           <!-- 工具栏区域 -->
           <div class="command-bar">
-            <div class="left-actions">
+            <!-- 团队工程的几页（动态、对比……）里排序、筛选、标签管理按钮隐藏（方案 4.8） -->
+            <div v-show="!teamPageActive" class="left-actions">
               <AppDropdown
                 v-if="canQueryCurrentList"
                 v-model:open="sortDropdownVisible"
@@ -424,7 +440,7 @@
                 />
               </div>
               <button
-                v-if="isShowingDeleted"
+                v-if="isShowingDeleted && !libraryCaps.team"
                 class="action-btn danger"
                 :title="
                   isHttpNetworkVault
@@ -450,7 +466,7 @@
           </div>
 
           <AssetFilterBar
-            v-if="canQueryCurrentList"
+            v-if="canQueryCurrentList && !teamPageActive"
             v-model:file-category="filterForm.fileCategory"
             v-model:asset-types="filterForm.assetTypes"
             v-model:size-range="filterForm.sizeRange"
@@ -474,7 +490,9 @@
           <!-- 拖拽覆盖层 -->
           <DragDropOverlay :visible="isDragOver" />
 
-          <div class="file-list-section">
+          <TeamCenter v-if="teamPageActive" @open-path="handleTeamOpenPath" />
+          <TeamEmptyProject v-else-if="libraryCaps.team && teamStore.isEmpty" />
+          <div v-else class="file-list-section">
             <AssetFileList
               ref="assetFileListRef"
               :current-path="currentPath"
@@ -633,10 +651,23 @@
           @close="serverImportOpen = false"
         />
         <CatalogSignInModal
-          :open="serverSignInOpen"
+          :open="serverSignInOpen && !libraryCaps.team"
           :server="libraryStore.activeServer?.server ?? null"
           @close="serverSignInOpen = false"
           @signed-in="handleServerSignedIn"
+        />
+        <!-- 团队工程：重新登录就是「加入团队」那个框，账号已填好（方案 4.2） -->
+        <TeamJoinModal
+          :open="serverSignInOpen && Boolean(libraryCaps.team)"
+          :relogin="libraryStore.activeServer?.server ?? null"
+          @close="serverSignInOpen = false"
+          @signed-in="handleServerSignedIn"
+        />
+        <TeamDialogs v-if="libraryCaps.team" />
+        <TeamDeliverModal
+          :open="teamDeliverFiles.length > 0"
+          :files="teamDeliverFiles"
+          @close="teamDeliverFiles = []"
         />
       </div>
 
@@ -1025,6 +1056,15 @@ import { useAssetLibraryStore } from '../../store/modules/assetLibraryStore'
 import { getActiveLibrarySource } from './data/activeLibrarySource'
 import CatalogImportModal from './catalog/CatalogImportModal.vue'
 import CatalogSignInModal from './catalog/CatalogSignInModal.vue'
+import TeamBanner from './team/TeamBanner.vue'
+import TeamCenter from './team/TeamCenter.vue'
+import TeamDialogs from './team/TeamDialogs.vue'
+import TeamDeliverModal from './team/TeamDeliverModal.vue'
+import TeamEmptyProject from './team/TeamEmptyProject.vue'
+import TeamJoinModal from './team/TeamJoinModal.vue'
+import TeamVersionPill from './team/TeamVersionPill.vue'
+import { assetRowByPath } from './team/teamAssets'
+import { useTeamStore } from '../../store/modules/teamStore'
 import {
   buildDirectFileUrl,
   buildThumbnailUrl,
@@ -1039,6 +1079,8 @@ import {
   type ImportResultView
 } from './utils/importResultView'
 import { filterRetriableFailures, type ImportSkipEntry } from '@core/shared/assetImport'
+import { describeImportError } from './importErrorText'
+import type { ImportErrorDetails } from '@core/shared/importErrorKey'
 import {
   isHttpNetworkVault as isHttpNetworkVaultKind,
   resolveErrorText
@@ -1106,6 +1148,23 @@ const importMenuOpen = ref(false)
 const serverImportOpen = ref(false)
 const serverImportFiles = ref<string[]>([])
 const serverSignInOpen = ref(false)
+
+// ---- 团队工程：中间区域在看哪一页、外包的交付
+const teamStore = useTeamStore()
+/** 动态、对比、签出中……这几页顶替网格（点左栏文件夹就回到网格） */
+const teamPageActive = computed(() => Boolean(libraryCaps.value.team) && teamStore.view !== 'grid')
+/** 外包把文件拖进「交付」：先出「交付给 星海」确认窗 */
+const teamDeliverFiles = ref<string[]>([])
+
+/** 动态 / 签出中 / 对比里点了一个资产：右边详情打开它 */
+const handleTeamOpenPath = async (path: string): Promise<void> => {
+  const key = libraryStore.activeServerKey
+  if (!key) return
+  const row = await assetRowByPath(key, path)
+  if (!row) return
+  detailsPanelVisible.value = true
+  handleFileClick(row)
+}
 const serverImportFolder = ref<{
   dirId: number
   path: string
@@ -2391,13 +2450,12 @@ const abandonImportSession = async (payload: ImportRecoveryPayload): Promise<boo
       success: boolean
       stagingCleared?: boolean
       locallyDismissed?: boolean
-      error?: string
-    }
+    } & ImportErrorDetails
 
     if (!result?.success) {
       message.error(
         t('assetManagement.import.abandonFailed', {
-          error: result?.error || t('assetManagement.import.unknownError')
+          error: describeImportError(result, t, t('assetManagement.import.unknownError'))
         }),
         8
       )
@@ -2409,7 +2467,7 @@ const abandonImportSession = async (payload: ImportRecoveryPayload): Promise<boo
     } else {
       message.warning(
         t('assetManagement.import.abandonStagingLeft', {
-          error: result.error || t('assetManagement.import.unknownError')
+          error: describeImportError(result, t, t('assetManagement.import.unknownError'))
         }),
         10
       )
@@ -2488,12 +2546,12 @@ const readImportRecoveryReportRef = async (
   try {
     report = JSON.parse(result.content)
   } catch {
-    throw new Error('这个文件不是有效的 JSON 报告')
+    throw new Error('该文件不是有效的 JSON 报告')
   }
 
   const ref = extractImportRecoveryReportRef(report)
   if (!ref) {
-    throw new Error('这个 JSON 里没有找到可用于续传的 taskId 或 diagnosticId')
+    throw new Error('该 JSON 中未找到可用于续传的 taskId 或 diagnosticId')
   }
   return ref
 }
@@ -2516,13 +2574,12 @@ const resumeImportByReportRef = async (ref: ImportRecoveryReportRef): Promise<vo
       uploadedFiles?: number
       uploadedThumbnails?: number
       committed?: boolean
-      error?: string
-    }
+    } & ImportErrorDetails
 
     if (!result?.success) {
-      const error = result?.error || t('assetManagement.import.unknownError')
+      const error = describeImportError(result, t, t('assetManagement.import.unknownError'))
       message.destroy(messageKey)
-      if (/未找到可续传|没有找到这份 JSON 对应/.test(error)) {
+      if (/未找到可续传|没有找到这份 JSON 对应/.test(result?.error ?? '')) {
         warningDialog({
           title: t('assetManagement.import.resumeNotFoundTitle'),
           content: t('assetManagement.import.resumeNotFoundContent', { error })
@@ -2725,13 +2782,12 @@ const handleFolderImportNeedsRecovery = (_event: unknown, payload: ImportRecover
         uploadedFiles?: number
         uploadedThumbnails?: number
         committed?: boolean
-        error?: string
-      }
+      } & ImportErrorDetails
       if (!result?.success) {
         const error =
           result?.status === 'expired'
-            ? t('assetManagement.import.sessionExpired')
-            : result?.error || t('assetManagement.import.unknownError')
+            ? t('assetManagement.import.importGone')
+            : describeImportError(result, t, t('assetManagement.import.unknownError'))
         message.error(t('assetManagement.import.continueFailed', { error }), 8)
         throw new Error(result?.error || 'resume import failed')
       }
@@ -2834,13 +2890,19 @@ const handleFolderImportError = (
     rootFolderPath?: string
     vaultId?: string
     targetFolderKey?: string
-  }
+  } & ImportErrorDetails
 ) => {
   if (suppressFolderImportErrorTasks.has(payload.taskId)) {
     console.warn('[DragImport] Folder import error captured for managed retry:', payload)
     return
   }
-  message.error(t('assetLib.import.failed', { message: payload.message }))
+  // 普通文件夹导入的 payload 没有 errorKey，describeImportError 原样走回 message
+  const errorText = describeImportError(
+    { error: payload.message, errorKey: payload.errorKey, errorParams: payload.errorParams },
+    t,
+    t('assetManagement.import.unknownError')
+  )
+  message.error(t('assetLib.import.failed', { message: errorText }))
   const view = buildImportResultView({
     ...payload,
     total: 0,
@@ -2850,7 +2912,7 @@ const handleFolderImportError = (
         stage: 'scan',
         fileName: payload.rootFolderPath || payload.taskId,
         path: payload.rootFolderPath || '',
-        error: payload.message,
+        error: errorText,
         retriable: Boolean(payload.rootFolderPath)
       }
     ]
@@ -3467,7 +3529,7 @@ interface ListCriteria {
   offset?: number
   classNameCnFilters?: string[]
   fileExtensions?: string[]
-  /** 服务器库：引擎版本分面 */
+  /** 引擎版本（前缀匹配：5.3 也命中 5.3.x） */
   engineVersions?: string[]
   sizeRange?: { min?: number; max?: number }
   dateRange?: { start: string; end: string }
@@ -3556,7 +3618,7 @@ const buildListCriteria = (options: {
     criteria.classNameCnFilters = [...filterForm.assetTypes]
   }
 
-  // 引擎版本只有服务器库有（服务端分面）
+  // 库支持版本分面才带（本地库、服务器库都有）
   if (libraryCaps.value.filters.engine && filterForm.engineVersions.length > 0) {
     criteria.engineVersions = [...filterForm.engineVersions]
   }
@@ -3591,10 +3653,19 @@ const buildListCriteria = (options: {
 }
 
 /** 跑一次统一查询，并把行转成文件列表认识的形状 */
+/**
+ * 查询被取消（同一列表的新查询把它顶掉了，或者保管库正在切换）—— 不是失败，别弹「搜索失败」。
+ * 主进程那边按 queryGroup 作废排着还没开始的旧查询，见 services/assetQueryRunner。
+ */
+const isCancelledQuery = (error: unknown): boolean =>
+  Boolean((error as { cancelled?: boolean } | null)?.cancelled)
+
 const searchAssetsWithCriteria = async (criteria: ListCriteria): Promise<SearchedAssetRow[]> => {
-  const rows = (await getActiveLibrarySource().search.assets(
-    criteria as never
-  )) as unknown as SearchedAssetRow[]
+  const rows = (await getActiveLibrarySource().search.assets({
+    ...criteria,
+    // 搜索、收藏、回收站三个视图是同一个列表：新查询来了，排着的旧查询作废
+    queryGroup: 'asset-list'
+  } as never)) as unknown as SearchedAssetRow[]
   return rows.map((asset) => ({
     ...asset,
     id: asset.assetKey,
@@ -3737,11 +3808,12 @@ const performSearchWithPagination = async (isLoadMore = false): Promise<void> =>
   } catch (error) {
     console.error('搜索请求失败:', error)
     if (isStaleListRequest(requestToken)) return
-    message.error(t('assetManagement.search.failed'))
+    const cancelled = isCancelledQuery(error)
+    if (!cancelled) message.error(t('assetManagement.search.failed'))
     if (isLoadMore) {
       // 页码不回滚的话，下次「加载更多」会直接跳过一页 —— 中间那 50 条永远看不到
       searchPagination.current = Math.max(1, searchPagination.current - 1)
-    } else {
+    } else if (!cancelled) {
       currentFiles.value = []
     }
   } finally {
@@ -5175,7 +5247,7 @@ const handleFavoritesShortcut = async () => {
     updateFileList(allFavorites)
   } catch (error) {
     console.error('处理收藏快捷方式失败:', error)
-    if (!isStaleListRequest(requestToken)) {
+    if (!isStaleListRequest(requestToken) && !isCancelledQuery(error)) {
       currentFiles.value = []
       resetPagination()
     }
@@ -5342,7 +5414,7 @@ const handleDeletedShortcut = async (isLoadMore = false) => {
     }
   } catch (error) {
     console.error('处理最近删除快捷方式失败:', error)
-    if (isStaleListRequest(requestToken)) return
+    if (isStaleListRequest(requestToken) || isCancelledQuery(error)) return
     message.error(t('assetManagement.load.recentDeletedFailed'))
     if (!isLoadMore) {
       currentFiles.value = []
@@ -5403,6 +5475,7 @@ const handleClearDeleted = async () => {
 
 // 导入树状态管理器
 import { saveTreeState, restoreTreeState } from './utils/tabStateManager'
+import { createAssetChangeDebouncer } from './utils/assetChangeDebouncer'
 import { log } from 'console'
 
 // 获取路由实例（已在文件开头声明）
@@ -5619,7 +5692,16 @@ const handleNetworkVaultAssetsSynced = async (): Promise<void> => {
   await loadCurrentFolderAssets()
 }
 
-let assetChangedTimer: ReturnType<typeof setTimeout> | null = null
+// 防抖 500ms：批量变更时合并为一次刷新；文件夹变更跨窗口累计，见 assetChangeDebouncer
+const assetChangeDebouncer = createAssetChangeDebouncer(async ({ touchedFolders }) => {
+  console.log('[AssetManagement] 收到实时变更推送，刷新 UI，含文件夹变更:', touchedFolders)
+  if (touchedFolders) {
+    // 文件夹变更：刷新树
+    await refreshFolderTreePreservingExpansion()
+  }
+  // 所有变更都刷新当前文件列表
+  await loadCurrentFolderAssets()
+})
 const handleAssetChanged = (
   _event: any,
   payload: { source?: string; vaultId?: string; op?: string; tableName?: string }
@@ -5630,17 +5712,7 @@ const handleAssetChanged = (
   // 仅处理当前 vault 的变更
   if (payload.vaultId && currentVault.value?.id && payload.vaultId !== currentVault.value.id) return
 
-  // 防抖 500ms：批量变更时合并为一次刷新
-  if (assetChangedTimer) clearTimeout(assetChangedTimer)
-  assetChangedTimer = setTimeout(async () => {
-    console.log('[AssetManagement] 收到实时变更推送，刷新 UI:', payload.tableName, payload.op)
-    if (payload.tableName === 'assetFolder') {
-      // 文件夹变更：刷新树
-      await refreshFolderTreePreservingExpansion()
-    }
-    // 所有变更都刷新当前文件列表
-    await loadCurrentFolderAssets()
-  }, 500)
+  assetChangeDebouncer.push(payload.tableName)
 }
 
 const handleTriggerNetworkVaultPullSync = async (): Promise<void> => {
@@ -5724,6 +5796,8 @@ onMounted(async () => {
   networkSyncProgressHandler = window.api.on('networkVaultV2:syncProgress', ((payload: {
     vaultId: string
     phase: string
+    /** 阶段代号，按它取双语文案；没有（老版本主进程）就退回 phase 原文 */
+    phaseKey?: string
     current: number
     total: number
   }) => {
@@ -5731,8 +5805,14 @@ onMounted(async () => {
       return
     if (currentVault.value?.id && payload.total > 0) {
       const percent = Math.round((payload.current / payload.total) * 100)
+      const phaseText = payload.phaseKey
+        ? t(`assetManagement.sync.phase.${payload.phaseKey}`, {
+            current: payload.current,
+            total: payload.total
+          })
+        : payload.phase
       message.loading({
-        content: `${payload.phase}  ${percent}%`,
+        content: `${phaseText}  ${percent}%`,
         key: getNetworkSyncMessageKey(payload.vaultId),
         duration: percent >= 100 ? 1.5 : 0
       })
@@ -5932,10 +6012,7 @@ onUnmounted(() => {
   window.removeEventListener('trigger-network-sync', handleTriggerNetworkSync)
   window.removeEventListener('navigate-to-all-folder', handleNavigateToAllFolder)
   removeIpcListener('asset:changed', handleAssetChanged)
-  if (assetChangedTimer) {
-    clearTimeout(assetChangedTimer)
-    assetChangedTimer = null
-  }
+  assetChangeDebouncer.cancel()
 
   // 清理拖拽监听器
   if (isResizing.value) {
@@ -6784,6 +6861,16 @@ const handleWebImageCapture = async (files: File[]): Promise<void> => {
 
 // 处理拖拽导入逻辑
 const handleDragImport = async (filePaths: string[]) => {
+  // 外包成员：拖进「交付」就是交一批（方案 4.12）；别处照旧（置灰，说为什么）
+  if (libraryCaps.value.team?.role === 'outsourcer') {
+    const folder = (await getActiveLibrarySource()
+      .folders.getByKey(selectedKeys.value[0] || ALL_FOLDER)
+      .catch(() => undefined)) as { catalogPath?: string } | undefined
+    if ((folder?.catalogPath ?? '').split('/')[0] === 'delivery') {
+      teamDeliverFiles.value = filePaths
+      return
+    }
+  }
   // 服务器库：同一个导入入口，走 lore 以本人身份提交（先确认仓库和提交说明）
   if (libraryStore.isServer) {
     importMenuOpen.value = false
@@ -7893,11 +7980,6 @@ const handleUploadProjectArchive = async (): Promise<void> => {
                 text-overflow: ellipsis;
               }
             }
-          }
-
-          .current-dir-text {
-            font-size: 13px;
-            color: var(--color-text-secondary);
           }
         }
 

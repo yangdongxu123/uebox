@@ -69,6 +69,8 @@ export interface ProviderConfig {
   /** 用户可见的唯一标识，如 'openai'、'my-gateway' */
   id: string
   displayName: string
+  /** 从目录哪一条添加的；有值时 kind 跟着目录走。见 shared 里 ProviderView 上同名字段的注释 */
+  catalogId?: string
   /** 这个 Provider 是用来干什么的。决定它出现在哪些角色的候选里 */
   kind: ProviderKind
   /** 3D / 视频的接口形状。见 shared 里 ProviderView 上同名字段的注释 */
@@ -132,8 +134,8 @@ export interface ModelRequest {
    * 钉死 provider/model，绕过角色绑定。
    *
    * 两处用它：
-   * - 会话绑定的模型（`agent-v3/core/sessionModel.ts`）—— 模型跟着会话走，
-   *   用户在别的会话里切模型不影响这一条。
+   * - 对话绑定的模型（`agent-v3/core/sessionModel.ts`）—— 模型跟着对话走，
+   *   用户在别的对话里切模型不影响这一条。
    * - 本机调试端点（`/api/debug/agent` 的 `model` 字段）。评测要比的是「同一个模型
    *   在两种工具池下的表现」，不钉死的话一批样本跑到一半换了模型，两臂就不再可比。
    */
@@ -187,6 +189,7 @@ export const ROLE_FALLBACK: Readonly<Record<ModelRole, readonly ModelRole[]>> = 
    */
   realtime: Object.freeze<ModelRole[]>(['realtime']),
   music: Object.freeze<ModelRole[]>(['music']),
+  sfx: Object.freeze<ModelRole[]>(['sfx']),
   tts: Object.freeze<ModelRole[]>(['tts']),
   /*
    * 语音识别。这张表里**唯一一个真有回落、却不能写在这里**的角色。

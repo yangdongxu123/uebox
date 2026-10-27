@@ -77,6 +77,12 @@ export type ImageApi =
    * 只由套餐导入写进来，用户不会手选。
    */
   | 'uebox-images'
+  /**
+   * ChatGPT 订阅的 Codex 后端（`openai-codex-responses` 协议）。没有 `/images/*` 端点：
+   * 出图是 Responses 里的 `image_generation` 工具，强制调用一次、从事件流里取图。
+   * 模型 id 是**驱动工具的那个对话模型**，画图的模型由后端定。一次请求一张。
+   */
+  | 'codex-images'
 
 /**
  * 结构化输出的能力档位。
@@ -283,14 +289,15 @@ export type ProviderKind =
   | 'image'
   | 'video'
   | 'model3d'
-  /** 双向实时语音会话（常驻 WebSocket） */
+  /** 双向实时语音连接（常驻 WebSocket） */
   | 'realtime'
   | 'tts'
   /**
-   * 流式语音识别。**只出文字，一个音都不出。**
+   * 语音识别。**只出文字，一个音都不出。**
    *
-   * 它和 `realtime` 的区别不是「实时不实时」—— 两档都是常驻 WebSocket、都是
-   * 边说边出字。区别是**会不会回话**：`realtime` 那一档的端点判停之后要生成
+   * 它和 `realtime` 的区别不是「实时不实时」—— 豆包、百炼的识别和 `realtime` 一样
+   * 是常驻 WebSocket、边说边出字（另有一类整段转写，见 `ai/stt/transcriptionStt.ts`）。
+   * 区别是**会不会回话**：`realtime` 那一档的端点判停之后要生成
    * 回答（豆包全双工的上行事件表里根本没有关掉它的开关），而听写要的只有
    * 转写结果，模型一张嘴就全是多余的。
    *
@@ -301,6 +308,11 @@ export type ProviderKind =
    */
   | 'stt'
   | 'music'
+  /**
+   * 音效。和音乐分开：接口不同（同步回音频字节，没有任务），而且没绑也能用 ——
+   * 那时 Agent 用本机 FFmpeg 合成，见 sound-effects 技能。
+   */
+  | 'sfx'
   /**
    * 网页检索。
    *
@@ -348,6 +360,7 @@ export const PROVIDER_KINDS: readonly ProviderKind[] = Object.freeze([
   'tts',
   'stt',
   'music',
+  'sfx',
   'search',
   'judge'
 ])
@@ -476,6 +489,35 @@ export interface ModelConfig {
    * 渲染层按它切段，主进程按它拦。放在模型上而不是另查清单缓存，是因为渲染层只读得到这份配置。
    */
   ttsMaxInputChars?: number
+  /**
+   * 名字旁的小标签（如「Beta」）。目前只有 Box Plan 写它：清单 `models[].badge` 原样搬过来，
+   * 界面原样显示，客户端不认识也不翻译 —— 标什么由服务端定。
+   */
+  badge?: string
+  /** 一句话说明，界面放在悬停提示里。来源同 `badge` */
+  description?: string
+  /**
+   * 这个模型只能绑到这几个角色。不写 = 不限（按来源用途过滤，见 `ROLE_KIND`）。
+   *
+   * 目前只有 Box Plan 写它（清单 `models[].roles`）：同一个对话来源下，可选的经济线
+   * 可能只开放给部分角色，绑到别的角色网关会拒。
+   */
+  allowedRoles?: ModelRole[]
+  /** 上游出错、流中断不扣费（清单 `models[].free_on_failure`）。主进程据此失败后自动重试一次 */
+  freeOnFailure?: boolean
+}
+
+/** 这个模型能不能绑到这个角色。没写 `allowedRoles` 的不限 */
+export function modelAllowsRole(
+  model: Pick<ModelConfig, 'allowedRoles'> | undefined,
+  role: ModelRole
+): boolean {
+  return !model?.allowedRoles || model.allowedRoles.includes(role)
+}
+
+/** 带标签的显示名：「Box-Music (Beta)」。界面上放不下小标签的地方（下拉框选中值、提示）用它 */
+export function modelLabelWithBadge(name: string, badge: string | undefined): string {
+  return badge ? `${name} (${badge})` : name
 }
 
 /**
@@ -505,6 +547,8 @@ export type ModelRole =
    */
   | 'stt'
   | 'music'
+  /** 音效。不绑不是不能用：Agent 改用本机 FFmpeg 合成 */
+  | 'sfx'
   /** 网页检索走哪条路。不绑就用内置的真浏览器 —— 社区版零配置就靠这条 */
   | 'search'
   /**
@@ -530,6 +574,7 @@ export const MODEL_ROLES: readonly ModelRole[] = Object.freeze([
   'tts',
   'stt',
   'music',
+  'sfx',
   'search',
   'judge'
 ])
@@ -554,6 +599,7 @@ export const ROLE_KIND: Readonly<Record<ModelRole, ProviderKind>> = Object.freez
   tts: 'tts',
   stt: 'stt',
   music: 'music',
+  sfx: 'sfx',
   search: 'search',
   judge: 'judge'
 })
@@ -642,16 +688,34 @@ export function applyRolePatch(roles: RoleBindings, patch: RoleBindingsPatch): R
 }
 
 /**
+ * 补丁里哪些角色绑到了不许绑的模型：来源用途对不上角色（音乐来源绑「音效生成」），
+ * 或模型写了 `allowedRoles` 而不含这个角色（见 `modelAllowsRole`）。
+ * 界面上的下拉本来就不列它们，走到这里的是过期的界面或手改的请求
+ */
+export function disallowedRoles(source: RoleBindingSource, patch: RoleBindingsPatch): ModelRole[] {
+  return (Object.entries(patch) as [ModelRole, ModelBinding | null][])
+    .filter(([role, binding]) => {
+      if (!binding) return false
+      const provider = source.providers.find((item) => item.id === binding.providerId)
+      if (provider?.kind && provider.kind !== ROLE_KIND[role]) return true
+      const model = provider?.models.find((item) => item.id === binding.modelId)
+      return !modelAllowsRole(model, role)
+    })
+    .map(([role]) => role)
+}
+
+/**
  * 补丁里要设上的角色，落盘之后哪些没留住（指向的来源或模型已经不在了，被归一化丢掉）。
  * 不报出来的话渲染层当成存上了，下拉框照样显示选中的，重开设置页才发现没了
  */
 export function unsavedRoles(saved: RoleBindings, patch: RoleBindingsPatch): ModelRole[] {
   return (Object.entries(patch) as [ModelRole, ModelBinding | null][])
-    .filter(
-      ([role, binding]) =>
-        binding &&
-        (saved[role]?.providerId !== binding.providerId || saved[role]?.modelId !== binding.modelId)
-    )
+    .filter(([role, binding]) => {
+      if (!binding) return false
+      // 「Agent」已并进「对话」那一格（主进程 `ai/store.ts` 的 mergeMainModel），写进去的在 chat 上
+      const stored = role === 'agent' ? (saved.agent ?? saved.chat) : saved[role]
+      return stored?.providerId !== binding.providerId || stored?.modelId !== binding.modelId
+    })
     .map(([role]) => role)
 }
 
@@ -682,7 +746,8 @@ export const VISION_FALLBACK_ROLES: readonly ModelRole[] = Object.freeze([
  */
 export interface RoleBindingSource {
   roles: RoleBindings
-  providers: readonly { id: string; models: readonly ModelConfig[] }[]
+  /** `kind` 给了就按它查用途对不对得上角色（见 `disallowedRoles`） */
+  providers: readonly { id: string; kind?: ProviderKind; models: readonly ModelConfig[] }[]
 }
 
 /** 这条绑定指向的模型声明了「看得懂图」吗。模型不在清单里（用户手改过配置）按不支持算 */
@@ -707,10 +772,47 @@ export function findVisionCapableRole(source: RoleBindingSource): ModelRole | nu
 }
 
 /**
+ * 拼装通话的「脑子」：对话没单独选过模型时，从这几个角色里取第一个绑了的。
+ *
+ * 和主进程的 `ROLE_FALLBACK.agent` 是同一串（那边有测试盯着两份对不对得上）——
+ * 也就是输入框里显示的那个默认模型。对话自己选过模型就用它，见 `cascadeDeps.resolveBrain`。
+ */
+export const VOICE_PIPELINE_BRAIN_ROLES: readonly ModelRole[] = Object.freeze(['agent', 'chat'])
+
+/**
+ * 没绑「实时语音」时，能不能拼一通电话出来：语音识别当耳朵、对话模型当脑子、
+ * 语音合成当嘴。回缺的那几个角色（`chat` 代表对话模型那一组），配齐了回空数组。
+ *
+ * 主进程开通话、设置页决定「语音通话不可用」那一行要不要显示，用的是同一份判断 ——
+ * 理由同 `findVisionCapableRole`：界面说能通、实际打不通（或者反过来）都很糟。
+ *
+ * `sttUsable` 给主进程用：识别那一路认不认得这个地址只有主进程知道。界面上不传，
+ * 按认得算 —— 认不得的那种地址（陌生的 ws://）极少，开通话时会把原因说清楚。
+ */
+export function missingForVoicePipeline(
+  source: {
+    roles: RoleBindings
+    providers: readonly { id: string; kind: ProviderKind; baseUrl: string }[]
+  },
+  sttUsable: (provider: { id: string; baseUrl: string }) => boolean = () => true
+): ModelRole[] {
+  const bound = (
+    role: ModelRole
+  ): { id: string; kind: ProviderKind; baseUrl: string } | undefined =>
+    source.providers.find((item) => item.id === source.roles[role]?.providerId)
+  const missing: ModelRole[] = []
+  const stt = bound('stt')
+  if (!stt || stt.kind !== 'stt' || !sttUsable(stt)) missing.push('stt')
+  if (bound('tts')?.kind !== 'tts') missing.push('tts')
+  if (!VOICE_PIPELINE_BRAIN_ROLES.some((role) => source.roles[role])) missing.push('chat')
+  return missing
+}
+
+/**
  * Agent 此刻的默认模型。没单独绑 Agent 时内核沿用 chat 角色，这里给出同一个结果。
  *
  * 只留 providerId / modelId：`source: 'plan'` 是全局绑定的归属标记，
- * 抄进会话记录里没有意义。
+ * 抄进对话记录里没有意义。
  */
 export function defaultAgentBinding(roles: RoleBindings): ModelBinding | null {
   const binding = roles.agent ?? roles.chat
@@ -718,26 +820,37 @@ export function defaultAgentBinding(roles: RoleBindings): ModelBinding | null {
 }
 
 /**
- * 会话钉住的模型还能不能用：来源还在、是对话类来源、模型还在它的清单里。
+ * 对话钉住的模型还能不能用：来源还在、是对话类来源、模型还在它的清单里。
  *
  * 用户可能在设置页删了那个来源或模型，套餐重新导入也会换掉模型清单。
  * 用不了的时候由调用方退回全局默认，而不是拿一个已经不存在的模型硬打出去。
  */
 export function isAgentBindingAvailable(
   source: {
-    providers: readonly { id: string; kind: ProviderKind; models: readonly { id: string }[] }[]
+    providers: readonly {
+      id: string
+      kind: ProviderKind
+      models: readonly Pick<ModelConfig, 'id' | 'allowedRoles'>[]
+    }[]
   },
   binding: ModelBinding
 ): boolean {
   const provider = source.providers.find((item) => item.id === binding.providerId)
   if (!provider || provider.kind !== ROLE_KIND.agent) return false
-  return provider.models.some((model) => model.id === binding.modelId)
+  const model = provider.models.find((item) => item.id === binding.modelId)
+  return !!model && modelAllowsRole(model, 'agent')
 }
 
 /** 发给渲染层的 provider 形态：不含任何密钥内容 */
 export interface ProviderView {
   id: string
   displayName: string
+  /**
+   * 从目录哪一条添加的。有值时用途（kind）跟着目录走、不许改：ElevenLabs 音乐和音效是
+   * 两条目录，把音乐那条改成「音效」留下的是一个只有音乐模型的音效来源，调用必然被拒。
+   * 要用同一家的另一种服务，从目录再添加那一条。手工新建的没有这一位，用途随便选
+   */
+  catalogId?: string
   /** 这个 Provider 是用来干什么的。决定它出现在哪些角色的候选里、界面显示哪些字段 */
   kind: ProviderKind
   /**
@@ -772,6 +885,8 @@ export interface ProviderView {
 
 export interface SettingsView {
   providers: ProviderView[]
+  /** 停用的来源。不在 providers 里，只给模型管理弹窗列出来 */
+  disabledProviders?: ProviderView[]
   roles: RoleBindings
   /** models.json 的绝对路径，界面上显示给用户 */
   path: string
@@ -797,6 +912,12 @@ export interface SettingsView {
 export interface ProviderDraft {
   id: string
   displayName: string
+  /**
+   * 从目录哪一条添加的。有值时用途（kind）跟着目录走、不许改：ElevenLabs 音乐和音效是
+   * 两条目录，把音乐那条改成「音效」留下的是一个只有音乐模型的音效来源，调用必然被拒。
+   * 要用同一家的另一种服务，从目录再添加那一条。手工新建的没有这一位，用途随便选
+   */
+  catalogId?: string
   /** 这个 Provider 是用来干什么的。决定它出现在哪些角色的候选里、界面显示哪些字段 */
   kind: ProviderKind
   /**
@@ -895,6 +1016,13 @@ export interface CatalogEntry {
    * 打内部接口那种做法不在此列。
    */
   supportsOAuth?: boolean
+  /**
+   * 登录用哪一家的账号（`oauth.ts` 的 OAUTH_PROVIDERS 键）。不填就是本条的 id。
+   *
+   * 「Codex 生图」与「Codex」对话是同一个 ChatGPT 账号：填 `chatgpt` 之后，
+   * 已经登录过的用户添加生图来源时直接沿用那份登录，不用再走一遍授权。
+   */
+  oauthProvider?: string
   models: ModelConfig[]
 }
 
@@ -922,6 +1050,10 @@ export type ProbeErrorCode =
   | 'modelNotFound'
   | 'rateLimited'
   | 'badRequest'
+  /** 当前协议下被拒，换成 `suggestedProtocol` 就通了（换着发试出来的，不是读报错猜的） */
+  | 'protocolMismatch'
+  /** 带工具就被拒、不带就通：这个模型或网关不接受工具调用，当不了智能体 */
+  | 'toolsRejected'
   | 'unreachable'
   /** 没归上类。原文照带，猜错了反而掩盖真实原因 */
   | 'unknown'
@@ -951,10 +1083,18 @@ export interface ProbeFailure {
    * 厂商原文（已截断）。
    *
    * 只有那几种「翻译过去还是说不清、必须让用户看见原话」的分支才带：
-   * 5xx 的服务端错误码、400 的拒绝理由、以及没归上类的。
+   * 5xx 的服务端错误码、400 / 403 的拒绝理由、以及没归上类的。
    */
   raw?: string
+  /** `protocolMismatch` 时：换成哪个协议试通了 */
+  suggestedProtocol?: ProviderProtocol
 }
+
+/**
+ * 通了，但有一项用不了。界面显示成提示而不是绿勾。
+ * - `thinkingRejected`：带思考档位被拒、不带就通 ——「自动」能用，开思考会 400
+ */
+export type ProbeCaveat = 'thinkingRejected'
 
 export type ListModelsResult =
   | { ok: true; models: ModelConfig[] }
@@ -968,7 +1108,7 @@ export type ListModelsResult =
  * 验过了，而实际上第一次真生成才知道对不对。
  */
 export type TestProviderResult =
-  | { ok: true; skipped?: ProbeSkipCode }
+  | { ok: true; skipped?: ProbeSkipCode; caveat?: ProbeCaveat }
   | { ok: false; error: ProbeFailure }
 
 /** Music providers have distinct request and task formats. */

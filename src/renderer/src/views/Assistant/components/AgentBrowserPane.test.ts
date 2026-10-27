@@ -118,6 +118,61 @@ describe('浏览器分割线', () => {
     expect(wrapper.emitted('closeReview')).toHaveLength(1)
     expect(window.api.agentBrowser.close).not.toHaveBeenCalled()
   })
+
+  it('团队任务页签同审查：选中时网页让位、显示插槽内容，切回网页后恢复', async () => {
+    wrapper.unmount()
+    wrapper = mount(AgentBrowserPane, {
+      attachTo: container,
+      props: {
+        sessionId: 'session-a',
+        open: true,
+        visible: true,
+        teamOpen: true,
+        teamActive: true
+      },
+      slots: { team: '<div class="team-slot">board</div>' }
+    })
+    await paint()
+    expect(setBounds).toHaveBeenLastCalledWith(null, 'session-a')
+    expect(wrapper.find('.team-slot').exists()).toBe(true)
+    expect(wrapper.find('.pane-header').isVisible()).toBe(false)
+    expect(wrapper.find('[role="tab"]').text()).toBe('assistant.teamBoard.tab')
+    await wrapper.setProps({ teamActive: false })
+    await paint()
+    expect(wrapper.find('.team-slot').exists()).toBe(false)
+    expect(setBounds).toHaveBeenLastCalledWith(expect.objectContaining({ width: 520 }), 'session-a')
+    await wrapper.find('[role="tab"]').trigger('click')
+    expect(wrapper.emitted('selectTeam')).toHaveLength(1)
+    await wrapper.find('[aria-label="assistant.teamBoard.closeTab"]').trigger('click')
+    expect(wrapper.emitted('closeTeam')).toHaveLength(1)
+  })
+
+  it('交付页签：选中时网页让位、显示插槽内容；点标题切过去，点 × 关掉', async () => {
+    wrapper.unmount()
+    const report = { id: 'j1', title: '配置统计报告' }
+    wrapper = mount(AgentBrowserPane, {
+      attachTo: container,
+      props: {
+        sessionId: 'session-a',
+        open: true,
+        visible: true,
+        reports: [report],
+        activeReport: 'j1'
+      },
+      slots: { report: '<div class="report-slot">body</div>' }
+    })
+    await paint()
+    expect(setBounds).toHaveBeenLastCalledWith(null, 'session-a')
+    expect(wrapper.find('.report-slot').exists()).toBe(true)
+    expect(wrapper.find('[role="tab"]').text()).toBe('配置统计报告')
+    await wrapper.setProps({ activeReport: null })
+    await paint()
+    expect(wrapper.find('.report-slot').exists()).toBe(false)
+    await wrapper.find('[role="tab"]').trigger('click')
+    expect(wrapper.emitted('selectReport')).toEqual([[report]])
+    await wrapper.find('[aria-label="assistant.teamBoard.closeReport"]').trigger('click')
+    expect(wrapper.emitted('closeReport')).toEqual([['j1']])
+  })
   it('向左拖动变宽，拖动期间隐藏原生视图，松手恢复最终 bounds', async () => {
     const handle = wrapper.get('[role="separator"]')
     expect(width()).toBe(520)

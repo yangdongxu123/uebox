@@ -472,8 +472,10 @@ function readUndoableFlag(result: unknown): boolean | null {
 const DETAIL_KEYS: Record<string, readonly string[]> = {
   run_shell_command: ['command'],
   ue_run_console_command: ['command'],
-  // 跑 skill 自带脚本时没有 script 原文，报出是哪个脚本
-  ue_run_python_script: ['script', 'skill_script'],
+  // 脚本先取模型写的用途说明。原文开头十有八九是 `import unreal`，清单上
+  // 一溜六十行 `import unreal` 等于什么都没说。没写说明的（老记录）退回原文，
+  // 跑 skill 自带脚本时没有原文，报出是哪个脚本
+  ue_run_python_script: ['description', 'script', 'skill_script'],
   ue_manage_plugin: ['action']
 }
 
@@ -505,7 +507,7 @@ function formatScalar(value: unknown): string {
 /**
  * detail 的长度上限。
  *
- * 它随聊天记录写进 localStorage（配额只有几 MB），而 `properties` 理论上
+ * 它随对话记录写进 localStorage（配额只有几 MB），而 `properties` 理论上
  * 能有任意多个键 —— 不封顶的话一次批量改属性就能把存储撑掉一块。
  * 界面那边还会再截到 80 字显示，这里管的是**存进去多少**。
  */

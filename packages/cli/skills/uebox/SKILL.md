@@ -139,8 +139,9 @@ uebox ask "halve the intensity of every point light" --allow-write --json
   not just discouraged — it can look but not change.
 - **Its reach is fixed:** engine, asset library, project library. It never gets the shell,
   local files, the browser or third-party MCP servers, with or without the flag.
-- **It runs on the model configured in the box**, billed to that model. Do not use it for
-  a single lookup that one `tools call` would answer.
+- **It runs on the box's default model**, billed to it. `--model <id>` picks another of
+  the box's models; only add it when the user names one. Do not use it for a single lookup
+  that one `tools call` would answer.
 - Progress lines go to stderr while it works; the conclusion is `data.answer`, and ends
   with a line listing every write it made. **Report that line to the user** — it is
   bookkeeping, not the agent's own claim.
@@ -202,6 +203,8 @@ If a write tool is missing from `tools list --allow-write` entirely, the box's M
 probably do not have "also expose mutating tools" turned on. `uebox doctor` says so; that
 is the user's switch to flip, not something to route around.
 
-Never route around the CLI by writing Python, editing files under the project directory, or
-driving the editor another way. The limits that remain are deliberate, and working around
-them removes the user's ability to approve what happens to their project.
+Do not route around the CLI for changes to the running editor's state — writing Python,
+driving the editor another way, or hand-editing `.uasset`/`.umap` files to do what a gated
+tool refused. Those limits are deliberate, and working around them removes the user's ability
+to approve what happens to their project. Editing source and config files in the project
+(C++, `.ini`, `.uproject`, `Build.cs`) as part of what the user asked for is ordinary work.

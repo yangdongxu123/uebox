@@ -158,7 +158,8 @@ describe('resolveTools —— 动态工具过滤', () => {
       resolveTools({ sessionId: 's', ueConnected: true }).map((t) => [t.name, t])
     )
 
-    expect(byName.get('material_delete_node')?.unrealBox.risk).toBe('destructive')
+    // 删材质节点开在插件事务里，ue_undo 撤得回来，按可撤销的改动算
+    expect(byName.get('material_delete_node')?.unrealBox.risk).toBe('mutating')
     expect(byName.get('ue_destroy_actor')?.unrealBox.risk).toBe('destructive')
   })
 
@@ -400,6 +401,27 @@ describe('resolveTools —— 动态工具过滤', () => {
       expect(tools.map((tool) => tool.name).sort()).toEqual(['load_skill', 'mcp_demo_read', 'task'])
     })
 
+    it('result_query 只在池里还有声明存档的工具时才留下', () => {
+      const query = fakeTool('result_query', 'core')
+      const withArchive = resolveAgentTools(
+        { sessionId: 's', ueConnected: true, toolNames: ['search_assets', 'result_query'] },
+        skills,
+        taskTool,
+        undefined,
+        query
+      )
+      expect(withArchive.map((tool) => tool.name).sort()).toEqual(['result_query', 'search_assets'])
+
+      const without = resolveAgentTools(
+        { sessionId: 's', ueConnected: true, toolNames: ['material_describe', 'result_query'] },
+        skills,
+        taskTool,
+        undefined,
+        query
+      )
+      expect(without.map((tool) => tool.name)).toEqual(['material_describe'])
+    })
+
     it('Ask 模式的最终过滤也覆盖后追加工具', () => {
       const unsafeTask = fakeTool('task', 'core', 'mutating')
       const tools = resolveAgentTools(
@@ -433,7 +455,11 @@ describe('resolveTools —— 动态工具过滤', () => {
             'ue_get_config',
             'cpp_probe',
             'search_notes',
-            'blueprint_describe'
+            'blueprint_describe',
+            // 交付验收的提示词点了这几个名字去核对交付目录（见 teamPrompt 的 buildAcceptancePrompt）
+            'find_local_files',
+            'list_local_dir',
+            'read_local_file'
           ])
         )
       })
@@ -578,6 +604,24 @@ describe('buildSystemPrompt', () => {
    * 做包含判断，会把能力清单里的一次提及误当成连接引导。
    */
   const environmentOf = (prompt: string): string => prompt.slice(prompt.indexOf('<environment>'))
+
+  /**
+   * 技能里的「不要做 X」是默认做法，不是替用户做的否决。以前模型读到就拒，
+   * 用户明说「我知道风险，做吧」也照样拒。这里守住三处放宽，以及没放宽的那几条。
+   */
+  it('用户明确要求时可以越过技能的默认做法；切到已装引擎不算假升级；下载不再一律交给用户', () => {
+    const prompt = buildSystemPrompt(base)
+    expect(prompt).toContain(
+      'Skills and tool descriptions describe defaults, not vetoes over the user'
+    )
+    expect(prompt).toContain('Switching the project to an engine that is already installed is real')
+    // 假装升级到没装的引擎仍然不行
+    expect(prompt).toContain(
+      'never rewrite `.uproject`, `Target.cs` or `Build.cs` to claim a state'
+    )
+    expect(prompt).toContain('a login, a payment, a captcha or an upload, hand it to the user')
+    expect(prompt).not.toMatch(/an upload or a download/)
+  })
 
   /**
    * 子 agent 手里没有 `task`（`resolveAgentTools` 摘掉了），提示词却照样把它
@@ -1341,14 +1385,16 @@ describe('buildSystemPrompt', () => {
 
   // 套餐网关会注入「你是 Box-Chat」；这里再写 creator-plan/xxx 就两条打架，
   // 模型会在思考过程里把两段提示词摆出来比
-  it('接的是 Box Plan：说法和网关一致，不写来源 ID', () => {
-    const prompt = buildSystemPrompt(base, [], {
-      providerId: 'creator-plan',
-      modelId: 'uebox-chat'
-    })
+  // 身份由网关按模型注入（Box-Chat Beta 会如实说底层模型）：这边写哪个名字都可能和它打架
+  it('接的是 Box Plan：不报模型名、不写来源 ID，身份交给网关', () => {
+    for (const modelId of ['uebox-chat', 'uebox-chat-beta']) {
+      const prompt = buildSystemPrompt(base, [], { providerId: 'creator-plan', modelId })
 
-    expect(prompt).toContain('Box-Chat (uebox-chat)')
-    expect(prompt).not.toContain('creator-plan/')
+      expect(prompt).toContain("a model from the user's Box Plan subscription")
+      expect(prompt).not.toContain('Box-Chat')
+      expect(prompt).not.toContain(modelId)
+      expect(prompt).not.toContain('creator-plan/')
+    }
   })
 
   // 无头场景（HTTP server、旧调用点）不传身份就整句不出现，而不是印 undefined
@@ -1447,16 +1493,16 @@ describe('shell 工具的条件注册', () => {
   })
 
   /**
-   * 这三个动的是**用户自己的硬盘**，不是虚幻工程里能重新生成的资产。
-   * 默认模式是 auto-edit，那个模式下 mutating 会静默放行 ——
-   * 静默改用户源码这件事不能有。
+   * 写 / 改文件有改前改后快照，改动看得到，按 mutating 走；
+   * 跑命令没有快照兜得住，每次都问。
    */
-  it('写 / 改 / 跑命令都必须每次都问', () => {
+  it('写 / 改文件是 mutating，跑命令每次都问', () => {
     const tools = resolveTools({ sessionId: 's', ueConnected: true, shellAvailable: true })
-    for (const name of ['write_local_file', 'edit_local_file', 'run_shell_command']) {
-      const tool = tools.find((t) => t.name === name)
-      expect(tool?.unrealBox.risk, name).toBe('destructive')
-    }
+    const riskOf = (name: string): string | undefined =>
+      tools.find((t) => t.name === name)?.unrealBox.risk
+    expect(riskOf('write_local_file')).toBe('mutating')
+    expect(riskOf('edit_local_file')).toBe('mutating')
+    expect(riskOf('run_shell_command')).toBe('destructive')
   })
 
   // Ask 模式是「只看不动」，写盘和跑命令一个都不能留

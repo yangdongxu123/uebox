@@ -598,6 +598,150 @@ namespace
 		return Json;
 	}
 
+	/**
+	 * 切轨段的一个边界换成显示帧号。
+	 *
+	 * 用 RoundToFrame 而不是 TickToDisplay 的 FloorToFrame：MRQ 给输出文件编号
+	 * （`{frame_number}` = `SourceFrameNumber`）就是 tick 换到显示帧率后 RoundToFrame，
+	 * 见 MovieRenderPipelineCore/Private/MoviePipelineTiming.cpp 的
+	 * `CalculateFrameNumbersForOutputState`（5.0 与 5.8 同）。边界正好落在整帧上时
+	 * 两种取整一样；30000/1001 这类每帧 tick 不是整数的帧率才会差，这里跟 MRQ 走。
+	 *
+	 * @param bOutOnFrame 边界离这个整帧不到 1 tick（tick 是存储的最小刻度）。
+	 *                    false = 切点落在两帧之间，交界那一帧渲哪台相机要看采样时刻
+	 */
+	int32 CutBoundaryToDisplay(const UMovieScene* MovieScene, const FFrameNumber& Tick, bool& bOutOnFrame)
+	{
+		const FFrameRate TickRes = MovieScene->GetTickResolution();
+		const FFrameRate DisplayRate = MovieScene->GetDisplayRate();
+		const FFrameNumber Frame = FFrameRate::TransformTime(FFrameTime(Tick), TickRes, DisplayRate).RoundToFrame();
+		const FFrameTime Back = FFrameRate::TransformTime(FFrameTime(Frame), DisplayRate, TickRes);
+		bOutOnFrame = FMath::Abs(Back.AsDecimal() - static_cast<double>(Tick.Value)) < 1.0;
+		return Frame.Value;
+	}
+
+	/**
+	 * 切轨上的每一段：从第几帧到第几帧、用哪台相机。按起始帧排序。
+	 *
+	 * 渲完看帧要看「每个切点的第一帧」，没有这张表模型只能猜，或者去写 Python。
+	 *
+	 * - 帧号是**显示帧**，和 Sequencer 时间轴上看到的、MRQ 默认文件名
+	 *   `{sequence_name}.{frame_number}` 里的帧号是同一套（绝对帧号，不从 0 起）。
+	 * - `end_frame` 不含，和 describe 里所有范围一样是 `[start, end)`。
+	 * - 一头无界写 null，不编一个数。
+	 * - 相机绑定在子序列 / 父序列里（相对绑定的 sequence ID 不是本序列），
+	 *   本序列查不到名字：camera 写 null 并标 `camera_in_other_sequence`，不猜。
+	 *
+	 * API：`UMovieSceneCameraCutSection::GetCameraBindingID()`、
+	 * `FMovieSceneObjectBindingID::GetGuid()` / `GetRelativeSequenceID()`、
+	 * `UMovieSceneSection::IsActive()` 在 5.0–5.8 签名一致（逐版本头文件核过），不需要 #if。
+	 */
+	TArray<TSharedPtr<FJsonValue>> MakeCameraCutListJson(UMovieScene* MovieScene, int32 MaxCuts, bool& bOutTruncated)
+	{
+		TArray<TSharedPtr<FJsonValue>> Out;
+		UMovieSceneTrack* CutTrack = MovieScene ? MovieScene->GetCameraCutTrack() : nullptr;
+		if (!CutTrack)
+		{
+			return Out;
+		}
+
+		TArray<const UMovieSceneSection*> Sections;
+		for (const UMovieSceneSection* Section : CutTrack->GetAllSections())
+		{
+			if (Section)
+			{
+				Sections.Add(Section);
+			}
+		}
+		// GetAllSections 不保证按时间排。无界的起点排最前
+		Sections.StableSort([](const UMovieSceneSection& A, const UMovieSceneSection& B)
+		{
+			const TRangeBound<FFrameNumber> LA = A.GetRange().GetLowerBound();
+			const TRangeBound<FFrameNumber> LB = B.GetRange().GetLowerBound();
+			if (!LA.IsClosed() || !LB.IsClosed())
+			{
+				return !LA.IsClosed() && LB.IsClosed();
+			}
+			return LA.GetValue() < LB.GetValue();
+		});
+
+		for (const UMovieSceneSection* Section : Sections)
+		{
+			if (Out.Num() >= MaxCuts)
+			{
+				bOutTruncated = true;
+				break;
+			}
+
+			TSharedPtr<FJsonObject> Cut = MakeShared<FJsonObject>();
+			const TRange<FFrameNumber> Range = Section->GetRange();
+			bool bOnFrame = true;
+
+			if (Range.GetLowerBound().IsClosed())
+			{
+				bool bStartOnFrame = true;
+				Cut->SetNumberField(TEXT("start_frame"), CutBoundaryToDisplay(MovieScene, Range.GetLowerBoundValue(), bStartOnFrame));
+				bOnFrame &= bStartOnFrame;
+			}
+			else
+			{
+				Cut->SetField(TEXT("start_frame"), MakeShared<FJsonValueNull>());
+			}
+			if (Range.GetUpperBound().IsClosed())
+			{
+				bool bEndOnFrame = true;
+				Cut->SetNumberField(TEXT("end_frame"), CutBoundaryToDisplay(MovieScene, Range.GetUpperBoundValue(), bEndOnFrame));
+				bOnFrame &= bEndOnFrame;
+			}
+			else
+			{
+				Cut->SetField(TEXT("end_frame"), MakeShared<FJsonValueNull>());
+			}
+			if (!bOnFrame)
+			{
+				Cut->SetBoolField(TEXT("off_frame_boundary"), true);
+			}
+
+			FString CameraName;
+			FString BindingId;
+			bool bOtherSequence = false;
+			if (const UMovieSceneCameraCutSection* CutSection = Cast<const UMovieSceneCameraCutSection>(Section))
+			{
+				const FMovieSceneObjectBindingID& Id = CutSection->GetCameraBindingID();
+				if (Id.IsValid())
+				{
+					BindingId = Id.GetGuid().ToString();
+					if (Id.GetRelativeSequenceID() != MovieSceneSequenceID::Root)
+					{
+						bOtherSequence = true;
+					}
+					else
+					{
+						EUALBindingKind Kind = EUALBindingKind::Unknown;
+						CameraName = ResolveBindingName(MovieScene, Id.GetGuid(), Kind);
+					}
+				}
+			}
+
+			if (CameraName.IsEmpty()) { Cut->SetField(TEXT("camera"), MakeShared<FJsonValueNull>()); }
+			else                      { Cut->SetStringField(TEXT("camera"), CameraName); }
+			if (BindingId.IsEmpty())  { Cut->SetField(TEXT("camera_binding_id"), MakeShared<FJsonValueNull>()); }
+			else                      { Cut->SetStringField(TEXT("camera_binding_id"), BindingId); }
+			if (bOtherSequence)
+			{
+				Cut->SetBoolField(TEXT("camera_in_other_sequence"), true);
+			}
+			// 被禁用的段不参与求值，渲出来不会切到它
+			if (!Section->IsActive())
+			{
+				Cut->SetBoolField(TEXT("active"), false);
+			}
+
+			Out.Add(MakeShared<FJsonValueObject>(Cut));
+		}
+		return Out;
+	}
+
 	// ========================================================================
 	// 能力回报
 	// ========================================================================
@@ -647,6 +791,11 @@ void FUAL_SequencerCommands::RegisterCommands(
 	CommandMap.Add(TEXT("sequence.camera_cuts"), [](const TSharedPtr<FJsonObject>& Payload, const FString RequestId)
 	{
 		Handle_CameraCuts(Payload, RequestId);
+	});
+
+	CommandMap.Add(TEXT("sequence.rebind"), [](const TSharedPtr<FJsonObject>& Payload, const FString RequestId)
+	{
+		Handle_Rebind(Payload, RequestId);
 	});
 }
 
@@ -855,7 +1004,18 @@ void FUAL_SequencerCommands::Handle_Describe(const TSharedPtr<FJsonObject>& Payl
 	TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
 	Data->SetObjectField(TEXT("sequence"), SequenceJson);
 	Data->SetArrayField(TEXT("bindings"), BindingArray);
-	Data->SetObjectField(TEXT("camera_cuts"), MakeCameraCutsJson(InspectCameraCuts(MovieScene, PlaybackStart, PlaybackEnd)));
+	{
+		TSharedPtr<FJsonObject> CutsJson = MakeCameraCutsJson(InspectCameraCuts(MovieScene, PlaybackStart, PlaybackEnd));
+		// 每一段的起止帧和相机。一段几十字节，切点再多也撑不爆上下文；
+		// 上限只防坏资产，超了单独置 cuts_truncated，不混进绑定的 truncated
+		bool bCutsTruncated = false;
+		CutsJson->SetArrayField(TEXT("cuts"), MakeCameraCutListJson(MovieScene, 500, bCutsTruncated));
+		if (bCutsTruncated)
+		{
+			CutsJson->SetBoolField(TEXT("cuts_truncated"), true);
+		}
+		Data->SetObjectField(TEXT("camera_cuts"), CutsJson);
+	}
 	Data->SetArrayField(TEXT("broken_bindings"), BrokenArray);
 	Data->SetArrayField(TEXT("unresolved_bindings"), UnresolvedArray);
 	Data->SetObjectField(TEXT("capabilities"), MakeCapabilitiesJson(bBindingResolutionWorks));
@@ -2199,5 +2359,323 @@ void FUAL_SequencerCommands::Handle_CameraCuts(const TSharedPtr<FJsonObject>& Pa
 		Data->SetArrayField(TEXT("warnings"), Warnings);
 	}
 
+	UAL_CommandUtils::SendResponse(RequestId, 200, Data);
+}
+
+// ============================================================================
+// sequence.rebind
+// ============================================================================
+
+void FUAL_SequencerCommands::Handle_Rebind(const TSharedPtr<FJsonObject>& Payload, const FString RequestId)
+{
+	FString SequencePath, BindingKey, ActorKey;
+	if (!Payload->TryGetStringField(TEXT("sequence_path"), SequencePath) ||
+		!Payload->TryGetStringField(TEXT("binding"), BindingKey) || BindingKey.IsEmpty() ||
+		!Payload->TryGetStringField(TEXT("actor"), ActorKey) || ActorKey.IsEmpty())
+	{
+		UAL_CommandUtils::SendError(RequestId, 400, TEXT("Missing field: sequence_path / binding / actor"));
+		return;
+	}
+	bool bAllowClassChange = false;
+	Payload->TryGetBoolField(TEXT("allow_class_change"), bAllowClassChange);
+
+	FString Error;
+	ULevelSequence* Sequence = LoadSequence(SequencePath, Error);
+	if (!Sequence)
+	{
+		UAL_CommandUtils::SendError(RequestId, 404, Error);
+		return;
+	}
+	UMovieScene* MovieScene = Sequence->GetMovieScene();
+
+	// 绑定存的是编辑器关卡里的引用。拿 PIE 世界去绑，停止 PIE 那一刻就断了
+	UWorld* World = GetSequencerResolveWorld();
+	if (!World)
+	{
+		UAL_CommandUtils::SendError(RequestId, 500,
+			TEXT("拿不到编辑器世界，无法重绑。如果正在 PIE，请先停止运行。"));
+		return;
+	}
+
+	// ══ 先探，不动手 ══════════════════════════════════════════════════════
+	//
+	// 歧义一律不猜（这正是此前不做这个工具的理由）：绑定名撞了、Actor 撞了，
+	// 都把候选列回去让调用方点名。猜错的重绑不报错，只是让轨道去动另一个东西。
+
+	// ── 哪条绑定：名字或 GUID ──
+	FGuid TargetGuid;
+	TArray<TSharedPtr<FJsonValue>> BindingCandidates;
+	{
+		FGuid ParsedGuid;
+		const bool bKeyIsGuid = FGuid::Parse(BindingKey, ParsedGuid);
+		// 走 const 重载：非 const 的 GetBindings() 5.7 起弃用
+		for (const FMovieSceneBinding& Binding : static_cast<const UMovieScene*>(MovieScene)->GetBindings())
+		{
+			EUALBindingKind Kind = EUALBindingKind::Unknown;
+			const FString Name = ResolveBindingNameForBinding(MovieScene, Binding, Kind);
+			const FGuid& Guid = Binding.GetObjectGuid();
+			if ((bKeyIsGuid && Guid == ParsedGuid) || Name == BindingKey)
+			{
+				TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+				Item->SetStringField(TEXT("name"), Name);
+				Item->SetStringField(TEXT("guid"), Guid.ToString(EGuidFormats::DigitsWithHyphens));
+				Item->SetStringField(TEXT("kind"), BindingKindToString(Kind));
+				BindingCandidates.Add(MakeShared<FJsonValueObject>(Item));
+				TargetGuid = Guid;
+			}
+		}
+	}
+	if (BindingCandidates.Num() == 0)
+	{
+		UAL_CommandUtils::SendError(RequestId, 404, FString::Printf(
+			TEXT("序列里没有叫「%s」的绑定。先用 sequence_describe 看绑定名。"), *BindingKey));
+		return;
+	}
+	if (BindingCandidates.Num() > 1)
+	{
+		TSharedPtr<FJsonObject> Details = MakeShared<FJsonObject>();
+		Details->SetArrayField(TEXT("binding_candidates"), BindingCandidates);
+		UAL_CommandUtils::SendError(RequestId, 409, FString::Printf(
+			TEXT("序列里有 %d 条绑定都叫「%s」，请用 binding 填其中一条的 guid。什么都没有改动。"),
+			BindingCandidates.Num(), *BindingKey), Details);
+		return;
+	}
+
+	EUALBindingKind TargetKind = EUALBindingKind::Unknown;
+	FString BindingName;
+	if (const FMovieSceneBinding* Binding = MovieScene->FindBinding(TargetGuid))
+	{
+		BindingName = ResolveBindingNameForBinding(MovieScene, *Binding, TargetKind);
+	}
+	if (TargetKind == EUALBindingKind::Spawnable)
+	{
+		UAL_CommandUtils::SendError(RequestId, 400, FString::Printf(
+			TEXT("「%s」是生成体（spawnable）：对象由序列自己生成，不指向关卡里的 Actor，没有可重绑的东西。"),
+			*BindingName));
+		return;
+	}
+	FMovieScenePossessable* Possessable = MovieScene->FindPossessable(TargetGuid);
+	if (!Possessable)
+	{
+		UAL_CommandUtils::SendError(RequestId, 400, FString::Printf(
+			TEXT("「%s」不是 possessable 绑定，这个工具只重绑指向关卡 Actor 的绑定。"), *BindingName));
+		return;
+	}
+	// 组件绑定是相对父 Actor 解析的：父那条绑对了，同名组件自动跟上
+	if (Possessable->GetParent().IsValid())
+	{
+		EUALBindingKind ParentKind = EUALBindingKind::Unknown;
+		const FString ParentName = ResolveBindingName(MovieScene, Possessable->GetParent(), ParentKind);
+		UAL_CommandUtils::SendError(RequestId, 400, FString::Printf(
+			TEXT("「%s」是组件绑定，挂在「%s」下面，跟着父 Actor 走。请重绑父绑定「%s」，同名组件会一起解析过去。"),
+			*BindingName, *ParentName, *ParentName));
+		return;
+	}
+
+	// ── 绑到哪个 Actor：完整路径精确匹配优先，其次标签 / 对象名 ──
+	AActor* Actor = nullptr;
+	{
+		TArray<AActor*> Matches;
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			AActor* Candidate = *It;
+			if (!Candidate)
+			{
+				continue;
+			}
+			if (Candidate->GetPathName() == ActorKey)
+			{
+				Matches.Reset();
+				Matches.Add(Candidate);
+				break;
+			}
+			if (Candidate->GetActorLabel() == ActorKey || Candidate->GetName() == ActorKey)
+			{
+				Matches.Add(Candidate);
+			}
+		}
+		if (Matches.Num() > 1)
+		{
+			TArray<TSharedPtr<FJsonValue>> ActorCandidates;
+			for (AActor* Match : Matches)
+			{
+				TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+				Item->SetStringField(TEXT("label"), Match->GetActorLabel());
+				Item->SetStringField(TEXT("path"), Match->GetPathName());
+				Item->SetStringField(TEXT("class"), Match->GetClass()->GetName());
+				ActorCandidates.Add(MakeShared<FJsonValueObject>(Item));
+			}
+			TSharedPtr<FJsonObject> Details = MakeShared<FJsonObject>();
+			Details->SetArrayField(TEXT("actor_candidates"), ActorCandidates);
+			UAL_CommandUtils::SendError(RequestId, 409, FString::Printf(
+				TEXT("关卡里有 %d 个 Actor 都叫「%s」，请用 actor 填其中一个的 path。什么都没有改动。"),
+				Matches.Num(), *ActorKey), Details);
+			return;
+		}
+		if (Matches.Num() == 1)
+		{
+			Actor = Matches[0];
+		}
+	}
+	if (!Actor)
+	{
+		UAL_CommandUtils::SendError(RequestId, 404, FString::Printf(
+			TEXT("当前编辑器关卡里找不到 Actor「%s」（按标签、对象名、完整路径都找过）。")
+			TEXT("World Partition 里没加载的区域找不到，先把那块加载出来。什么都没有改动。"),
+			*ActorKey));
+		return;
+	}
+
+	// ── 类型对不上：轨道上的属性多半作用不上 ──
+	const UClass* OldClass = Possessable->GetPossessedObjectClass();
+	if (OldClass && !Actor->IsA(OldClass) && !bAllowClassChange)
+	{
+		UAL_CommandUtils::SendError(RequestId, 409, FString::Printf(
+			TEXT("「%s」原来绑的是 %s，「%s」是 %s，不是它的子类 —— 轨道上的属性多半对不上。")
+			TEXT("确认要换就带 allow_class_change=true。什么都没有改动。"),
+			*BindingName, *OldClass->GetName(), *Actor->GetActorLabel(), *Actor->GetClass()->GetName()));
+		return;
+	}
+
+	// ── 这个 Actor 已经被另一条绑定占着：两条绑定会抢同一个对象 ──
+	{
+		const FGuid Existing = FindPossessableFor(Sequence, Actor, World);
+		if (Existing.IsValid() && Existing != TargetGuid)
+		{
+			EUALBindingKind OtherKind = EUALBindingKind::Unknown;
+			const FString OtherName = ResolveBindingName(MovieScene, Existing, OtherKind);
+			UAL_CommandUtils::SendError(RequestId, 409, FString::Printf(
+				TEXT("「%s」已经被这条序列里的另一条绑定「%s」绑着。两条绑定抢同一个 Actor，")
+				TEXT("轨道会互相覆盖。先决定留哪条，再来重绑。什么都没有改动。"),
+				*Actor->GetActorLabel(), *OtherName));
+			return;
+		}
+	}
+
+	// 改之前它指向什么，回执里要说：重绑一条好的绑定等于换演员
+	FString PreviousActor;
+	bool bWasBroken = false;
+	{
+		TArray<UObject*, TInlineAllocator<1>> Bound;
+		if (ResolveBindingObjects(Sequence, MovieScene, TargetGuid, World, Bound))
+		{
+			// 刚删掉的 Actor 在 GC 之前还解析得到（已标记为垃圾），不能算「原来指向它」
+			// —— 2026-10-12 真机：删了 CamA 马上重绑，回执说「原来指向 CamA」
+			for (UObject* Object : Bound)
+			{
+				if (IsValid(Object))
+				{
+					const AActor* PrevActor = Cast<AActor>(Object);
+					PreviousActor = PrevActor ? PrevActor->GetActorLabel() : Object->GetName();
+					break;
+				}
+			}
+			bWasBroken = PreviousActor.IsEmpty();
+		}
+	}
+
+	// ══ 动手 ══════════════════════════════════════════════════════════════
+	//
+	// GUID 不换：切轨、子序列里引用这条绑定的地方全按 GUID 指，换了就得逐个修。
+	// 编辑器的「Assign Actor」会新建 GUID 再 ReplacePossessable，那是顺带处理
+	// 打开着的 Sequencer 的运行时状态；这里没有 Sequencer，原地换对象动得最少。
+	{
+		FUAL_ScopedTransaction Transaction(NSLOCTEXT("UALSequencer", "Rebind", "Rebind Possessable"));
+		Sequence->Modify();
+		MovieScene->Modify();
+		Sequence->UnbindPossessableObjects(TargetGuid);
+		Sequence->BindPossessableObject(TargetGuid, *Actor, World);
+		if (FMovieScenePossessable* Updated = MovieScene->FindPossessable(TargetGuid))
+		{
+			Updated->SetName(Actor->GetActorLabel());
+			Updated->SetPossessedObjectClass(Actor->GetClass());
+		}
+	}
+
+	// ── 读回来：真的解析到这个 Actor 了吗 ──
+	bool bResolved = false;
+	bool bResolveChecked = false;
+	{
+		TArray<UObject*, TInlineAllocator<1>> Bound;
+		bResolveChecked = ResolveBindingObjects(Sequence, MovieScene, TargetGuid, World, Bound);
+		bResolved = bResolveChecked && Bound.Contains(Actor);
+	}
+	if (bResolveChecked && !bResolved)
+	{
+		UAL_CommandUtils::SendError(RequestId, 500, FString::Printf(
+			TEXT("绑定写进去了，但读回来解析不到「%s」。序列没有存盘，Ctrl+Z 可以撤回。"),
+			*Actor->GetActorLabel()));
+		return;
+	}
+
+	// 组件子绑定按名字跟着父 Actor 走；新 Actor 上没有同名组件的会断，要报出来
+	TArray<TSharedPtr<FJsonValue>> BrokenComponents;
+	for (int32 Index = 0; Index < MovieScene->GetPossessableCount(); ++Index)
+	{
+		const FMovieScenePossessable& Child = MovieScene->GetPossessable(Index);
+		if (Child.GetParent() != TargetGuid)
+		{
+			continue;
+		}
+		TArray<UObject*, TInlineAllocator<1>> ChildBound;
+		if (ResolveBindingObjects(Sequence, MovieScene, Child.GetGuid(), World, ChildBound) && ChildBound.Num() == 0)
+		{
+			BrokenComponents.Add(MakeShared<FJsonValueString>(Child.GetName()));
+		}
+	}
+
+	const bool bSequenceSaved = SaveSequenceAsset(Sequence);
+
+	TArray<TSharedPtr<FJsonValue>> Warnings;
+	if (!bSequenceSaved)
+	{
+		Warnings.Add(MakeShared<FJsonValueString>(
+			TEXT("序列资产没保存成功，重绑只在编辑器内存里 —— 关掉编辑器前要手动保存这条序列。")));
+	}
+	if (!bResolveChecked)
+	{
+		Warnings.Add(MakeShared<FJsonValueString>(
+			TEXT("这台引擎上判不出绑定解析结果，重绑写进去了但没能读回确认。")));
+	}
+	// 绑定按路径记 Actor：Actor 所在的包没存，重开编辑器这条绑定又会断
+	if (const UPackage* ActorPackage = Actor->GetPackage())
+	{
+		if (ActorPackage->IsDirty())
+		{
+			Warnings.Add(MakeShared<FJsonValueString>(FString::Printf(
+				TEXT("「%s」所在的关卡还有未保存的改动。不保存关卡的话，重开编辑器这条绑定会再断一次。"),
+				*Actor->GetActorLabel())));
+		}
+	}
+
+	FString NewName;
+	if (const FMovieScenePossessable* Updated = MovieScene->FindPossessable(TargetGuid))
+	{
+		NewName = Updated->GetName();
+	}
+
+	TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+	Data->SetStringField(TEXT("sequence_path"), SequencePath);
+	Data->SetStringField(TEXT("binding_guid"), TargetGuid.ToString(EGuidFormats::DigitsWithHyphens));
+	Data->SetStringField(TEXT("previous_name"), BindingName);
+	Data->SetStringField(TEXT("binding_name"), NewName);
+	Data->SetBoolField(TEXT("was_broken"), bWasBroken);
+	if (!PreviousActor.IsEmpty())
+	{
+		Data->SetStringField(TEXT("previous_actor"), PreviousActor);
+	}
+	Data->SetStringField(TEXT("actor_label"), Actor->GetActorLabel());
+	Data->SetStringField(TEXT("actor_path"), Actor->GetPathName());
+	Data->SetStringField(TEXT("actor_class"), Actor->GetClass()->GetName());
+	if (bResolveChecked)
+	{
+		Data->SetBoolField(TEXT("resolved"), bResolved);
+	}
+	Data->SetArrayField(TEXT("broken_components"), BrokenComponents);
+	Data->SetBoolField(TEXT("sequence_saved"), bSequenceSaved);
+	if (Warnings.Num() > 0)
+	{
+		Data->SetArrayField(TEXT("warnings"), Warnings);
+	}
 	UAL_CommandUtils::SendResponse(RequestId, 200, Data);
 }

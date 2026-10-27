@@ -1,7 +1,7 @@
 /**
  * 对象存储：配置、上传、链接、查看、清理。
  *
- * ## 为什么聊天里的音视频要走它
+ * ## 为什么对话里的音视频要走它
  *
  * 多模态厂商收本地文件只有 base64 一条路（MIMO 上限 50MB）。base64 塞进对话以后，
  * 之后每一轮、工具循环的每一步都要把几十 MB 重传一遍；想把它从对话里摘掉，
@@ -162,7 +162,7 @@ async function targetFor(config: ObjectStorageConfig, secretOverride?: string): 
     secretOverride?.trim() ||
     (await resolveApiKey({ kind: 'literal', id: SECRET_ID }).catch(() => ''))
   if (!secret) missing.push('AccessKey Secret')
-  if (missing.length > 0) throw new Error(`对象存储还没配完整：缺 ${missing.join('、')}`)
+  if (missing.length > 0) throw new Error(`对象存储配置不完整，缺少：${missing.join('、')}`)
   return {
     endpoint: config.endpoint,
     region: config.region,
@@ -173,7 +173,7 @@ async function targetFor(config: ObjectStorageConfig, secretOverride?: string): 
   }
 }
 
-/** 开着、而且配完整了。聊天发送时据此决定走链接还是只带路径 */
+/** 开着、而且配完整了。对话发送时据此决定走链接还是只带路径 */
 export async function isObjectStorageReady(): Promise<boolean> {
   const config = await readObjectStorageConfig()
   if (config.preset === 'uebox') return config.enabled && planStorage.isPlanStorageReady()
@@ -547,8 +547,8 @@ export async function testObjectStorage(input: ObjectStorageSaveInput): Promise<
         return {
           ok: false,
           message: config.publicBaseUrl
-            ? `写入成功，但公开域名读不到（HTTP ${response.status}）：检查域名是否绑定到这个桶、桶是否允许公共读`
-            : `写入成功，但签名链接读不回来（HTTP ${response.status}）：检查 region 是否与桶所在地域一致`
+            ? `写入成功，但无法通过公开域名读取（HTTP ${response.status}）：请检查域名是否已绑定到该存储桶，以及存储桶是否允许公共读`
+            : `写入成功，但无法通过签名链接读取（HTTP ${response.status}）：请检查 region 是否与存储桶所在地域一致`
         }
       }
     } finally {
@@ -558,7 +558,7 @@ export async function testObjectStorage(input: ObjectStorageSaveInput): Promise<
       return {
         ok: false,
         message:
-          '本机读写都通过了，但这是本机或内网地址，模型厂商从公网访问不到，视频发过去它看不了'
+          '本机读写测试通过，但该地址为本机或内网地址，模型服务商无法从公网访问，因此无法读取上传的视频'
       }
     }
     return { ok: true, message: '连接正常：写入、链接读取、删除都通过了' }

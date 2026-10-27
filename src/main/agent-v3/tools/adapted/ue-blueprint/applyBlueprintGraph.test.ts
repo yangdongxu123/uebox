@@ -103,6 +103,59 @@ describe('整图写入', () => {
     expect(result.success).toBe(true)
   })
 
+  it('回话里的引脚按读图的样子给：一个不少，默认值字段不带，连线收成一张表', async () => {
+    const pin = (name: string, dir: string, extra: Record<string, unknown> = {}): unknown => ({
+      name,
+      dir,
+      category: 'exec',
+      sub_category: '',
+      is_array: false,
+      is_reference: false,
+      is_const: false,
+      friendly_name: '',
+      linked_count: 0,
+      is_connected: false,
+      linked_to: [],
+      ...extra
+    })
+    mockApply({
+      ...okResponse,
+      nodes: [
+        {
+          id: 'begin',
+          node_id: 'GUID-1',
+          class: 'K2Node_Event',
+          reused: true,
+          pins: [pin('then', 'Output', { linked_to: [{ node_id: 'GUID-2', pin_name: 'execute' }] })]
+        },
+        {
+          id: 'print',
+          node_id: 'GUID-2',
+          class: 'K2Node_CallFunction',
+          pins: [
+            pin('execute', 'Input', { linked_to: [{ node_id: 'GUID-1', pin_name: 'then' }] }),
+            pin('InString', 'Input', { category: 'string', default_value: 'Hello' })
+          ]
+        }
+      ]
+    })
+
+    const result = await run(MINIMAL)
+    const nodes = result.nodes as Array<{ id: string; node_id: string; pins: unknown[] }>
+
+    expect(nodes.map((n) => [n.id, n.node_id])).toEqual([
+      ['begin', 'GUID-1'],
+      ['print', 'GUID-2']
+    ])
+    expect(nodes[1].pins).toEqual([
+      { name: 'execute', dir: 'Input', type: 'exec' },
+      { name: 'InString', dir: 'Input', type: 'string', default_value: 'Hello' }
+    ])
+    expect(result.connections).toEqual([
+      { from_node_id: 'GUID-1', from_pin: 'then', to_node_id: 'GUID-2', to_pin: 'execute' }
+    ])
+  })
+
   /**
    * 前一代最贵的一个缺陷：schema 里的 `class` 是九项枚举，其中四项插件端
    * 不认，而工具示例用的恰好是不认的那个。zod 在 app 侧就把合法输入拦下，
@@ -131,6 +184,46 @@ describe('整图写入', () => {
     })
 
     expect(writeParams().nodes[0].raw_class).toBe('K2Node_MakeMap')
+  })
+
+  /**
+   * 以前 SpawnActor 拿到控件类会回「widgets use CreateWidget」，而 CreateWidget
+   * 这个具名类型并不存在 —— 模型照着改还是被拒。插件补上之后，app 侧要做的是：
+   * 描述里列出它、target_class 原样发下去（插件靠它设 Class 引脚、重建返回值类型）。
+   * 加到屏幕走普通 Function：UserWidget.AddToViewport。
+   */
+  it('CreateWidget 的 target_class 原样透传，AddToViewport 走普通 Function', async () => {
+    mockApply({ ...okResponse, created_count: 2 })
+
+    await run({
+      blueprint_path: '/Game/BP_PlayerController',
+      nodes: [
+        { id: 'w', class: 'CreateWidget', target_class: 'WBP_HUD' },
+        { id: 'add', class: 'Function', member_name: 'UserWidget.AddToViewport' }
+      ],
+      connections: [
+        { from: 'w.then', to: 'add.execute' },
+        { from: 'w.ReturnValue', to: 'add.self' }
+      ]
+    })
+
+    const sent = writeParams().nodes as unknown as Array<Record<string, unknown>>
+    expect(sent[0]).toMatchObject({ class: 'CreateWidget', target_class: 'WBP_HUD' })
+    expect(sent[1]).toMatchObject({ class: 'Function', member_name: 'UserWidget.AddToViewport' })
+  })
+
+  it('描述里列出 CreateWidget，并指明怎么加到屏幕', () => {
+    type Described = { description?: string }
+    const schema = (
+      createApplyBlueprintGraphTool() as unknown as {
+        inputSchema: { shape: { nodes: { element: { shape: Record<string, Described> } } } }
+      }
+    ).inputSchema
+    const nodeShape = schema.shape.nodes.element.shape
+
+    expect(nodeShape.class.description).toContain('CreateWidget')
+    expect(nodeShape.target_class.description).toContain('CreateWidget')
+    expect(nodeShape.target_class.description).toContain('UserWidget.AddToViewport')
   })
 
   /**
@@ -649,5 +742,106 @@ describe('动画蓝图', () => {
     expect((result.transitions as Array<{ rule_graph: string }>)[0].rule_graph).toBe(
       'AnimGraph/Locomotion/Idle->Walk'
     )
+  })
+
+  /**
+   * 真机上模型往 `待机` 里写动画节点，插件只认完整路径回了一句 Graph not found ——
+   * 而这里原来只读 errors 数组，模型拿到的是光秃秃的「写入失败。」，以为插件不认动画节点。
+   */
+  it('只写了状态名 → 换成完整路径整批重发', async () => {
+    callRequest.mockImplementation(async (command: string, params: { graph_name?: string }) => {
+      if (command === 'blueprint.list_graphs') {
+        return {
+          ok: true,
+          graphs: [
+            { name: 'AnimGraph', type: 'anim_graph' },
+            { name: 'AnimGraph/MR22基础动作/待机', type: 'state' }
+          ]
+        }
+      }
+      if (params.graph_name !== 'AnimGraph/MR22基础动作/待机') {
+        return { ok: false, error: `Graph not found: ${params.graph_name}`, code: 404 }
+      }
+      return command === 'blueprint.get_graph'
+        ? { ok: true, nodes: [] }
+        : { ...okResponse, graph_name: 'AnimGraph/MR22基础动作/待机' }
+    })
+
+    const result = await run({
+      blueprint_path: '/Game/ABP_Hero',
+      graph_name: '待机',
+      nodes: [{ id: 'p', class: 'SequencePlayer', member_name: 'Idle' }],
+      connections: []
+    })
+
+    expect(result.success).toBe(true)
+    expect(result.graph_name).toBe('AnimGraph/MR22基础动作/待机')
+    const writes = callRequest.mock.calls.filter(
+      ([command]) => command === 'blueprint.create_graph'
+    )
+    expect(writes.map(([, params]) => (params as { graph_name: string }).graph_name)).toEqual([
+      '待机',
+      'AnimGraph/MR22基础动作/待机'
+    ])
+  })
+
+  it('插件只回一句 error（没有 errors 数组）时，原话要带给模型', async () => {
+    mockApply({ ok: false, error: 'Blueprint not found: /Game/ABP_Nope', code: 404 })
+
+    const result = await run({ ...MINIMAL, blueprint_path: '/Game/ABP_Nope' })
+
+    expect(result.success).toBe(false)
+    expect(String(result.error)).toContain('Blueprint not found: /Game/ABP_Nope')
+  })
+})
+
+/**
+ * 真机上模型写 { class: "Function", raw_class: "AnimGraphNode_SequencePlayer" }，
+ * 插件按 Function 去要 member_name，回「Function not found:（空）」，把它带去查函数名。
+ */
+describe('raw_class 与 class=Function 同时出现', () => {
+  it('Function 没给 member_name → 按 raw_class 建', async () => {
+    mockApply(okResponse)
+
+    await run({
+      blueprint_path: '/Game/ABP_Hero',
+      graph_name: 'AnimGraph',
+      nodes: [{ id: 'p', class: 'Function', raw_class: 'AnimGraphNode_SequencePlayer' }],
+      connections: []
+    })
+
+    expect(writeParams().nodes[0]).toMatchObject({ class: 'AnimGraphNode_SequencePlayer' })
+  })
+
+  it('Call_Function 这种带下划线的写法也认', async () => {
+    mockApply(okResponse)
+
+    await run({
+      blueprint_path: '/Game/ABP_Hero',
+      graph_name: 'AnimGraph',
+      nodes: [{ id: 'p', class: 'Call_Function', raw_class: 'AnimGraphNode_SequencePlayer' }],
+      connections: []
+    })
+
+    expect(writeParams().nodes[0]).toMatchObject({ class: 'AnimGraphNode_SequencePlayer' })
+  })
+
+  it('Function 给了 member_name → 照旧是函数调用，不动它', async () => {
+    mockApply(okResponse)
+
+    await run({
+      ...MINIMAL,
+      nodes: [
+        {
+          id: 'print',
+          class: 'Function',
+          member_name: 'KismetSystemLibrary.PrintString',
+          raw_class: 'K2Node_CallFunction'
+        }
+      ],
+      connections: []
+    })
+
+    expect(writeParams().nodes[0]).toMatchObject({ class: 'Function' })
   })
 })

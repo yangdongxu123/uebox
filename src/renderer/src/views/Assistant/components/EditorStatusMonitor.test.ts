@@ -47,12 +47,12 @@ function okResult(overrides = {}): EditorHealthResult {
   return { status: 'ok', raw, report: evaluateEditorHealth(raw) }
 }
 
-async function mountMonitor(sessionId = 'sid'): Promise<ReturnType<typeof mount>> {
+async function mountMonitor(chatSid = 'sid'): Promise<ReturnType<typeof mount>> {
   const chat = useChatSessionsStore()
-  chat.ensureSession(sessionId, '二段跳')
-  chat.setProject(sessionId, { projectName: 'Bound' })
+  chat.ensureSession(chatSid, '二段跳')
+  chat.setProject(chatSid, { projectName: 'Bound' })
   const wrapper = mount(EditorStatusMonitor, {
-    props: { sessionId },
+    props: { chatSid },
     global: { stubs: { AppDropdown: dropdownStub, AppTooltip: tooltipStub } }
   })
   await flushPromises()
@@ -105,7 +105,7 @@ describe('EditorStatusMonitor', () => {
     await wrapper.find('.bad-item .ask-btn').trigger('click')
 
     expect(useChatSessionsStore().getDraft('sid')).toBe(
-      '状态监控里「本地缓存命中」是 62.0%（预期 > 85.0%），帮我查查原因。'
+      '状态监控里「本地缓存命中」是 62.0%（预期 > 85.0%），请排查原因。'
     )
   })
 

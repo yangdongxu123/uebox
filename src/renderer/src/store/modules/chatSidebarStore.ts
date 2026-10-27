@@ -1,6 +1,5 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { usePersistOptions } from '../../hooks/usePersistOptions'
 import type { ChatGroupMode, ChatSortMode } from '../../layout/composables/chatSessionGrouping'
 
 /** 用户手动加进侧边栏的工程（还没有任何对话时也要显示） */
@@ -22,7 +21,7 @@ interface ChatSidebarState {
 /**
  * 侧边栏「AI 对话」区域的用户偏好。
  *
- * 和会话数据分开存：这些是「我想怎么看」，换台机器/清空会话都不该丢。
+ * 和对话数据分开存：这些是「我想怎么看」，换台机器/清空对话都不该丢。
  */
 export const useChatSidebarStore = defineStore(
   'chat-sidebar',
@@ -63,7 +62,7 @@ export const useChatSidebarStore = defineStore(
     /**
      * 手动添加的工程分组。
      *
-     * 会话上盖的工程戳是自动的；这里存的是用户自己从「+」加进来的工程，
+     * 对话上盖的工程戳是自动的；这里存的是用户自己从「+」加进来的工程，
      * 哪怕一条对话都还没有也要一直显示在「项目」下面。
      */
     const manualProjects = ref<SidebarProject[]>([])
@@ -194,17 +193,17 @@ export const useChatSidebarStore = defineStore(
     }
   },
   {
-    persist: usePersistOptions<ChatSidebarState>({
+    persist: {
       key: 'chat-sidebar',
-      paths: [
+      pick: [
         'groupMode',
         'sortMode',
         'collapsedGroups',
         'manualProjects',
         'hiddenProjects',
         'pinnedProjects'
-      ],
-      storage: 'localStorage'
-    })
+      ] satisfies (keyof ChatSidebarState)[],
+      storage: localStorage
+    }
   }
 )

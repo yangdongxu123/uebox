@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { readSettings } from '../../ai/store'
-import { requestSpeech } from '../../ai/speech'
+import { requestSpeech, type SpeechOptions } from '../../ai/speech'
 import { CreatorPlanCallError } from '../../ai/creatorPlan/callError'
 import { recoverMediaFile, saveMediaFile } from './files'
 import type { Storyboard } from './schema'
@@ -44,14 +44,17 @@ export async function speakToFile(
   text: string,
   cacheDir: string,
   signal?: AbortSignal,
-  onSynthesize: () => void = () => {}
+  onSynthesize: () => void = () => {},
+  options: SpeechOptions = {}
 ): Promise<{ path: string; seconds: number }> {
   const key = digest({
     text,
     provider: provider.id,
     baseUrl: provider.baseUrl,
     model: modelId,
-    voice: provider.models.find((m) => m.id === modelId)?.ttsVoice
+    voice: options.voice ?? provider.models.find((m) => m.id === modelId)?.ttsVoice,
+    // 不带演法时不进键：以前合成过的配音照旧命中缓存
+    ...(options.instruction ? { instruction: options.instruction } : {})
   })
   await fs.mkdir(cacheDir, { recursive: true })
   const speechFile = path.join(cacheDir, `${key}.pcm`)
@@ -68,8 +71,13 @@ export async function speakToFile(
       )
     onSynthesize()
     const chunks: Buffer[] = []
-    await requestSpeech(provider, modelId, text, signal ?? new AbortController().signal, (chunk) =>
-      chunks.push(Buffer.from(chunk.base64, 'base64'))
+    await requestSpeech(
+      provider,
+      modelId,
+      text,
+      signal ?? new AbortController().signal,
+      (chunk) => chunks.push(Buffer.from(chunk.base64, 'base64')),
+      options
     ).catch((error: unknown) => {
       // Box Plan 的额度 / 订阅 / 授权错误：错误码后面挂着说清下一步的原话，给它
       const cause = error instanceof Error ? error.cause : undefined
@@ -85,7 +93,11 @@ export async function speakToFile(
 /** 给 PCM 套上 WAV 头，播放器、UE 导入都能直接用。 */
 export async function pcmToWav(pcmFile: string, wavFile: string): Promise<void> {
   if (await exists(wavFile)) return
-  const pcm = await fs.readFile(pcmFile)
+  await saveMediaFile(wavFile, wavBytes(await fs.readFile(pcmFile), 24000))
+}
+
+/** 单声道 16 位 PCM 加 WAV 头。配音是 24000，音效按服务商实际给的采样率传 */
+export function wavBytes(pcm: Buffer, sampleRate: number): Buffer {
   const header = Buffer.alloc(44)
   header.write('RIFF', 0)
   header.writeUInt32LE(36 + pcm.length, 4)
@@ -94,13 +106,13 @@ export async function pcmToWav(pcmFile: string, wavFile: string): Promise<void> 
   header.writeUInt32LE(16, 16)
   header.writeUInt16LE(1, 20)
   header.writeUInt16LE(1, 22)
-  header.writeUInt32LE(24000, 24)
-  header.writeUInt32LE(PCM_BYTES_PER_SECOND, 28)
+  header.writeUInt32LE(sampleRate, 24)
+  header.writeUInt32LE(sampleRate * 2, 28)
   header.writeUInt16LE(2, 32)
   header.writeUInt16LE(16, 34)
   header.write('data', 36)
   header.writeUInt32LE(pcm.length, 40)
-  await saveMediaFile(wavFile, Buffer.concat([header, pcm]))
+  return Buffer.concat([header, pcm])
 }
 
 /** Lock narration before visual choreography so animation follows the actual voice, not an estimate. */

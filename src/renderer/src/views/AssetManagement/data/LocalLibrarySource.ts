@@ -42,19 +42,26 @@ export const LOCAL_CAPABILITIES: LibraryCapabilities = {
     tags: true,
     favorite: true,
     showDependencies: true,
-    engine: false,
+    engine: true,
     tagMode: 'full'
   },
-  reasons: {}
+  reasons: {},
+  team: null
 }
 
 async function invokeSearch<T>(channel: string, payload: unknown): Promise<T[]> {
   const response = (await window.electron.ipcRenderer.invoke(channel, payload)) as {
     success?: boolean
     error?: string
+    /** 查询被取消（被同一列表的新查询顶掉、保管库正在切换），不是失败 */
+    cancelled?: boolean
     data?: T[]
   }
-  if (!response || !response.success) throw new Error(response?.error || 'Unknown error')
+  if (!response || !response.success) {
+    throw Object.assign(new Error(response?.error || 'Unknown error'), {
+      cancelled: response?.cancelled === true
+    })
+  }
   return response.data || []
 }
 
@@ -174,7 +181,12 @@ export const localLibrarySource: AssetLibrarySource = {
     folders: (params) => invokeSearch('db:assetFolder:search', params)
   },
   annotations: null,
-  facets: null,
+  facets: {
+    engines: (criteria) =>
+      invokeSearch('db:assetSearch:engineFacet', { ...criteria, engineVersions: [] }),
+    // 本地库的标签筛选走标签库（按 id），用不着标签分面
+    tags: async () => []
+  },
   favorites: localFavorites,
   tagRegistry: localTagRegistry
 }

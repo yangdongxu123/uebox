@@ -25,13 +25,9 @@
  * 用，只是 AI 那部分要补一下。
  */
 import i18n from '@renderer/i18n'
-import router from '@renderer/router'
-import { useChatSessionsStore } from '@renderer/store/modules/chatSessions'
-import { useTabsStore } from '@renderer/store/modules/tabs'
 import { confirmDialog } from '@renderer/utils/dialog'
 import { message } from '@renderer/utils/messageManager'
-import { appExecuteAgent } from '@renderer/views/Assistant/composables/appAgentRunner'
-import { ensureSessionWithTitle } from '@renderer/views/Assistant/composables/chatSendPrimitives'
+import { startAgentChat } from '@renderer/views/Assistant/composables/handOffToAgent'
 
 /** 主进程给的原因码里，有专门文案的那几种 */
 const KNOWN_REASONS: Record<string, string> = {
@@ -107,6 +103,54 @@ export function notifyPluginUpgradeFailure(
   return true
 }
 
+/** 弹窗开着期间陆续导入进来的工程；null 表示弹窗没开 */
+let pendingInstallPaths: string[] | null = null
+
+/**
+ * 首次导入工程时问一句要不要装连接插件。只问一次，答案由主进程记住。
+ *
+ * 「全部导入」会连发很多次，弹窗开着时后来的工程并进同一个弹窗，点安装一起装。
+ * 点叉、按 Esc 和「暂不安装」一样算答过：用户已经看到了，之后去设置里改就行。
+ */
+export function askUALinkInstall(uprojectPath: string): void {
+  if (pendingInstallPaths) {
+    if (!pendingInstallPaths.includes(uprojectPath)) pendingInstallPaths.push(uprojectPath)
+    return
+  }
+  pendingInstallPaths = [uprojectPath]
+
+  const { t } = i18n.global
+  const answer = async (install: boolean): Promise<void> => {
+    const paths = pendingInstallPaths ?? []
+    pendingInstallPaths = null
+    let failures: Array<{ uprojectPath: string; reason: string }>
+    try {
+      failures = await window.api.database.project.ualinkPromptAnswer(install, paths)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : String(error))
+      return
+    }
+    if (!install) return
+    if (failures.length > 0) {
+      notifyPluginInstallFailure({
+        pluginFailure: failures[0].reason,
+        data: { originPath: failures[0].uprojectPath }
+      })
+    } else {
+      message.success(t('page.home.project.ualinkPrompt.installed'))
+    }
+  }
+
+  confirmDialog({
+    title: t('page.home.project.ualinkPrompt.title'),
+    content: t('page.home.project.ualinkPrompt.content'),
+    okText: t('page.home.project.ualinkPrompt.install'),
+    cancelText: t('page.home.project.ualinkPrompt.skip'),
+    onOk: () => answer(true),
+    onCancel: () => void answer(false)
+  })
+}
+
 interface HandOffContext {
   /** 给用户看的那句话 */
   content: string
@@ -134,7 +178,7 @@ function askUserOrHandOff(context: HandOffContext): void {
 }
 
 /**
- * 把故障原样交给 AI 的一轮对话，并把用户带到那条会话上。
+ * 把故障原样交给 AI 的一轮对话，并把用户带到那条对话上。
  *
  * 带上的三样东西缺一不可：工程文件的绝对路径（AI 要去读它）、原因码或异常原文
  * （不翻译，AI 认得），以及**查什么**。只丢一句「插件装不上」的话，模型会反过来
@@ -146,7 +190,7 @@ function askUserOrHandOff(context: HandOffContext): void {
  * 的话，同路径换 query 不会重建组件，这条消息就**悄无声息地没了** ——
  * 而「点了按钮什么都没发生」正是这次要消灭的那类症状。
  *
- * 所以走和实时语音派活、蓝图库存片段同一条路：自己建一条会话，用应用级的
+ * 所以走和实时语音派活、蓝图库存片段同一条路：自己建一条对话，用应用级的
  * `appExecuteAgent` 发起（它不依赖助手页挂没挂着），再把用户带到 `?sid=` 上 ——
  * 那个 query 助手页是 watch 着的。用户中途切走也不影响 AI 把活干完。
  */
@@ -158,16 +202,8 @@ function handOffToAgent(context: HandOffContext): void {
     reason: context.reason
   })
 
-  const chatSid = `plugin-failure-${Date.now()}`
   try {
-    ensureSessionWithTitle(chatSid, prompt, {
-      chatStore: useChatSessionsStore(),
-      tabsStore: useTabsStore(),
-      route: router.currentRoute.value,
-      unnamedTitle: t('assistant.chatFlow.unnamedSession')
-    })
-    void router.push({ path: '/dev-assistant', query: { sid: chatSid } })
-    void appExecuteAgent(prompt, undefined, { chatSid })
+    startAgentChat(prompt, 'plugin-failure')
   } catch (error) {
     message.error(
       t('page.home.project.pluginFailure.askAiFailed', {

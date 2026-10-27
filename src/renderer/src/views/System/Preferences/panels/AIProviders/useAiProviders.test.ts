@@ -7,6 +7,7 @@ import type {
 } from '@core/shared/aiProvider'
 import {
   draftFromCatalog,
+  missingCatalogModels,
   draftFromProvider,
   filterModelOptionsForRole,
   modelOptionLabel,
@@ -109,6 +110,62 @@ describe('draftFromCatalog', () => {
     }
 
     expect(draftFromCatalog(entry).apiKeyInput).toBe('OPENAI_API_KEY')
+  })
+
+  it('记下目录条目，界面据此锁住用途', () => {
+    const entry: CatalogEntry = {
+      id: 'elevenlabs-music',
+      displayName: 'ElevenLabs Music',
+      kind: 'music',
+      protocol: 'openai-completions',
+      baseUrl: 'https://api.elevenlabs.io/v1',
+      requiresApiKey: true,
+      models: []
+    }
+
+    expect(draftFromCatalog(entry).catalogId).toBe('elevenlabs-music')
+  })
+})
+
+describe('missingCatalogModels', () => {
+  const openai: CatalogEntry = {
+    id: 'openai',
+    displayName: 'OpenAI',
+    group: 'cloud',
+    kind: 'chat',
+    protocol: 'openai-responses',
+    baseUrl: 'https://api.openai.com/v1',
+    requiresApiKey: true,
+    hasLogo: true,
+    models: [
+      { id: 'gpt-6.1-sol', displayName: 'GPT-6.1 Sol', thinkingLevelMap: { minimal: null } },
+      { id: 'gpt-6-sol', displayName: 'GPT-6 Sol' }
+    ]
+  }
+
+  it('老服务商只列出目录里新出的型号，能力位一并带上', () => {
+    const saved = {
+      id: 'openai',
+      kind: 'chat' as const,
+      baseUrl: 'https://api.openai.com/v1',
+      models: [{ id: 'gpt-6-sol' }]
+    }
+    expect(missingCatalogModels(saved, [openai])).toEqual([
+      { id: 'gpt-6.1-sol', displayName: 'GPT-6.1 Sol', thinkingLevelMap: { minimal: null } }
+    ])
+  })
+
+  it('第二份同厂商按 Base URL 认，换了网关的不算', () => {
+    const second = {
+      id: 'openai-2',
+      kind: 'chat' as const,
+      baseUrl: 'https://api.openai.com/v1/',
+      models: []
+    }
+    expect(missingCatalogModels(second, [openai])).toHaveLength(2)
+    expect(
+      missingCatalogModels({ ...second, baseUrl: 'https://gw.example.com/v1' }, [openai])
+    ).toEqual([])
   })
 })
 
@@ -482,6 +539,18 @@ describe('filterModelOptionsForRole', () => {
 
     expect(filterModelOptionsForRole([opaque], 'embedding')).toEqual([opaque])
     expect(filterModelOptionsForRole([opaque], 'chat')).toEqual([])
+  })
+
+  // 套餐的可选模型由服务端说能接哪几个角色（清单 models[].roles），别的角色不列
+  it('模型写了能接的角色：只出现在那几个角色的下拉里', () => {
+    const beta = option('creator-plan::uebox-chat-beta', 'chat', {
+      supportsVision: true,
+      allowedRoles: ['chat', 'agent']
+    })
+    expect(filterModelOptionsForRole([beta], 'chat')).toEqual([beta])
+    expect(filterModelOptionsForRole([beta], 'agent')).toEqual([beta])
+    expect(filterModelOptionsForRole([beta], 'summary')).toEqual([])
+    expect(filterModelOptionsForRole([beta], 'vision')).toEqual([])
   })
 })
 

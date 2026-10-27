@@ -1,6 +1,6 @@
 ---
 name: ue-content-import-organize
-description: Bring external files into the project, find and inspect existing assets, batch-rename or relocate them, enforce a naming convention, trace dependencies and referencers, clean up redirectors, and migrate assets with their dependencies to another project. Use when the user wants files imported, the content folder tidied or restructured, names normalised, "what uses this" answered, or assets moved to another project. Do not use for placing things in the level, or for editing a material's node graph.
+description: Bring external files into the project, find and inspect existing assets, batch-rename or relocate them, enforce a naming convention, trace dependencies and referencers, clean up redirectors, migrate assets with their dependencies to another project, and read or edit DataTable rows (数据表、配置表). Use when the user wants files imported, the content folder tidied or restructured, names normalised, "what uses this" answered, assets moved to another project, or values in a DataTable changed (改表里的数值、加一行、删行). Do not use for placing things in the level, or for editing a material's node graph.
 ---
 
 # Content import and organisation
@@ -16,7 +16,7 @@ Three ways to get them, in order of preference:
 - **On disk** — `list_local_dir` for one folder, `find_local_files` with a glob
   (`**/*.fbx`) when the files could be at any depth. "把 D:/Downloads/kit 里的都导进来"
   starts here: list it, show the user what you found, then import.
-- **In the box's asset library** — `search_assets` first, take `realPath` from each result.
+- **In the box's asset library** — `search_assets` first, take `real_path` from each result.
 - **Neither** — ask the user for the paths. Do not guess filenames from a folder's name.
 
 ## Import does more than you asked
@@ -29,10 +29,12 @@ Always compare `imported_count` against `requested_count` and tell the user what
 appeared. They will otherwise find material instances in their project that they never asked
 for and have no idea where they came from.
 
-Naming matters at import time: a file named `*_normal.png` is detected as a normal map and
-imported with `TC_Normalmap` / BC5 / sRGB off. Passing badly named files through gives wrong
-compression settings that are tedious to fix afterwards — say so before importing rather than
-after.
+Naming matters at import time: the texture type is guessed **from the filename alone**. A file
+named `*_normal.png` becomes a normal map (`TC_Normalmap` / BC5 / sRGB off); a name it cannot
+classify keeps whatever the engine chose — usually sRGB on. The receipt's `texture_setup` lists,
+per texture, the type it was read as and the `srgb` / `compression` it ended up with. Say so
+before importing badly named files, and check that list afterwards — see _After importing:
+acceptance checks_.
 
 Check `saved_count` too. It should equal the number of assets imported; a `save_warning` means
 some assets exist only in the current editor session and will be lost when the user closes UE.
@@ -52,13 +54,80 @@ already converts metres to centimetres for glTF, and FBX carries its own units).
 lands a hundred times too small or too large, re-import it with `scale` set — do not tell the
 user to go fix Build Scale in the editor themselves.
 
+## After importing: acceptance checks
+
+`imported_count` proves the files went in, not that they are usable. Before reporting success,
+read back what the engine actually made. Read `import_messages` (the importer's own warnings and
+errors) before calling an import clean; if the reply has no such field (older plugin), check
+`ue_message_log` (`action: "list"`, then the import-related category) when anything looks off.
+
+**Meshes — one `mesh_describe` per mesh**, then compare against what the asset is:
+
+| Check | Read | Wrong looks like | Fix |
+|---|---|---|---|
+| Real-world size | `bounds.size` (cm) | a chair 0.9 cm or 9000 cm tall | re-import with `scale` |
+| Up axis | which `bounds` axis is longest | a door lying flat (Z smallest) | fix in the DCC, re-export |
+| Pivot | origin line (centred / on base / at corner) | floor prop pivoting from its middle | DCC (`blender-ue-pipeline`) — do not compensate on every actor |
+| Collision | ⚠️ no collision / primitive count | player walks through it | `mesh_optimize` `collision` (box for crates, convex for concave shapes) |
+| Lightmap UV | ⚠️ invalid lightmap index | dark blotches after a lighting build | only matters with baked lighting; Lumen-only projects can skip |
+| Nanite / LODs | `nanite`, per-LOD source and triangles | dense non-Nanite mesh with one LOD | see below |
+| Materials | every slot has a material | Legacy Phong parent, empty slots | see _Third-party packs_ |
+
+`index_valid` only says the lightmap channel exists; overlapping lightmap UVs show up as
+lighting-build warnings, not here. Nanite: opaque, dense static meshes on a desktop/console
+project should have it on (`ue_content_set_properties`, `"NaniteSettings.bEnabled": true`) —
+then judge cost by Nanite, not by the raw triangle count. Translucent
+materials and mobile targets keep classic LODs; add auto LODs (`mesh_optimize` `lods`) before anyone
+decimates LOD0.
+Skeletal meshes: confirm `skeleton` is the one the user's animations use and that a physics
+asset exists.
+
+**Textures — `ue_content_describe` per texture**, compare `srgb` and `compression`:
+
+| Texture | `srgb` | `compression` |
+|---|---|---|
+| Base colour, emissive | true | `TC_Default` |
+| Normal | false | `TC_Normalmap` |
+| Single-channel roughness / metallic / AO / height | false | `TC_Masks` (HDR sources keep `TC_HDR*`) |
+| Packed ORM / ARM / RMA / MRA / mask | false | `TC_Masks` |
+
+`texture_setup` already shows these per texture; `ue_content_describe` is for textures imported
+earlier or by hand. What the filename guess handles, and where it stops:
+
+- **Packed masks** are recognised only when the type word ends the name (`T_Rock_ORM`, not
+  `T_Arm_BaseColor`). The receipt gives `channels` for ORM/ARM (R = AO, G = roughness, B =
+  metallic), RMA and MRA; plain `_Mask` has no known order — ask. Packed masks are **not wired**
+  into the auto-generated instance (its master has no per-channel inputs); wiring one is a
+  material job.
+- **`bump`** is read as height, not as a normal map.
+- **Green flip** happens only when the name says `gl` / `opengl` as a word (`flip_reason` says
+  which). OpenGL normal maps without that marker (Blender, many free or AI sources) are not
+  flipped and render with bumps pushed in: ask where the maps came from, or have the user look at
+  a lit surface, before flipping by hand.
+
+Fix anything else with `ue_content_set_properties`; its receipt reads every value back
+(flip included), and it saves by default:
+
+```json
+{ "asset_path": "/Game/Imported/rock/T_Rock_ORM",
+  "properties": { "SRGB": false, "CompressionSettings": "TC_Masks" } }
+```
+
+An OpenGL normal map instead: `{ "bFlipGreenChannel": true }`.
+
+Then check the material: `material_describe` the auto-generated instance; each `texture_setup`
+entry names the material parameter its texture went into. A texture that landed in the wrong parameter
+(an older plugin put `bump` images in Normal) goes back to a flat normal with
+`material_set_param` and `/Engine/EngineMaterials/DefaultNormal` (it cannot clear a texture
+parameter).
+
 ## Same-named textures inside meshes silently overwrite each other
 
 FBX and GLB carry their textures inside the file, and the names are whatever the author chose —
 AI-generated models are almost always `Color`, `Normal`, `Roughness`, `Metallic`. Import two such
 models into one folder and the engine behaves **asymmetrically**: the meshes get deduplicated
 (`model` → `model_1`), the textures do not. The second file's textures are skipped without an
-error because the target names already exist, so every model's material points at the *first*
+error because the target names already exist, so every model's material points at the _first_
 model's textures. Different UV layouts then sample the wrong texture and the surfaces render as
 scrambled fragments. `imported_count` still reports success.
 
@@ -221,6 +290,22 @@ sitting on the base, or at a corner — which is what you need before placing mo
 **Read `referencers` before moving or deleting anything.** A non-zero count means other assets
 point at it — say which ones, and let the user decide, rather than breaking references silently.
 
+## DataTables: read the columns, then change in one batch
+
+`ue_datatable_describe` gives the columns with their types (enum columns list their allowed
+values), every row name, and the values of the rows you ask for. Read it first: column names in
+Blueprint structs carry a hidden GUID suffix, and the tool only accepts what describe shows.
+
+`ue_datatable_edit` takes a list of ops — `set` cells, `add` a row (`copy_from` an existing one,
+then override the differences), `remove`, `rename`. "所有剑攻击力加 10%" is describe → compute
+→ one `set` per row in the same call. A failing op rolls back the whole batch, and the batch is
+one step on the undo stack. Save with `ue_save` afterwards.
+
+If describe returns `source_file`, the table was imported from CSV/JSON and the next reimport
+overwrites edits made in the editor. Ask the user before touching it: edit the table here, or
+change the source file and reimport. Columns themselves belong to the row struct and cannot be
+changed here; composite tables cannot be edited — edit the parent table that owns the row.
+
 ## Renaming and moving — always as a batch, always dry-run first
 
 `ue_content_move` takes a **list**. One pair is fine, but never loop it: the engine loads every
@@ -239,7 +324,7 @@ reference it, and whether the destination is taken. Show that to the user, then 
 or `auto_rename` only when the user says so.
 
 After a real run the rewritten referencers are saved (`saved_count`), but the redirectors it
-left behind are **not** cleaned up — `redirectors_fixed` is always 0; see *Redirectors* below.
+left behind are **not** cleaned up — `redirectors_fixed` is always 0; see _Redirectors_ below.
 If `dirty_after` is non-zero, those are packages modified outside the command and were
 deliberately left alone. Every item is read back: `failed` means the asset is not at the
 destination, whatever the engine claimed.
@@ -264,7 +349,7 @@ for a location check. Pass `use_project_rules: false` to audit against Epic alon
 
 **Their customized prefixes are reported, not applied.** If the user changed a prefix, the
 summary names the change and says explicitly that the audit did not use it. Forwarding a prefix
-makes the plugin forget the old one, so every *correctly* named asset of that type comes back as
+makes the plugin forget the old one, so every _correctly_ named asset of that type comes back as
 "missing prefix" with a doubled suggestion (`T_Rock` → `TX_T_Rock`) and no warning marker. To
 audit by their convention, confirm with the user first, then pass it yourself via `rules` keyed
 by engine class name (`Texture2D`, not `Texture`) — and warn them that their already-correct
@@ -277,7 +362,7 @@ Rules of engagement:
   displace, so passing `rules: { SoundWave: "S_" }` only adds coverage. Ask the user what they
   use, then audit again.
 - **There is a second list.** After the violations, the summary lists assets whose prefix is
-  *correct* but which still break the user's own rules. They are not counted in the violation
+  _correct_ but which still break the user's own rules. They are not counted in the violation
   total; feed them to the move the same way.
 - **`conflict_unknown` means we could not check.** When a suggested name was rewritten by the
   user's rules, the plugin never queried the registry for that name, so "is it taken" has no
@@ -310,21 +395,21 @@ Rules of engagement:
 
 `ue_content_dependencies` walks the asset registry (no loading) from an asset **or a folder**:
 
-- `direction: "referencers"` on a folder → `referencers.external` is everything *outside* the
+- `direction: "referencers"` on a folder → `referencers.external` is everything _outside_ the
   folder that points in. Deleting the folder breaks those; moving it is safe (redirectors).
 - `direction: "dependencies"` on a folder → `dependencies.external` is what the folder pulls in
   from outside. That is the extra baggage a migration must carry.
 - `dependencies.missing` are references to packages that no longer exist — the "Failed to load"
   errors on open. Report them; the fix is a human decision.
 - `direction: "unreferenced"` lists assets nothing points at. Registry-only: assets loaded by
-  path from code or config are invisible to it, so it is a *candidate* list, never a delete list.
+  path from code or config are invisible to it, so it is a _candidate_ list, never a delete list.
 
 For "why is this so big" keep using `ue_asset_size_map`; for one asset's direct neighbours
 `ue_content_describe` is still the quickest.
 
 ## Migrating to another project
 
-`ue_content_migrate` is the right-click *Migrate*: copies the assets plus their dependency
+`ue_content_migrate` is the right-click _Migrate_: copies the assets plus their dependency
 closure into another project's `Content`, preserving folder structure. `destination` takes the
 `.uproject`, the project folder, or its `Content` folder. Levels bring their One-File-Per-Actor
 packages automatically.
@@ -348,8 +433,8 @@ confirm nobody does first (`ue_content_dependencies` with `direction: "reference
 `paths` to limit the run to a few redirectors or one folder instead of scanning all of `/Game`.
 
 A real run (`dry_run: false`) **opens a modal "Redirector Update Report" window in the editor on
-UE 5.4+ that a human must click** — its default button is *Keep Redirectors*, so tell the user
-to pick *Delete Unreferenced Redirectors*. Warn the user before running; if nobody clicks within
+UE 5.4+ that a human must click** — its default button is _Keep Redirectors_, so tell the user
+to pick _Delete Unreferenced Redirectors_. Warn the user before running; if nobody clicks within
 10 minutes the call times out with the outcome unknown (the engine finishes when they click), so
 re-run `dry_run: true` to read back instead of repeating the fixup. When the editor cannot show
 the window (script mode, no renderer) the plugin refuses with 409 and `details.how_to`. The engine

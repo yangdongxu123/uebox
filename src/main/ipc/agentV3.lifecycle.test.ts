@@ -22,6 +22,12 @@ const mock = vi.hoisted(() => ({
   attachments: vi.fn()
 }))
 
+/** 审计员交回一份只有一条的复核清单 */
+function auditReply(status: 'PASS' | 'FAIL', finding: string): string {
+  const item = { id: 1, requirement: '验收', quote: '完成原目标', how: '看', status, finding }
+  return `<checklist>${JSON.stringify([item])}</checklist>`
+}
+
 vi.mock('electron', () => ({
   ipcMain: { handle: (name: string, handler: Handler) => mock.handlers.set(name, handler) },
   webContents: { getAllWebContents: () => [] }
@@ -149,7 +155,14 @@ const created = {
   // 改动台账按**全量**工具名判「这一步算不算改了东西」，所以 createUnrealAgent
   // 现在同时给这一份；替身漏掉它，`/goal` 那几条会话装配当场炸
   allTools: [],
-  selection: { providerId: 'faux', modelId: 'test', role: 'agent', model: { contextWindow: 10000 } }
+  selection: {
+    providerId: 'faux',
+    modelId: 'test',
+    role: 'agent',
+    model: { contextWindow: 10000 }
+  },
+  // 自动续跑和报错提示按它认「失败不扣费」的套餐模型
+  runtime: { freeOnFailure: () => false }
 }
 
 function invoke(channel: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -178,7 +191,7 @@ beforeEach(() => {
   mock.compact.mockReset()
   mock.truncate.mockReset().mockResolvedValue({ ok: true, messageCount: 1, dropped: 1 })
   mock.fork.mockReset().mockResolvedValue({ ok: true, sessionId: 'branch', messageCount: 2 })
-  mock.audit.mockReset().mockResolvedValue({ text: 'VERDICT: PASS — checked' })
+  mock.audit.mockReset().mockResolvedValue({ text: auditReply('PASS', 'checked') })
   mock.deleteTranscript.mockReset().mockResolvedValue(undefined)
   mock.deleteBrowser.mockReset().mockResolvedValue(undefined)
   agent.state.messages = []
@@ -218,7 +231,7 @@ describe('Agent V3 真实 IPC 生命周期', () => {
    * 「盘上落后于内存」（turn_end 才落盘），而那件事只影响还没说完的这一轮 ——
    * 跑着的时候读内存那份就绕开了，见 `liveForkSource`。
    */
-  describe('输出中的会话分支', () => {
+  describe('输出中的分支', () => {
     const turns = (count: number): AgentMessage[] =>
       Array.from({ length: count }, (_, i) => [
         { role: 'user', content: `问${i + 1}`, timestamp: 0 },
@@ -333,10 +346,20 @@ describe('Agent V3 真实 IPC 生命周期', () => {
     expect(context.isReadOnly?.()).toBe(false)
   })
 
+  it('下一轮带着只读进来时，本对话内都允许的名单也清掉', async () => {
+    await invoke('execute', { sessionId: 'allow-reset', prompt: 'work', mode: 'agent' })
+    const allowed = (mock.create.mock.calls[0][0] as SessionContext).alwaysAllowed!
+    allowed.add('ue_delete_assets')
+
+    // 渲染层那次 set-approval-mode 没送到，只读是随下一轮 execute 带进来的
+    await invoke('execute', { sessionId: 'allow-reset', prompt: 'ask', mode: 'ask' })
+    expect(allowed.size).toBe(0)
+  })
+
   it('失败后继续仍装配目标复核，并保存恢复后的轮次', async () => {
     mock.loadOptions.mockResolvedValue({
       mode: 'agent',
-      goal: { objective: '完成目标', rounds: 3, lastFailReason: '', mutations: [], settled: false }
+      goal: { objective: '完成目标', rounds: 3, checklist: [], mutations: [], settled: false }
     })
     agent.continue.mockImplementationOnce(async () => {
       const event: AgentEvent = {
@@ -365,7 +388,7 @@ describe('Agent V3 真实 IPC 生命周期', () => {
       goal: {
         objective: '完成目标',
         rounds: 5,
-        lastFailReason: '旧',
+        checklist: [],
         mutations: ['x'],
         settled: true
       }
@@ -378,7 +401,7 @@ describe('Agent V3 真实 IPC 生命周期', () => {
           objective: '完成目标',
           latestRequest: '顺便把灯调亮',
           rounds: 0,
-          lastFailReason: '',
+          checklist: [],
           mutations: [],
           settled: false
         }
@@ -389,7 +412,7 @@ describe('Agent V3 真实 IPC 生命周期', () => {
   it('取消目标：删掉落盘的目标并通知界面；正在跑时不让取消', async () => {
     mock.loadOptions.mockResolvedValue({
       mode: 'agent',
-      goal: { objective: '完成目标', rounds: 1, lastFailReason: '', mutations: [], settled: false }
+      goal: { objective: '完成目标', rounds: 1, checklist: [], mutations: [], settled: false }
     })
     expect(await invoke('goal-end', { sessionId: 'goal-cancel' })).toEqual({ success: true })
     expect(mock.saveOptions).toHaveBeenCalledWith('goal-cancel', { mode: 'agent' })
@@ -411,7 +434,7 @@ describe('Agent V3 真实 IPC 生命周期', () => {
   it('只有复核中断时继续先复核，不重复请求 worker', async () => {
     mock.loadOptions.mockResolvedValue({
       mode: 'agent',
-      goal: { objective: '完成目标', rounds: 1, lastFailReason: '', mutations: [], settled: false }
+      goal: { objective: '完成目标', rounds: 1, checklist: [], mutations: [], settled: false }
     })
     mock.load.mockResolvedValue([
       ...messages,
@@ -434,7 +457,7 @@ describe('Agent V3 真实 IPC 生命周期', () => {
       goal: {
         objective: '完成原目标',
         rounds: 2,
-        lastFailReason: '',
+        checklist: [],
         mutations: [],
         settled: false
       }
@@ -443,7 +466,7 @@ describe('Agent V3 真实 IPC 生命周期', () => {
       ...messages,
       { role: 'assistant', content: '已完成', stopReason: 'stop' }
     ])
-    mock.audit.mockResolvedValue({ text: 'VERDICT: FAIL — 缺少验收' })
+    mock.audit.mockResolvedValue({ text: auditReply('FAIL', '缺少验收') })
     expect(
       await invoke('continue', { sessionId: 'goal-audit-retry', mode: 'agent' })
     ).toMatchObject({ success: true })
@@ -454,7 +477,10 @@ describe('Agent V3 真实 IPC 生命周期', () => {
     expect(mock.saveOptions).toHaveBeenLastCalledWith(
       'goal-audit-retry',
       expect.objectContaining({
-        goal: expect.objectContaining({ rounds: 3, lastFailReason: '缺少验收' })
+        goal: expect.objectContaining({
+          rounds: 3,
+          checklist: [expect.objectContaining({ id: 1, status: 'fail', finding: '缺少验收' })]
+        })
       })
     )
   })
@@ -580,5 +606,56 @@ describe('Agent V3 真实 IPC 生命周期', () => {
     })
     expect(mock.append).toHaveBeenCalledWith(messages, { strict: true })
     expect(mock.deleteCheckpoint).not.toHaveBeenCalled()
+  })
+
+  /**
+   * `execute` 忙的时候回 `code: 'SESSION_BUSY'`，渲染层拿它换成本地化文案。
+   * `continue` 是同一种拒绝（会话被占），原来只回原文不带码，于是气泡里
+   * 直接摆出「session {uuid} 正在执行中」。两边必须同形。
+   */
+  it('续跑撞上还在跑的一轮：带 SESSION_BUSY 码，原文照旧留给日志', async () => {
+    const reached = deferred<void>()
+    agent.prompt.mockImplementationOnce(() => {
+      reached.resolve()
+      // 一轮永远不结束的输出
+      return new Promise(() => {})
+    })
+    void invoke('execute', { sessionId: 'busy-resume', prompt: 'work' })
+    await reached.promise
+
+    const result = await invoke('continue', { sessionId: 'busy-resume' })
+
+    expect(result).toMatchObject({ success: false, code: 'SESSION_BUSY' })
+    expect(String(result.error)).toContain('正在执行中')
+  })
+
+  /**
+   * steer 的第二道闸：进队之前要等附件落盘、媒体处理，这几秒里这一轮可能
+   * 刚好跑完。那时内核的插话队列已经没人读了 —— 原来照样回「成功」，
+   * 话就这么没了。拒出 NOT_RUNNING，调用方才说得出「这一轮刚好结束」。
+   */
+  it('等附件落盘期间这一轮结束：steer 按 NOT_RUNNING 拒', async () => {
+    let releasePrompt: () => void = () => {}
+    const reached = deferred<void>()
+    agent.prompt.mockImplementationOnce(() => {
+      reached.resolve()
+      return new Promise<void>((resolve) => {
+        releasePrompt = resolve
+      })
+    })
+    const executing = invoke('execute', { sessionId: 'steer-late', prompt: 'work' })
+    await reached.promise
+
+    // 附件落盘卡住：插话停在准备阶段，这一轮在它下面跑完
+    const saving = deferred<unknown[]>()
+    mock.attachments.mockReturnValueOnce(saving.promise)
+    const steering = invoke('steer', { sessionId: 'steer-late', message: '再加一句' })
+
+    releasePrompt()
+    // 等整个 handler 收完 —— finally 里才会从登记表摘掉这一轮
+    await executing
+    saving.resolve([])
+
+    expect(await steering).toMatchObject({ success: false, code: 'NOT_RUNNING' })
   })
 })

@@ -148,7 +148,7 @@ function notifyChanged(): void {
  * 注册冲突提示回调，由 ipc 层在启动时接上。
  *
  * 冲突**必须**让用户看见：他可能开着两个窗口，以为两边在干不同的活。
- * 静默失败的话，他只会看到一条会话莫名其妙地绕开了任务。
+ * 静默失败的话，他只会看到一条对话莫名其妙地绕开了任务。
  */
 export function setLockConflictNotifier(fn: ConflictNotifier | undefined): void {
   notifier = fn
@@ -170,6 +170,8 @@ export function rootSessionId(sessionId: string): string {
  * 制作人的锁主是会话本身。两者同属一个团队。
  */
 const MATE = ':mate-'
+/** 外部团队的锁主在队员名后面带上活的编号（`队员@活`），界面上只显示队员名 */
+export const JOB_SEP = '@'
 
 export function teamRootOf(owner: string): string {
   return owner.split(MATE)[0] ?? owner
@@ -182,7 +184,7 @@ export function sameTeam(a: string, b: string): boolean {
 /** 冲突里占着锁的那一方叫什么：队友名，或者制作人 */
 export function holderLabel(owner: string): string {
   const at = owner.indexOf(MATE)
-  return at >= 0 ? `队友「${owner.slice(at + MATE.length)}」` : '制作人'
+  return at >= 0 ? `队友「${owner.slice(at + MATE.length).split(JOB_SEP)[0]}」` : '制作人'
 }
 
 /**
@@ -369,6 +371,33 @@ export function releaseAll(owner: string): number {
   return released.length
 }
 
+/**
+ * 放掉某个主人手上的几把锁（不是全部）。
+ *
+ * 给工作室模式的制作人用：它那一轮就是整局，锁跟着一轮走的话，它碰过的资产（包括
+ * 「当前关卡」那把）到交付之前队友一个都改不了 —— 队员撞上去等 90 秒再失败。
+ * GDBox 那边 2026-10-15 真机撞到过（程序等制作人占着的场景文件等了 14 分钟）。
+ */
+export function releasePaths(
+  connectionId: string | undefined,
+  owner: string,
+  paths: string[]
+): number {
+  const root = rootSessionId(owner)
+  const released: LockRecord[] = []
+  for (const raw of paths) {
+    const path = raw === CURRENT_LEVEL_LOCK ? raw : toPackagePath(raw)
+    const key = keyOf(connectionId, path)
+    const record = locks.get(key)
+    if (record && record.owner === root && locks.delete(key)) released.push(record)
+  }
+  if (released.length > 0) {
+    notifyChanged()
+    notifyReleased(released)
+  }
+  return released.length
+}
+
 /** 当前所有锁，给界面上那个「AI 锁定了 N 个资产」用 */
 export function listLocks(): LockRecord[] {
   return [...locks.values()]
@@ -423,7 +452,7 @@ export function forceReleaseAll(): number {
  * 用户 —— 真机上就出现过「这个材质被会话 b04ba478… 占用了」这种话。
  * 用户看到一串乱码，既不知道是自己哪个窗口，也没法据此决定做什么。
  *
- * 「是哪条会话」由界面上的锁指示器回答，那边能把 id 换成会话标题
+ * 「是哪条会话」由界面上的锁指示器回答，那边能把 id 换成对话标题
  * （见 `renderer/.../AssetLockIndicator.vue`）。
  *
  * 也明确告诉模型别去猜原因：它曾经把「另一条 agent 会话占着」误说成
@@ -445,9 +474,9 @@ export function describeConflicts(conflicts: LockConflict[], requester?: string)
   }
   const lines = conflicts.map((c) => `  - ${describeLockPath(c.path)}`)
   return [
-    '以下资产正被**盒子里的另一条 AI 会话**修改中，本次调用未做任何改动：',
+    '以下资产正被**盒子里的另一条 AI 对话**修改中，本次调用未做任何改动：',
     ...lines,
     '这与用户在虚幻编辑器里的操作无关，别让用户去关闭资产或退出编辑 —— 那不会解锁。',
-    '锁在那条会话结束时自动释放。请先做别的任务，或告诉用户等它结束。反复重试不会让锁提前释放。'
+    '锁在那一轮结束时自动释放。请先做别的任务，或告诉用户等它结束。反复重试不会让锁提前释放。'
   ].join('\n')
 }
